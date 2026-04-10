@@ -154,7 +154,7 @@ class NemoTarShardDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
                     )
 
         logger.info(
-            "NemoTarShardDiscoveryStage: found %d shards (corpus_filter=%s)",
+            "NemoTarShardDiscoveryStage: found {} shards (corpus_filter={})",
             len(tasks), self.corpus_filter,
         )
         return tasks
@@ -215,7 +215,7 @@ class NemoTarShardReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
         manifest = self._read_manifest(manifest_path)
 
-        logger.info("Reading shard %s: %s (%d manifest entries)", shard_key, tar_path, len(manifest))
+        logger.info("Reading shard {}: {} ({} manifest entries)", shard_key, tar_path, len(manifest))
 
         tar = _open_tar(tar_path, self.s3_endpoint_url)
         results: list[AudioTask] = []
@@ -229,7 +229,7 @@ class NemoTarShardReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             try:
                 audio, sample_rate = sf.read(BytesIO(raw_audio), dtype="float32")
             except Exception:
-                logger.warning("Skipping corrupt audio %s in %s", tar_info.name, tar_path)
+                logger.warning("Skipping corrupt audio {} in {}", tar_info.name, tar_path)
                 continue
 
             # Convert to mono 1-D array
@@ -251,7 +251,7 @@ class NemoTarShardReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             )
 
         tar.close()
-        logger.info("Shard %s: emitted %d AudioTasks", shard_key, len(results))
+        logger.info("Shard {}: emitted {} AudioTasks", shard_key, len(results))
         return results
 
 

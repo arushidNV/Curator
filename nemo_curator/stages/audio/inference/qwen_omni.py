@@ -157,6 +157,7 @@ class InferenceQwenOmniStage(ProcessingStage[AudioTask, AudioTask]):
         waveforms = [t.data[self.waveform_key] for t in tasks]
         sample_rates = [t.data[self.sample_rate_key] for t in tasks]
 
+
         texts = self._model.generate(waveforms, sample_rates)
 
         for task, text in zip(tasks, texts, strict=True):
@@ -165,5 +166,5 @@ class InferenceQwenOmniStage(ProcessingStage[AudioTask, AudioTask]):
             # only need the predicted text and manifest metadata.
             task.data.pop(self.waveform_key, None)
 
-        logger.info("QwenOmni: generated %d predictions", len(texts))
+        logger.info("QwenOmni: generated predictions for {} waveforms".format(len(texts)))
         return tasks

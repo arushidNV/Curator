@@ -100,7 +100,7 @@ class QwenOmni(ModelInterface):
         tp_size = self.tensor_parallel_size or get_gpu_count()
 
         logger.info(
-            "Loading QwenOmni model=%s  tp=%d  max_model_len=%d  max_num_seqs=%d",
+            "Loading QwenOmni model={}  tp={}  max_model_len={}  max_num_seqs={}",
             self.model_id, tp_size, self.max_model_len, self.max_num_seqs,
         )
 
@@ -181,7 +181,7 @@ class QwenOmni(ModelInterface):
             text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             audios, images, videos = process_mm_info(messages, use_audio_in_video=False)
         except Exception:
-            logger.warning("Failed to preprocess audio, skipping (waveform shape=%s, sr=%d)", waveform.shape, sample_rate)
+            logger.warning("Failed to preprocess audio, skipping (waveform shape={}, sr={})", waveform.shape, sample_rate)
             return None
 
         inputs: dict[str, Any] = {
@@ -235,11 +235,11 @@ class QwenOmni(ModelInterface):
         valid_inputs = [prepared[i] for i in valid_indices]
 
         if not valid_inputs:
-            logger.warning("All %d audio samples in batch failed preprocessing", len(waveforms))
+            logger.warning("All {} audio samples in batch failed preprocessing", len(waveforms))
             return [""] * len(waveforms)
 
         if len(valid_inputs) < len(waveforms):
-            logger.warning("Skipped %d/%d corrupt audio samples", len(waveforms) - len(valid_inputs), len(waveforms))
+            logger.warning("Skipped {}/{} corrupt audio samples", len(waveforms) - len(valid_inputs), len(waveforms))
 
         outputs = self._llm.generate(valid_inputs, sampling_params=self._sampling_params, use_tqdm=False)
 

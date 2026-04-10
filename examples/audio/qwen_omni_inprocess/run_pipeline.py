@@ -122,7 +122,7 @@ def main():
         ],
     )
 
-    logger.info("Pipeline: %s", pipeline.describe())
+    logger.info("Pipeline: {}", pipeline.describe())
 
     executor = XennaExecutor(config={
         "execution_mode": args.execution_mode,
@@ -131,7 +131,7 @@ def main():
     t0 = time.time()
     pipeline.run(executor=executor)
     elapsed = time.time() - t0
-    logger.info("Pipeline finished in %.1f min. Output: %s", elapsed / 60, args.output)
+    logger.info("Pipeline finished in {:.1f} min. Output: {}", elapsed / 60, args.output)
 
 
 if __name__ == "__main__":
