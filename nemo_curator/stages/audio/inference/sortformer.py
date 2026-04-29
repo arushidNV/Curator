@@ -14,13 +14,10 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
-import tempfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import soundfile as sf
 from huggingface_hub import snapshot_download
 from loguru import logger
 from nemo.collections.asr.models import SortformerEncLabelModel
@@ -86,20 +83,6 @@ def _write_rttm(segments: list[dict[str, Any]], sess_name: str, rttm_out_dir: st
             f.write(f"SPEAKER {sess_name} 1 {seg['start']:.3f} {duration:.3f} <NA> <NA> {seg['speaker']} <NA> <NA>\n")
 
 
-def _waveform_to_tempfile(waveform: np.ndarray, sample_rate: int) -> str:
-    """Write an in-memory waveform (numpy float32) to a temporary WAV file.
-
-    Returns the path to the temp file.  Caller is responsible for cleanup.
-    """
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        try:
-            sf.write(tmp.name, waveform, sample_rate)
-        except Exception:
-            os.unlink(tmp.name)
-            raise
-        return tmp.name
-
-
 @dataclass
 class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     """Speaker diarization inference using Streaming Sortformer (NeMo).
@@ -110,15 +93,13 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
     Supports two input modes:
 
-    1. **File path mode** (default): reads audio from
-       ``task.data[filepath_key]`` (e.g. ``"audio_filepath"``).
+    1. **File path mode**: reads audio from ``task.data[filepath_key]``.
     2. **In-memory waveform mode**: when ``task.data[waveform_key]``
-       exists, the stage writes the waveform to a temp file, runs
-       diarization, and cleans up.  This is the mode used by the
-       NeMo tarred audio pipeline where audio lives in memory.
+       exists, numpy arrays are passed directly to NeMo's ``diarize()``
+       API (requires NeMo >= 2.7).
 
     Args:
-        model_name: Hugging Face model id.
+        model_name: Hugging Face model id or local ``.nemo`` path.
         model_path: Local path to a .nemo checkpoint file; overrides model_name.
         cache_dir: Directory for caching downloaded model weights.
         diar_model: Pre-loaded SortformerEncLabelModel; if provided, setup() is a no-op.
@@ -219,28 +200,17 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             out.append(self.diar_segments_key)
         return ["data"], out
 
-    def diarize(self, audio_paths: list[str]) -> list[list[dict[str, Any]]]:
-        """Run Sortformer on a list of audio files.
+    def _diarize(self, audio: list[np.ndarray] | list[str], sample_rate: int | None = None) -> list[list[dict[str, Any]]]:
+        """Run Sortformer diarization on a list of audio inputs.
 
-        Returns a list (one entry per file) of segment lists [{start, end, speaker}].
+        Accepts either file paths or numpy arrays (with sample_rate).
         """
         predicted_segments = self.diar_model.diarize(
-            audio=audio_paths,
+            audio=audio,
             batch_size=self.inference_batch_size,
+            sample_rate=sample_rate,
         )
         return [_parse_sortformer_segments(segs) for segs in predicted_segments]
-
-    def _resolve_audio_path(self, task: AudioTask) -> tuple[str, bool]:
-        """Resolve the audio path for a task.
-
-        Returns ``(path, is_temp)`` where *is_temp* indicates a temporary
-        file that the caller must clean up.
-        """
-        waveform = task.data.get(self.waveform_key)
-        if waveform is not None:
-            tmp_path = _waveform_to_tempfile(waveform, task.data[self.sample_rate_key])
-            return tmp_path, True
-        return task.data[self.filepath_key], False
 
     def _apply_results(self, task: AudioTask, segments: list[dict[str, Any]]) -> None:
         """Write diarization results into *task.data*."""
@@ -250,15 +220,15 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
     def process(self, task: AudioTask) -> AudioTask:
         """Run speaker diarization on a single task."""
-        audio_path, is_temp = self._resolve_audio_path(task)
-        try:
-            segments = self.diarize([audio_path])[0]
-        finally:
-            if is_temp:
-                os.unlink(audio_path)
+        waveform = task.data.get(self.waveform_key)
+        if waveform is not None:
+            sr = task.data[self.sample_rate_key]
+            segments = self._diarize([waveform], sample_rate=sr)[0]
+        else:
+            segments = self._diarize([task.data[self.filepath_key]])[0]
 
         if self.rttm_out_dir is not None:
-            sess_name = task.data.get("session_name") or os.path.splitext(os.path.basename(audio_path))[0]
+            sess_name = task.data.get("session_name") or task.task_id
             _write_rttm(segments, sess_name, self.rttm_out_dir)
 
         self._apply_results(task, segments)
@@ -269,28 +239,22 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if not tasks:
             return []
 
-        audio_paths: list[str] = []
-        is_temp: list[bool] = []
+        waveforms = [t.data.get(self.waveform_key) for t in tasks]
+        use_waveform = waveforms[0] is not None
 
-        try:
-            for t in tasks:
-                path, tmp = self._resolve_audio_path(t)
-                audio_paths.append(path)
-                is_temp.append(tmp)
+        if use_waveform:
+            sr = tasks[0].data[self.sample_rate_key]
+            all_segments = self._diarize(waveforms, sample_rate=sr)
+        else:
+            paths = [t.data[self.filepath_key] for t in tasks]
+            all_segments = self._diarize(paths)
 
-            all_segments = self.diarize(audio_paths)
+        for task, segments in zip(tasks, all_segments, strict=True):
+            self._apply_results(task, segments)
 
-            for task, segments, path in zip(tasks, all_segments, audio_paths, strict=True):
-                self._apply_results(task, segments)
-
-                if self.rttm_out_dir is not None:
-                    sess_name = task.data.get("session_name") or os.path.splitext(os.path.basename(path))[0]
-                    _write_rttm(segments, sess_name, self.rttm_out_dir)
-        finally:
-            for path, tmp in zip(audio_paths, is_temp, strict=True):
-                if tmp:
-                    with contextlib.suppress(OSError):
-                        os.unlink(path)
+            if self.rttm_out_dir is not None:
+                sess_name = task.data.get("session_name") or task.task_id
+                _write_rttm(segments, sess_name, self.rttm_out_dir)
 
         logger.info(f"Sortformer: diarized {len(tasks)} samples")
         return tasks
