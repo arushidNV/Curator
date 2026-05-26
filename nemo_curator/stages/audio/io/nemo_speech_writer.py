@@ -28,7 +28,6 @@ import io
 import json
 import os
 import tarfile
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -71,7 +70,7 @@ class TarredDatasetWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
     samples_per_tar: int = 1000
     target_sample_rate: int = _TARGET_SR
     waveform_key: str = "waveform"
-    sample_rate_key: str = "sampling_rate"
+    sample_rate_key: str = "sample_rate"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     _current_tar: Any = field(default=None, init=False, repr=False)
@@ -127,14 +126,22 @@ class TarredDatasetWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             self._current_tar.close()
             self._current_tar = None
 
-    def _encode_opus(self, waveform: np.ndarray, sr: int) -> bytes:
+    def _encode_opus(self, waveform: Any, sr: int) -> bytes:
+        if not isinstance(waveform, np.ndarray):
+            import torch
+
+            if isinstance(waveform, torch.Tensor):
+                waveform = waveform.numpy()
+            else:
+                waveform = np.asarray(waveform, dtype=np.float32)
+
+        if waveform.ndim > 1:
+            waveform = waveform.mean(axis=0)
+
         if sr != self.target_sample_rate:
             import librosa
 
             waveform = librosa.resample(waveform, orig_sr=sr, target_sr=self.target_sample_rate)
-
-        if waveform.ndim > 1:
-            waveform = waveform.mean(axis=0)
 
         buf = io.BytesIO()
         sf.write(buf, waveform, self.target_sample_rate, format="OGG", subtype="OPUS")
@@ -156,7 +163,7 @@ class TarredDatasetWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         info.size = len(opus_bytes)
         self._current_tar.addfile(info, io.BytesIO(opus_bytes))
 
-        duration = len(waveform) / sr
+        duration = task.data.get("duration_sec") or (len(waveform) / sr if sr > 0 else 0)
         manifest_entry = {
             "audio_filepath": filename,
             "duration": round(duration, 4),

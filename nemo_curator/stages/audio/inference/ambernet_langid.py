@@ -59,7 +59,7 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     name: str = "AmberNetLangID"
     model_name: str = "langid_ambernet"
     waveform_key: str = "waveform"
-    sample_rate_key: str = "sampling_rate"
+    sample_rate_key: str = "sample_rate"
     output_key: str = "language"
     confidence_key: str = "language_confidence"
     min_duration_sec: float = 1.0
