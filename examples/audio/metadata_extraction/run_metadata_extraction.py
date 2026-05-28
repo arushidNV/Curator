@@ -24,13 +24,14 @@ Pipeline:
         -> SEDInferenceStage (sound event detection on each segment)
         -> SEDPostprocessingStage (converts framewise probs to event labels)
         -> AmberNetLangIDStage (language identification per segment)
-        -> TarredDatasetWriterStage (encodes to opus, packs into tar shards)
+        -> NeMoSpeechWriterStage (encodes to opus at 16kHz + original SR)
 """
 
 from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import dataclass
 
 from loguru import logger
 
@@ -38,10 +39,81 @@ from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio.inference.ambernet_langid import AmberNetLangIDStage
 from nemo_curator.stages.audio.inference.sed import SEDInferenceStage
 from nemo_curator.stages.audio.io.nemo_speech_reader import NeMoSpeechAudioReader
-from nemo_curator.stages.audio.io.nemo_speech_writer import TarredDatasetWriterStage
+from nemo_curator.stages.audio.io.nemo_speech_writer import NeMoSpeechWriterStage
 from nemo_curator.stages.audio.postprocessing.sed_postprocessing import SEDPostprocessingStage
 from nemo_curator.stages.audio.segmentation import VADSegmentationStage
+from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
+from nemo_curator.tasks import AudioTask
+
+
+@dataclass
+class MonoDownsampleStage(ProcessingStage[AudioTask, AudioTask]):
+    """Convert to mono and downsample to target sample rate. Runs once before VAD."""
+
+    name: str = "MonoDownsample"
+    target_sample_rate: int = 16000
+    waveform_key: str = "waveform"
+    sample_rate_key: str = "sample_rate"
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], [self.waveform_key]
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], [self.waveform_key, self.sample_rate_key]
+
+    def process(self, task: AudioTask) -> AudioTask:
+        import numpy as np
+
+        wav = task.data.get(self.waveform_key)
+        sr = task.data.get(self.sample_rate_key, self.target_sample_rate)
+
+        if wav is None:
+            return task
+
+        wav = np.asarray(wav, dtype=np.float32)
+        if wav.ndim > 1:
+            wav = wav.mean(axis=0)
+
+        if sr != self.target_sample_rate:
+            import librosa
+
+            task.data["original_sampling_rate"] = sr
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=self.target_sample_rate)
+
+        task.data[self.waveform_key] = wav
+        task.data[self.sample_rate_key] = self.target_sample_rate
+        task.data["sampling_rate"] = self.target_sample_rate
+        return task
+
+
+@dataclass
+class SqueezeWaveformStage(ProcessingStage[AudioTask, AudioTask]):
+    """Squeeze (1, N) waveforms to (N,) for downstream compatibility.
+
+    VAD outputs waveform with shape (1, N) from .unsqueeze(0), but
+    downstream stages (SED, LangID) expect 1D (N,) arrays.
+    """
+
+    name: str = "SqueezeWaveform"
+    waveform_key: str = "waveform"
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], [self.waveform_key]
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], [self.waveform_key]
+
+    def process(self, task: AudioTask) -> AudioTask:
+        import numpy as np
+
+        wav = task.data.get(self.waveform_key)
+        if wav is not None:
+            wav = np.asarray(wav)
+            if wav.ndim > 1:
+                wav = wav.squeeze()
+            task.data[self.waveform_key] = wav
+        return task
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -69,7 +141,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     lid.add_argument("--skip_langid", action="store_true", default=False, help="Skip language ID stage.")
 
     out = ap.add_argument_group("Output")
-    out.add_argument("--samples_per_tar", type=int, default=1000, help="Segments per tar shard.")
     out.add_argument("--target_sample_rate", type=int, default=16000, help="Output sample rate.")
 
     return ap
@@ -84,6 +155,7 @@ def main() -> None:
             corpus_filter=args.corpus,
             output_dir=args.output_dir,
         ),
+        MonoDownsampleStage(target_sample_rate=args.target_sample_rate),
         VADSegmentationStage(
             threshold=args.vad_threshold,
             min_duration_sec=args.min_duration_sec,
@@ -91,6 +163,7 @@ def main() -> None:
             speech_pad_ms=args.speech_pad_ms,
             nested=False,
         ),
+        SqueezeWaveformStage(),
     ]
 
     if args.sed_checkpoint:
@@ -116,9 +189,8 @@ def main() -> None:
         )
 
     stages.append(
-        TarredDatasetWriterStage(
+        NeMoSpeechWriterStage(
             output_dir=args.output_dir,
-            samples_per_tar=args.samples_per_tar,
             target_sample_rate=args.target_sample_rate,
         )
     )
@@ -137,7 +209,7 @@ def main() -> None:
         logger.info(f"  SED: enabled (checkpoint={args.sed_checkpoint})")
     if not args.skip_langid:
         logger.info(f"  LangID: {args.langid_model}")
-    logger.info(f"  Output: {args.samples_per_tar} samples/tar, {args.target_sample_rate}Hz opus")
+    logger.info(f"  Output: individual opus files at {args.target_sample_rate}Hz + original SR")
 
     t0 = time.time()
     pipeline.run(executor=executor)
