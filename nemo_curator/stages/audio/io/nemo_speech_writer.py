@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tarred dataset writer — encodes audio segments to opus and packs into tar shards.
+"""NeMo Speech Writer — encodes audio segments to opus files at multiple sample rates.
 
-Produces NeMo-compatible tarred datasets:
+Produces two versions of each segment:
     output_dir/
-        audio_0.tar          (opus-encoded audio files)
-        audio_1.tar
-        ...
-        manifest.jsonl       (one line per segment with metadata)
+        16k/
+            0_0.opus, 0_1.opus, ...    (16kHz mono)
+        original/
+            0_0.opus, 0_1.opus, ...    (original sample rate, mono)
+        manifest.jsonl                  (one line per segment with metadata)
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import tarfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -44,40 +44,35 @@ from nemo_curator.tasks import AudioTask, FileGroupTask
 
 try:
     from nemo_curator.backends.utils import RayStageSpecKeys
-except ImportError:
+except (ImportError, ModuleNotFoundError):
     RayStageSpecKeys = None
 
 _TARGET_SR = 16000
 
 
 @dataclass
-class TarredDatasetWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
-    """Write audio segments as opus files packed into tar shards.
+class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
+    """Write audio segments as individual opus files at two sample rates.
 
-    Downsamples to 16kHz mono and encodes to opus before writing.
-    Generates a NeMo-format JSONL manifest alongside the tars.
+    Produces 16kHz mono and original-rate mono versions of each segment,
+    plus a single manifest referencing both.
 
     Args:
-        output_dir: Root directory for output tars and manifest.
-        samples_per_tar: Number of audio segments per tar shard.
-        target_sample_rate: Output sample rate (default 16000).
+        output_dir: Root directory for output.
+        target_sample_rate: Downsampled rate (default 16000).
         waveform_key: Task data key for audio waveform.
         sample_rate_key: Task data key for sample rate.
     """
 
-    name: str = "tarred_dataset_writer"
+    name: str = "nemo_speech_writer"
     output_dir: str = ""
-    samples_per_tar: int = 1000
     target_sample_rate: int = _TARGET_SR
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
-    _current_tar: Any = field(default=None, init=False, repr=False)
-    _current_shard_id: int = field(default=0, init=False, repr=False)
-    _samples_in_current_tar: int = field(default=0, init=False, repr=False)
-    _manifest_file: Any = field(default=None, init=False, repr=False)
     _total_written: int = field(default=0, init=False, repr=False)
+    _shard_counts: dict = field(default_factory=dict, init=False, repr=False)
 
     def setup_on_node(
         self,
@@ -88,18 +83,24 @@ class TarredDatasetWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
-        manifest_path = os.path.join(self.output_dir, "manifest.jsonl")
-        self._manifest_file = open(manifest_path, "a", encoding="utf-8")  # noqa: SIM115
-        self._open_new_tar()
+
+        # Recover _shard_counts from existing .done markers on restart
+        if os.path.isdir(self.output_dir):
+            for root, _dirs, files in os.walk(self.output_dir):
+                for fname in files:
+                    if fname.endswith(".jsonl.done"):
+                        rel = os.path.relpath(os.path.join(root, fname), self.output_dir)
+                        shard_key = rel[: -len(".jsonl.done")]
+                        self._shard_counts[shard_key] = -1  # mark as already done
 
     def teardown(self) -> None:
-        self._close_current_tar()
-        if self._manifest_file is not None:
-            self._manifest_file.close()
-            self._manifest_file = None
+        done_count = sum(
+            1 for k, v in self._shard_counts.items()
+            if v == -1 or os.path.exists(os.path.join(self.output_dir, f"{k}.jsonl.done"))
+        )
         logger.info(
-            f"TarredDatasetWriter: wrote {self._total_written} segments "
-            f"across {self._current_shard_id + 1} tar shards to {self.output_dir}"
+            f"NeMoSpeechWriter: wrote {self._total_written} segments to {self.output_dir}, "
+            f"{done_count}/{len(self._shard_counts)} shards completed with .done"
         )
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -116,17 +117,7 @@ class TarredDatasetWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             return {RayStageSpecKeys.IS_ACTOR_STAGE: True}
         return {"is_actor_stage": True}
 
-    def _open_new_tar(self) -> None:
-        tar_path = os.path.join(self.output_dir, f"audio_{self._current_shard_id}.tar")
-        self._current_tar = tarfile.open(tar_path, "w")
-        self._samples_in_current_tar = 0
-
-    def _close_current_tar(self) -> None:
-        if self._current_tar is not None:
-            self._current_tar.close()
-            self._current_tar = None
-
-    def _encode_opus(self, waveform: Any, sr: int) -> bytes:
+    def _to_numpy_mono(self, waveform: Any) -> np.ndarray:
         if not isinstance(waveform, np.ndarray):
             import torch
 
@@ -136,65 +127,101 @@ class TarredDatasetWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
                 waveform = np.asarray(waveform, dtype=np.float32)
 
         if waveform.ndim > 1:
+            waveform = waveform.squeeze()
+        if waveform.ndim > 1:
             waveform = waveform.mean(axis=0)
 
-        if sr != self.target_sample_rate:
-            import librosa
+        return waveform.astype(np.float32)
 
-            waveform = librosa.resample(waveform, orig_sr=sr, target_sr=self.target_sample_rate)
-
+    def _encode_opus(self, waveform: np.ndarray, sr: int) -> bytes:
         buf = io.BytesIO()
-        sf.write(buf, waveform, self.target_sample_rate, format="OGG", subtype="OPUS")
+        sf.write(buf, waveform, sr, format="OGG", subtype="OPUS")
         return buf.getvalue()
 
-    def process(self, task: AudioTask) -> FileGroupTask:
+    def _resample(self, waveform: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        if orig_sr == target_sr:
+            return waveform
+        import librosa
+
+        return librosa.resample(waveform, orig_sr=orig_sr, target_sr=target_sr)
+
+    def process(self, task: AudioTask) -> FileGroupTask:  # noqa: C901
+        # Skip segments from already-completed shards (resume support)
+        shard_key = task._metadata.get("_shard_key", "")
+        if shard_key and self._shard_counts.get(shard_key) == -1:
+            return FileGroupTask(task_id=task.task_id, dataset_name=task.dataset_name, data=[])
+
         waveform = task.data.get(self.waveform_key)
         sr = task.data.get(self.sample_rate_key, self.target_sample_rate)
 
-        if waveform is None or len(waveform) == 0:
+        if waveform is None or (hasattr(waveform, "__len__") and len(waveform) == 0):
             return FileGroupTask(task_id=task.task_id, dataset_name=task.dataset_name, data=[])
 
+        waveform = self._to_numpy_mono(waveform)
+
+        # Derive filename from original audio path + offset
+        original_file = task.data.get("original_file", task.data.get("audio_filepath", ""))
+        base_name = os.path.splitext(os.path.basename(original_file))[0] if original_file else str(self._total_written)
+        offset_ms = int(task.data.get("start_ms", 0))
+        filename = f"{base_name}_{offset_ms}ms.opus"
+
+        # Use shard_key as subdirectory to mirror input structure
+        shard_subdir = shard_key or ""
+        segment_dir = os.path.join(self.output_dir, shard_subdir)
+        os.makedirs(segment_dir, exist_ok=True)
+
+        # Write opus (already at target SR from upstream ResampleStage)
         opus_bytes = self._encode_opus(waveform, sr)
+        out_path = os.path.join(segment_dir, filename)
+        with open(out_path, "wb") as f:
+            f.write(opus_bytes)
 
-        segment_id = f"{self._current_shard_id}_{self._samples_in_current_tar}"
-        filename = f"{segment_id}.opus"
-
-        info = tarfile.TarInfo(name=filename)
-        info.size = len(opus_bytes)
-        self._current_tar.addfile(info, io.BytesIO(opus_bytes))
-
+        # Build manifest entry
         duration = task.data.get("duration_sec") or (len(waveform) / sr if sr > 0 else 0)
+        original_sr = task.data.get("original_sampling_rate", sr)
+        rel_path = os.path.join(shard_subdir, filename) if shard_subdir else filename
         manifest_entry = {
-            "audio_filepath": filename,
+            "audio_filepath": rel_path,
             "duration": round(duration, 4),
-            "shard_id": self._current_shard_id,
-            "sampling_rate": self.target_sample_rate,
+            "sample_rate": sr,
+            "sampling_rate": sr,
+            "original_sampling_rate": original_sr,
         }
 
-        if "original_file" in task.data:
-            manifest_entry["original_audio_filepath"] = task.data["original_file"]
+        original_file = task.data.get("original_file", task.data.get("audio_filepath", ""))
+        if original_file:
+            manifest_entry["original_audio_filepath"] = original_file
         if "start_ms" in task.data:
             manifest_entry["offset"] = task.data["start_ms"] / 1000.0
         if "end_ms" in task.data:
             manifest_entry["original_end"] = task.data["end_ms"] / 1000.0
         if "language" in task.data:
             manifest_entry["language"] = task.data["language"]
+        if "language_confidence" in task.data:
+            manifest_entry["language_confidence"] = round(task.data["language_confidence"], 4)
         if "sed_events" in task.data:
             manifest_entry["sed_events"] = task.data["sed_events"]
 
-        self._manifest_file.write(json.dumps(manifest_entry) + "\n")
-        self._manifest_file.flush()
+        # Write to per-shard manifest
+        shard_manifest_path = os.path.join(self.output_dir, f"{shard_subdir}.jsonl") if shard_subdir else os.path.join(self.output_dir, "manifest.jsonl")
+        os.makedirs(os.path.dirname(shard_manifest_path), exist_ok=True)
+        with open(shard_manifest_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(manifest_entry) + "\n")
 
-        self._samples_in_current_tar += 1
         self._total_written += 1
 
-        if self._samples_in_current_tar >= self.samples_per_tar:
-            self._close_current_tar()
-            self._current_shard_id += 1
-            self._open_new_tar()
+        # Checkpointing: track per-shard progress and write .done markers
+        shard_total = task._metadata.get("_shard_total", 0)
+        if shard_key:
+            self._shard_counts[shard_key] = self._shard_counts.get(shard_key, 0) + 1
+            if shard_total > 0 and self._shard_counts[shard_key] >= shard_total:
+                done_path = os.path.join(self.output_dir, f"{shard_subdir}.jsonl.done")
+                os.makedirs(os.path.dirname(done_path), exist_ok=True)
+                open(done_path, "w").close()
+                logger.info(f"Shard {shard_key} complete: {self._shard_counts[shard_key]} segments")
 
         return FileGroupTask(
             task_id=task.task_id,
             dataset_name=task.dataset_name,
-            data=[os.path.join(self.output_dir, f"audio_{self._current_shard_id}.tar")],
+            data=[out_path],
         )
