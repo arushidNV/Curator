@@ -25,6 +25,8 @@ from nemo.collections.asr.models import SortformerEncLabelModel
 from nemo_curator.stages.base import ProcessingStage
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
@@ -89,21 +91,32 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     diarization with streaming support. See:
     https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2
 
+    Supports two input modes:
+
+    1. **File path mode**: reads audio from ``task.data[filepath_key]``.
+    2. **In-memory waveform mode**: when ``task.data[waveform_key]``
+       exists, numpy arrays are passed directly to NeMo's ``diarize()``
+       API (requires NeMo >= 2.7).
+
     Args:
-        model_name: Hugging Face model id. Defaults to "nvidia/diar_streaming_sortformer_4spk-v2".
-        model_path: Local path to a .nemo checkpoint file; if set, takes precedence over model_name.
-        cache_dir: Directory for caching downloaded model weights. Defaults to HF hub default.
+        model_name: Hugging Face model id or local ``.nemo`` path.
+        model_path: Local path to a .nemo checkpoint file; overrides model_name.
+        cache_dir: Directory for caching downloaded model weights.
         diar_model: Pre-loaded SortformerEncLabelModel; if provided, setup() is a no-op.
-        filepath_key: Key in data for path to audio file. Defaults to "audio_filepath".
-        diar_segments_key: Key in output data for diarization segments list. Defaults to "diar_segments".
-        rttm_out_dir: Optional directory to write RTTM files. Defaults to None.
-        chunk_len: Streaming chunk size in 80 ms frames. Defaults to 340 (~30.4 s latency).
-        chunk_right_context: Right context frames. Defaults to 40.
-        fifo_len: FIFO queue size in frames. Defaults to 40.
-        spkcache_update_period: Speaker cache update period in frames. Defaults to 300.
-        spkcache_len: Speaker cache size in frames. Defaults to 188.
-        inference_batch_size: Batch size passed to diarize(). Defaults to 1.
-        name: Stage name. Defaults to "Sortformer_inference".
+        filepath_key: Key in data for path to audio file.
+        waveform_key: Key in data for in-memory waveform (numpy float32).
+        sample_rate_key: Key in data for sample rate (int).
+        diar_segments_key: Key in output data for diarization segments list.
+        num_speakers_key: Key in output data for the number of distinct speakers.
+        store_segments: Whether to store the full diar_segments in task.data.
+        rttm_out_dir: Optional directory to write RTTM files.
+        chunk_len: Streaming chunk size in 80 ms frames.
+        chunk_right_context: Right context frames.
+        fifo_len: FIFO queue size in frames.
+        spkcache_update_period: Speaker cache update period in frames.
+        spkcache_len: Speaker cache size in frames.
+        inference_batch_size: Batch size passed to diarize().
+        name: Stage name.
     """
 
     model_name: str = "nvidia/diar_streaming_sortformer_4spk-v2"
@@ -111,7 +124,11 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     cache_dir: str | None = None
     diar_model: Any | None = None
     filepath_key: str = "audio_filepath"
+    waveform_key: str = "waveform"
+    sample_rate_key: str = "sample_rate"
     diar_segments_key: str = "diar_segments"
+    num_speakers_key: str = "num_speakers"
+    store_segments: bool = True
     rttm_out_dir: str | None = None
     chunk_len: int = 340
     chunk_right_context: int = 40
@@ -120,7 +137,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     spkcache_len: int = 188
     inference_batch_size: int = 1
     name: str = "Sortformer_inference"
-    batch_size: int = 1
+    batch_size: int = 8
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0, gpu_memory_gb=8.0))
 
     def setup_on_node(
@@ -146,11 +163,21 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             self._configure_streaming()
             return
 
-        self.diar_model = SortformerEncLabelModel.restore_from(
-            restore_path=self.model_path,
-            map_location="cuda",
-            strict=False,
-        )
+        restore_path = self.model_path
+        if not restore_path and self.model_name.endswith(".nemo"):
+            restore_path = self.model_name
+
+        if restore_path:
+            self.diar_model = SortformerEncLabelModel.restore_from(
+                restore_path=restore_path,
+                map_location="cuda",
+                strict=False,
+            )
+        else:
+            self.diar_model = SortformerEncLabelModel.from_pretrained(
+                model_name=self.model_name,
+                map_location="cuda",
+            )
 
         self.diar_model.eval()
         self._configure_streaming()
@@ -168,45 +195,66 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         return ["data"], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.filepath_key, self.diar_segments_key]
+        out = [self.num_speakers_key]
+        if self.store_segments:
+            out.append(self.diar_segments_key)
+        return ["data"], out
 
-    def diarize(self, audio_paths: list[str]) -> list[list[dict[str, Any]]]:
-        """Run Sortformer on a list of audio files.
+    def _diarize(self, audio: list[np.ndarray] | list[str], sample_rate: int | None = None) -> list[list[dict[str, Any]]]:
+        """Run Sortformer diarization on a list of audio inputs.
 
-        Returns a list (one entry per file) of segment lists [{start, end, speaker}].
+        Accepts either file paths or numpy arrays (with sample_rate).
         """
         predicted_segments = self.diar_model.diarize(
-            audio=audio_paths,
+            audio=audio,
             batch_size=self.inference_batch_size,
+            sample_rate=sample_rate,
         )
         return [_parse_sortformer_segments(segs) for segs in predicted_segments]
 
+    def _apply_results(self, task: AudioTask, segments: list[dict[str, Any]]) -> None:
+        """Write diarization results into *task.data*."""
+        task.data[self.num_speakers_key] = len({seg["speaker"] for seg in segments})
+        if self.store_segments:
+            task.data[self.diar_segments_key] = segments
+
     def process(self, task: AudioTask) -> AudioTask:
-        """Run speaker diarization on the audio file in the task."""
-        if not self.validate_input(task):
-            msg = f"Task {task!s} failed validation for stage {self}"
-            raise ValueError(msg)
-
-        file_path = task.data[self.filepath_key]
-        sess_name = task.data.get("session_name")
-        resolved_sess_name = (
-            sess_name if sess_name is not None else os.path.splitext(os.path.basename(file_path))[0]
-        )
-
-        all_segments = self.diarize([file_path])
-        segments = all_segments[0]
+        """Run speaker diarization on a single task."""
+        waveform = task.data.get(self.waveform_key)
+        if waveform is not None:
+            sr = task.data[self.sample_rate_key]
+            segments = self._diarize([waveform], sample_rate=sr)[0]
+        else:
+            segments = self._diarize([task.data[self.filepath_key]])[0]
 
         if self.rttm_out_dir is not None:
-            _write_rttm(segments, resolved_sess_name, self.rttm_out_dir)
+            sess_name = task.data.get("session_name") or task.task_id
+            _write_rttm(segments, sess_name, self.rttm_out_dir)
 
-        output_data = dict(task.data)
-        output_data[self.diar_segments_key] = segments
+        self._apply_results(task, segments)
+        return task
 
-        return AudioTask(
-            task_id=f"{task.task_id}_sortformer",
-            dataset_name=task.dataset_name,
-            filepath_key=task.filepath_key or self.filepath_key,
-            data=output_data,
-            _metadata=task._metadata,
-            _stage_perf=task._stage_perf,
-        )
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+        """Run batched speaker diarization across multiple tasks."""
+        if len(tasks) == 0:
+            return []
+
+        waveforms = [t.data.get(self.waveform_key) for t in tasks]
+        use_waveform = waveforms[0] is not None
+
+        if use_waveform:
+            sr = tasks[0].data[self.sample_rate_key]
+            all_segments = self._diarize(waveforms, sample_rate=sr)
+        else:
+            paths = [t.data[self.filepath_key] for t in tasks]
+            all_segments = self._diarize(paths)
+
+        for task, segments in zip(tasks, all_segments, strict=True):
+            self._apply_results(task, segments)
+
+            if self.rttm_out_dir is not None:
+                sess_name = task.data.get("session_name") or task.task_id
+                _write_rttm(segments, sess_name, self.rttm_out_dir)
+
+        logger.info(f"Sortformer: diarized {len(tasks)} samples")
+        return tasks
