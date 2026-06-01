@@ -14,12 +14,14 @@
 
 """Metadata extraction pipeline for unsegmented audio.
 
-Reads long unsegmented audio from NeMo input_cfg YAML, segments with
-Silero VAD, runs SED and language ID on each segment, then writes
-output as a NeMo tarred dataset (16kHz mono opus).
+Reads long unsegmented audio from NeMo input_cfg YAML, optionally runs
+speaker diarization (Sortformer) on the full audio, segments with Silero VAD,
+runs SED and language ID on each segment, then writes output as a NeMo
+tarred dataset (16kHz mono opus).
 
 Pipeline:
     NeMoSpeechAudioReader (reads full audio from input_cfg)
+        -> InferenceSortformerStage (speaker diarization on full audio) [optional]
         -> VADSegmentationStage (segments into speech chunks, fan-out)
         -> SEDInferenceStage (sound event detection on each segment)
         -> SEDPostprocessingStage (converts framewise probs to event labels)
@@ -38,6 +40,7 @@ from loguru import logger
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio.inference.ambernet_langid import AmberNetLangIDStage
 from nemo_curator.stages.audio.inference.sed import SEDInferenceStage
+from nemo_curator.stages.audio.inference.sortformer import InferenceSortformerStage
 from nemo_curator.stages.audio.io.nemo_speech_reader import NeMoSpeechAudioReader
 from nemo_curator.stages.audio.io.nemo_speech_writer import NeMoSpeechWriterStage
 from nemo_curator.stages.audio.postprocessing.sed_postprocessing import SEDPostprocessingStage
@@ -140,6 +143,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     lid.add_argument("--langid_gpu_memory_gb", type=float, default=4.0, help="GPU memory for LangID stage.")
     lid.add_argument("--skip_langid", action="store_true", default=False, help="Skip language ID stage.")
 
+    diar = ap.add_argument_group("Speaker Diarization (Sortformer)")
+    diar.add_argument(
+        "--sortformer_model", type=str, default=None,
+        help="HuggingFace model id or local .nemo path. Enables Sortformer diarization on full audio.",
+    )
+    diar.add_argument("--sortformer_gpu_memory_gb", type=float, default=8.0, help="GPU memory for Sortformer stage.")
+    diar.add_argument("--sortformer_batch_size", type=int, default=1, help="Sortformer inference batch size.")
+    diar.add_argument("--rttm_out_dir", type=str, default=None, help="Directory to write RTTM files.")
+
     out = ap.add_argument_group("Output")
     out.add_argument("--target_sample_rate", type=int, default=16000, help="Output sample rate.")
 
@@ -156,15 +168,31 @@ def main() -> None:
             output_dir=args.output_dir,
         ),
         MonoDownsampleStage(target_sample_rate=args.target_sample_rate),
+    ]
+
+    if args.sortformer_model:
+        model_path = args.sortformer_model if args.sortformer_model.endswith(".nemo") else None
+        model_name = args.sortformer_model if model_path is None else "nvidia/diar_streaming_sortformer_4spk-v2"
+        stages.append(
+            InferenceSortformerStage(
+                model_name=model_name,
+                model_path=model_path,
+                inference_batch_size=args.sortformer_batch_size,
+                rttm_out_dir=args.rttm_out_dir,
+                resources=Resources(gpu_memory_gb=args.sortformer_gpu_memory_gb),
+            )
+        )
+
+    stages.append(
         VADSegmentationStage(
             threshold=args.vad_threshold,
             min_duration_sec=args.min_duration_sec,
             max_duration_sec=args.max_duration_sec,
             speech_pad_ms=args.speech_pad_ms,
             nested=False,
-        ),
-        SqueezeWaveformStage(),
-    ]
+        )
+    )
+    stages.append(SqueezeWaveformStage())
 
     if args.sed_checkpoint:
         stages.append(
@@ -204,6 +232,8 @@ def main() -> None:
     logger.info(f"Metadata extraction pipeline: {len(stages)} stages")
     logger.info(f"  Input: {args.data_config}")
     logger.info(f"  Output: {args.output_dir}")
+    if args.sortformer_model:
+        logger.info(f"  Sortformer: {args.sortformer_model} (on full audio before VAD)")
     logger.info(f"  VAD: threshold={args.vad_threshold}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s")
     if args.sed_checkpoint:
         logger.info(f"  SED: enabled (checkpoint={args.sed_checkpoint})")
