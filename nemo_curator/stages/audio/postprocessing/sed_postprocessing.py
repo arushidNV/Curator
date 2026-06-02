@@ -79,6 +79,7 @@ class SEDPostprocessingStage(ProcessingStage[AudioTask, AudioTask]):
     framewise_key: str = "_sed_framewise"
     npz_filepath_key: str = "npz_filepath"
     events_key: str = "sed_events"
+    skip_if_output_exists: bool = False
 
     name: str = "SEDPostprocessing"
     batch_size: int = 1
@@ -91,6 +92,8 @@ class SEDPostprocessingStage(ProcessingStage[AudioTask, AudioTask]):
         return ["data"], [self.events_key]
 
     def process(self, task: AudioTask) -> AudioTask:
+        if self.skip_if_output_exists and self.events_key in task.data:
+            return task
         task.data[self.events_key] = self._detect_all_events(task.data)
         task.data.pop(self.framewise_key, None)
         return task

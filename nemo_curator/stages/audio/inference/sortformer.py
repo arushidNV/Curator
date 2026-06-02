@@ -128,6 +128,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     sample_rate_key: str = "sample_rate"
     diar_segments_key: str = "diar_segments"
     num_speakers_key: str = "num_speakers"
+    skip_if_output_exists: bool = False
     store_segments: bool = True
     rttm_out_dir: str | None = None
     chunk_len: int = 340
@@ -220,6 +221,9 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
     def process(self, task: AudioTask) -> AudioTask:
         """Run speaker diarization on a single task."""
+        if self.skip_if_output_exists and self.num_speakers_key in task.data:
+            return task
+
         waveform = task.data.get(self.waveform_key)
         if waveform is not None:
             sr = task.data[self.sample_rate_key]
@@ -239,22 +243,29 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if len(tasks) == 0:
             return []
 
-        waveforms = [t.data.get(self.waveform_key) for t in tasks]
+        if self.skip_if_output_exists:
+            to_process = [t for t in tasks if self.num_speakers_key not in t.data]
+            if not to_process:
+                return tasks
+        else:
+            to_process = tasks
+
+        waveforms = [t.data.get(self.waveform_key) for t in to_process]
         use_waveform = waveforms[0] is not None
 
         if use_waveform:
-            sr = tasks[0].data[self.sample_rate_key]
+            sr = to_process[0].data[self.sample_rate_key]
             all_segments = self._diarize(waveforms, sample_rate=sr)
         else:
-            paths = [t.data[self.filepath_key] for t in tasks]
+            paths = [t.data[self.filepath_key] for t in to_process]
             all_segments = self._diarize(paths)
 
-        for task, segments in zip(tasks, all_segments, strict=True):
+        for task, segments in zip(to_process, all_segments, strict=True):
             self._apply_results(task, segments)
 
             if self.rttm_out_dir is not None:
                 sess_name = task.data.get("session_name") or task.task_id
                 _write_rttm(segments, sess_name, self.rttm_out_dir)
 
-        logger.info(f"Sortformer: diarized {len(tasks)} samples")
+        logger.info(f"Sortformer: diarized {len(to_process)} samples (skipped {len(tasks) - len(to_process)})")
         return tasks

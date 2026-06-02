@@ -96,6 +96,7 @@ class SEDInferenceStage(ProcessingStage[AudioTask, AudioTask]):
     sample_rate_key: str = "sample_rate"
     filepath_key: str = "audio_filepath"
     skip_me_key: str = "_skipme"
+    skip_if_output_exists: bool = False
 
     name: str = "SEDInference"
     batch_size: int = 32
@@ -232,6 +233,9 @@ class SEDInferenceStage(ProcessingStage[AudioTask, AudioTask]):
 
         for i, task in enumerate(tasks):
             if task.data.get(self.skip_me_key):
+                continue
+
+            if self.skip_if_output_exists and task.data.get("_sed_framewise") is not None:
                 continue
 
             wav = task.data.get(self.waveform_key)

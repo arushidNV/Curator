@@ -63,6 +63,7 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     output_key: str = "language"
     confidence_key: str = "language_confidence"
     min_duration_sec: float = 1.0
+    skip_if_output_exists: bool = False
     batch_size: int = 32
     resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=4.0))
 
@@ -123,6 +124,9 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
         audio_lengths: list[int] = []
 
         for i, task in enumerate(tasks):
+            if self.skip_if_output_exists and task.data.get(self.output_key):
+                continue
+
             waveform = task.data.get(self.waveform_key)
             sr = task.data.get(self.sample_rate_key, self._target_sr)
 
