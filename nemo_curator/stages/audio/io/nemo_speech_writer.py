@@ -201,6 +201,8 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             manifest_entry["language_confidence"] = round(task.data["language_confidence"], 4)
         if "sed_events" in task.data:
             manifest_entry["sed_events"] = task.data["sed_events"]
+        if "num_speakers" in task.data:
+            manifest_entry["num_speakers"] = task.data["num_speakers"]
 
         # Write to per-shard manifest
         shard_manifest_path = os.path.join(self.output_dir, f"{shard_subdir}.jsonl") if shard_subdir else os.path.join(self.output_dir, "manifest.jsonl")
