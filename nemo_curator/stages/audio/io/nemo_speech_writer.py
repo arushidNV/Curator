@@ -212,15 +212,25 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
 
         self._total_written += 1
 
-        # Checkpointing: track per-shard progress and write .done markers
+        # Checkpointing: track per-shard progress by unique input files (not segments).
+        # After VAD, one input audio produces many segments — count unique original files
+        # to compare against shard_total (number of input entries in the manifest).
         shard_total = task._metadata.get("_shard_total", 0)
         if shard_key:
-            self._shard_counts[shard_key] = self._shard_counts.get(shard_key, 0) + 1
-            if shard_total > 0 and self._shard_counts[shard_key] >= shard_total:
+            input_id = task.data.get("original_file") or task.data.get("audio_filepath") or task.task_id
+            if "_seen_inputs" not in self.__dict__:
+                self._seen_inputs: dict[str, set] = {}
+            if shard_key not in self._seen_inputs:
+                self._seen_inputs[shard_key] = set()
+            self._seen_inputs[shard_key].add(input_id)
+            if shard_total > 0 and len(self._seen_inputs[shard_key]) >= shard_total:
                 done_path = os.path.join(self.output_dir, f"{shard_subdir}.jsonl.done")
                 os.makedirs(os.path.dirname(done_path), exist_ok=True)
                 open(done_path, "w").close()
-                logger.info(f"Shard {shard_key} complete: {self._shard_counts[shard_key]} segments")
+                logger.info(
+                    f"Shard {shard_key} complete: {len(self._seen_inputs[shard_key])} inputs processed, "
+                    f"{self._total_written} total segments written"
+                )
 
         return FileGroupTask(
             task_id=task.task_id,
