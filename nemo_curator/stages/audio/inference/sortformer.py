@@ -205,11 +205,10 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
         Accepts either file paths or numpy arrays (with sample_rate).
         """
-        predicted_segments = self.diar_model.diarize(
-            audio=audio,
-            batch_size=self.inference_batch_size,
-            sample_rate=sample_rate,
-        )
+        kwargs: dict[str, Any] = {"audio": audio, "batch_size": self.inference_batch_size}
+        if sample_rate is not None:
+            kwargs["sample_rate"] = sample_rate
+        predicted_segments = self.diar_model.diarize(**kwargs)
         return [_parse_sortformer_segments(segs) for segs in predicted_segments]
 
     def _apply_results(self, task: AudioTask, segments: list[dict[str, Any]]) -> None:
@@ -222,10 +221,17 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         """Run speaker diarization on a single task."""
         waveform = task.data.get(self.waveform_key)
         if waveform is not None:
-            sr = task.data[self.sample_rate_key]
+            sr = task.data.get(self.sample_rate_key)
+            if sr is None:
+                msg = f"Sortformer: waveform provided but '{self.sample_rate_key}' is missing in task {task.task_id}"
+                raise ValueError(msg)
             segments = self._diarize([waveform], sample_rate=sr)[0]
         else:
-            segments = self._diarize([task.data[self.filepath_key]])[0]
+            filepath = task.data.get(self.filepath_key)
+            if filepath is None:
+                msg = f"Sortformer: neither '{self.waveform_key}' nor '{self.filepath_key}' found in task {task.task_id}"
+                raise ValueError(msg)
+            segments = self._diarize([filepath])[0]
 
         if self.rttm_out_dir is not None:
             sess_name = task.data.get("session_name") or task.task_id
@@ -240,10 +246,17 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             return []
 
         waveforms = [t.data.get(self.waveform_key) for t in tasks]
-        use_waveform = waveforms[0] is not None
+        has_waveform = [w is not None for w in waveforms]
+        if any(has_waveform) and not all(has_waveform):
+            msg = "Sortformer: batch contains a mix of waveform and filepath tasks; all tasks must use the same mode"
+            raise ValueError(msg)
+        use_waveform = has_waveform[0]
 
         if use_waveform:
-            sr = tasks[0].data[self.sample_rate_key]
+            sr = tasks[0].data.get(self.sample_rate_key)
+            if sr is None:
+                msg = f"Sortformer: waveform provided but '{self.sample_rate_key}' is missing"
+                raise ValueError(msg)
             all_segments = self._diarize(waveforms, sample_rate=sr)
         else:
             paths = [t.data[self.filepath_key] for t in tasks]

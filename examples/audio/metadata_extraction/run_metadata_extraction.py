@@ -16,8 +16,8 @@
 
 Reads long unsegmented audio from NeMo input_cfg YAML, optionally runs
 speaker diarization (Sortformer) on the full audio, segments with Silero VAD,
-runs SED and language ID on each segment, then writes output as a NeMo
-tarred dataset (16kHz mono opus).
+runs SED and language ID on each segment, then writes output as opus files
+with a NeMo-compatible JSONL manifest (16kHz mono).
 
 Pipeline:
     NeMoSpeechAudioReader (reads full audio from input_cfg)

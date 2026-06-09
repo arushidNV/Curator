@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NeMo Speech Writer — encodes audio segments to opus files at multiple sample rates.
+"""NeMo Speech Writer — encodes audio segments to opus files with a JSONL manifest.
 
-Produces two versions of each segment:
+Produces one opus file per segment at the task's sample rate (typically 16kHz mono
+from upstream downsampling), plus a per-shard JSONL manifest with metadata:
+
     output_dir/
-        16k/
-            0_0.opus, 0_1.opus, ...    (16kHz mono)
-        original/
-            0_0.opus, 0_1.opus, ...    (original sample rate, mono)
-        manifest.jsonl                  (one line per segment with metadata)
+        <shard_key>/
+            <basename>_<offset_ms>ms.opus
+        <shard_key>.jsonl
+        <shard_key>.jsonl.done          (written when all inputs in shard are processed)
 """
 
 from __future__ import annotations
@@ -52,14 +53,15 @@ _TARGET_SR = 16000
 
 @dataclass
 class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
-    """Write audio segments as individual opus files at two sample rates.
+    """Write audio segments as individual opus files with a JSONL manifest.
 
-    Produces 16kHz mono and original-rate mono versions of each segment,
-    plus a single manifest referencing both.
+    Encodes each segment at the task's current sample rate (typically 16kHz
+    mono from upstream downsampling) and writes a per-shard JSONL manifest
+    with duration, language, SED events, and speaker count metadata.
 
     Args:
         output_dir: Root directory for output.
-        target_sample_rate: Downsampled rate (default 16000).
+        target_sample_rate: Expected sample rate (default 16000).
         waveform_key: Task data key for audio waveform.
         sample_rate_key: Task data key for sample rate.
     """

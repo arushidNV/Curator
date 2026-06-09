@@ -126,7 +126,19 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
             waveform = task.data.get(self.waveform_key)
             sr = task.data.get(self.sample_rate_key, self._target_sr)
 
-            if waveform is None or len(waveform) == 0:
+            if waveform is None:
+                task.data[self.output_key] = ""
+                task.data[self.confidence_key] = 0.0
+                continue
+
+            # Normalize to 1-D numpy float32
+            if isinstance(waveform, torch.Tensor):
+                waveform = waveform.squeeze().cpu().numpy()
+            else:
+                waveform = np.asarray(waveform, dtype=np.float32)
+            if waveform.ndim > 1:
+                waveform = waveform.squeeze()
+            if waveform.size == 0:
                 task.data[self.output_key] = ""
                 task.data[self.confidence_key] = 0.0
                 continue
