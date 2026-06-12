@@ -43,11 +43,12 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     Processes audio segments and adds a ``language`` field with the
     predicted language code (e.g., 'en', 'de', 'fr').
 
-    The model resamples to 16kHz internally if the input is at a
-    different sample rate.
+    The model requires 16kHz audio and resamples internally if the
+    input is at a different sample rate.
 
     Args:
         model_name: NeMo model name for from_pretrained.
+        target_sr: Target sample rate for the model (default 16000).
         waveform_key: Task data key for the audio waveform.
         sample_rate_key: Task data key for the sample rate.
         output_key: Task data key to write the predicted language.
@@ -58,6 +59,7 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
 
     name: str = "AmberNetLangID"
     model_name: str = "langid_ambernet"
+    target_sr: int = 16000
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
     output_key: str = "language"
@@ -66,8 +68,7 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     batch_size: int = 32
     resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=4.0))
 
-    _model: Any = field(default=None, init=False, repr=False)
-    _target_sr: int = field(default=16000, init=False, repr=False)
+    model: Any = field(default=None, init=False, repr=False)
 
     def setup_on_node(
         self,
@@ -77,21 +78,21 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
         pass
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
-        if self._model is not None:
+        if self.model is not None:
             return
         import nemo.collections.asr as nemo_asr
 
         logger.info(f"AmberNetLangID: loading model {self.model_name}")
-        self._model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(self.model_name)
-        self._model.eval()
+        self.model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(self.model_name)
+        self.model.eval()
         if torch.cuda.is_available():
-            self._model = self._model.cuda()
+            self.model = self.model.cuda()
         logger.info("AmberNetLangID: model ready")
 
     def teardown(self) -> None:
-        if self._model is not None:
-            del self._model
-            self._model = None
+        if self.model is not None:
+            del self.model
+            self.model = None
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [self.waveform_key, self.sample_rate_key]
@@ -101,10 +102,10 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
 
     def _resample_if_needed(self, waveform: np.ndarray, sr: int) -> torch.Tensor:
         audio = torch.from_numpy(waveform).float()
-        if sr != self._target_sr:
+        if sr != self.target_sr:
             import torchaudio
 
-            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self._target_sr)
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.target_sr)
             audio = resampler(audio)
         return audio
 
@@ -114,7 +115,7 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
         if len(tasks) == 0:
             return []
-        if self._model is None:
+        if self.model is None:
             msg = "Model not initialised — setup() was not called"
             raise RuntimeError(msg)
 
@@ -124,7 +125,7 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
 
         for i, task in enumerate(tasks):
             waveform = task.data.get(self.waveform_key)
-            sr = task.data.get(self.sample_rate_key, self._target_sr)
+            sr = task.data.get(self.sample_rate_key, self.target_sr)
 
             if waveform is None:
                 task.data[self.output_key] = ""
@@ -164,18 +165,16 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
         for j, sig in enumerate(audio_signals):
             batch_tensor[j, : len(sig)] = sig
 
-        device = next(self._model.parameters()).device
+        device = next(self.model.parameters()).device
         batch_tensor = batch_tensor.to(device)
         length_tensor = length_tensor.to(device)
 
         with torch.no_grad():
-            logits, _ = self._model.forward(
-                input_signal=batch_tensor, input_signal_length=length_tensor
-            )
+            logits, _ = self.model.forward(input_signal=batch_tensor, input_signal_length=length_tensor)
             probs = torch.softmax(logits, dim=-1)
             confidences, pred_indices = probs.max(dim=-1)
 
-        labels = self._model.cfg.train_ds.get("labels", None) or self._model.cfg.get("labels", None)
+        labels = self.model.cfg.train_ds.get("labels", None) or self.model.cfg.get("labels", None)
         if labels is None:
             labels = [str(i) for i in range(logits.shape[-1])]
 

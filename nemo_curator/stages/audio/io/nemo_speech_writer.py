@@ -97,7 +97,8 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
 
     def teardown(self) -> None:
         done_count = sum(
-            1 for k, v in self._shard_counts.items()
+            1
+            for k, v in self._shard_counts.items()
             if v == -1 or os.path.exists(os.path.join(self.output_dir, f"{k}.jsonl.done"))
         )
         logger.info(
@@ -146,6 +147,9 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         import librosa
 
         return librosa.resample(waveform, orig_sr=orig_sr, target_sr=target_sr)
+
+    def process_batch(self, tasks: list[AudioTask]) -> list[FileGroupTask]:
+        return [self.process(task) for task in tasks]
 
     def process(self, task: AudioTask) -> FileGroupTask:  # noqa: C901
         # Skip segments from already-completed shards (resume support)
@@ -207,7 +211,11 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             manifest_entry["num_speakers"] = task.data["num_speakers"]
 
         # Write to per-shard manifest
-        shard_manifest_path = os.path.join(self.output_dir, f"{shard_subdir}.jsonl") if shard_subdir else os.path.join(self.output_dir, "manifest.jsonl")
+        shard_manifest_path = (
+            os.path.join(self.output_dir, f"{shard_subdir}.jsonl")
+            if shard_subdir
+            else os.path.join(self.output_dir, "manifest.jsonl")
+        )
         os.makedirs(os.path.dirname(shard_manifest_path), exist_ok=True)
         with open(shard_manifest_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(manifest_entry) + "\n")

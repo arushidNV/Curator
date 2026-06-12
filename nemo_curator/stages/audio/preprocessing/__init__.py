@@ -27,7 +27,13 @@ Example:
     pipeline.add_stage(MonoConversionStage(output_sample_rate=48000))
 """
 
+from .audio_transforms import MonoDownsampleStage, SqueezeWaveformStage
 from .concatenation import SegmentConcatenationStage
 from .mono_conversion import MonoConversionStage
 
-__all__ = ["MonoConversionStage", "SegmentConcatenationStage"]
+__all__ = [
+    "MonoConversionStage",
+    "MonoDownsampleStage",
+    "SegmentConcatenationStage",
+    "SqueezeWaveformStage",
+]

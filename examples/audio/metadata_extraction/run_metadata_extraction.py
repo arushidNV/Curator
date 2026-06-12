@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import time
-from dataclasses import dataclass
 
 from loguru import logger
 
@@ -44,87 +43,23 @@ from nemo_curator.stages.audio.inference.sortformer import InferenceSortformerSt
 from nemo_curator.stages.audio.io.nemo_speech_reader import NeMoSpeechAudioReader
 from nemo_curator.stages.audio.io.nemo_speech_writer import NeMoSpeechWriterStage
 from nemo_curator.stages.audio.postprocessing.sed_postprocessing import SEDPostprocessingStage
+from nemo_curator.stages.audio.preprocessing import MonoDownsampleStage, SqueezeWaveformStage
 from nemo_curator.stages.audio.segmentation import VADSegmentationStage
-from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
-from nemo_curator.tasks import AudioTask
-
-
-@dataclass
-class MonoDownsampleStage(ProcessingStage[AudioTask, AudioTask]):
-    """Convert to mono and downsample to target sample rate. Runs once before VAD."""
-
-    name: str = "MonoDownsample"
-    target_sample_rate: int = 16000
-    waveform_key: str = "waveform"
-    sample_rate_key: str = "sample_rate"
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.waveform_key]
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.waveform_key, self.sample_rate_key]
-
-    def process(self, task: AudioTask) -> AudioTask:
-        import numpy as np
-
-        wav = task.data.get(self.waveform_key)
-        sr = task.data.get(self.sample_rate_key, self.target_sample_rate)
-
-        if wav is None:
-            return task
-
-        wav = np.asarray(wav, dtype=np.float32)
-        if wav.ndim > 1:
-            wav = wav.mean(axis=0)
-
-        if sr != self.target_sample_rate:
-            import librosa
-
-            task.data["original_sampling_rate"] = sr
-            wav = librosa.resample(wav, orig_sr=sr, target_sr=self.target_sample_rate)
-
-        task.data[self.waveform_key] = wav
-        task.data[self.sample_rate_key] = self.target_sample_rate
-        task.data["sampling_rate"] = self.target_sample_rate
-        return task
-
-
-@dataclass
-class SqueezeWaveformStage(ProcessingStage[AudioTask, AudioTask]):
-    """Squeeze (1, N) waveforms to (N,) for downstream compatibility.
-
-    VAD outputs waveform with shape (1, N) from .unsqueeze(0), but
-    downstream stages (SED, LangID) expect 1D (N,) arrays.
-    """
-
-    name: str = "SqueezeWaveform"
-    waveform_key: str = "waveform"
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.waveform_key]
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.waveform_key]
-
-    def process(self, task: AudioTask) -> AudioTask:
-        import numpy as np
-
-        wav = task.data.get(self.waveform_key)
-        if wav is not None:
-            wav = np.asarray(wav)
-            if wav.ndim > 1:
-                wav = wav.squeeze()
-            task.data[self.waveform_key] = wav
-        return task
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Metadata extraction pipeline for unsegmented audio")
 
     ap.add_argument("--data_config", type=str, required=True, help="Path to input_cfg YAML.")
-    ap.add_argument("--output_dir", type=str, required=True, help="Output directory for tarred dataset.")
+    ap.add_argument("--output_dir", type=str, required=True, help="Output directory for opus files + manifest.")
     ap.add_argument("--corpus", type=str, default=None, help="Filter to specific corpus in the YAML.")
+    ap.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help="Filter to specific language(s) in the YAML (comma-separated, e.g. 'en,de').",
+    )
 
     vad = ap.add_argument_group("VAD (Silero)")
     vad.add_argument("--vad_threshold", type=float, default=0.5, help="VAD confidence threshold.")
@@ -145,7 +80,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     diar = ap.add_argument_group("Speaker Diarization (Sortformer)")
     diar.add_argument(
-        "--sortformer_model", type=str, default=None,
+        "--sortformer_model",
+        type=str,
+        default=None,
         help="HuggingFace model id or local .nemo path. Enables Sortformer diarization on full audio.",
     )
     diar.add_argument("--sortformer_gpu_memory_gb", type=float, default=8.0, help="GPU memory for Sortformer stage.")
@@ -161,10 +98,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_arg_parser().parse_args()
 
+    language_filter = [lang.strip() for lang in args.language.split(",")] if args.language else None
+    corpus_filter = [args.corpus] if args.corpus else None
+
     stages = [
         NeMoSpeechAudioReader(
             yaml_path=args.data_config,
-            corpus_filter=args.corpus,
+            corpus_filter=corpus_filter,
+            language_filter=language_filter,
             output_dir=args.output_dir,
         ),
         MonoDownsampleStage(target_sample_rate=args.target_sample_rate),
@@ -232,6 +173,8 @@ def main() -> None:
     logger.info(f"Metadata extraction pipeline: {len(stages)} stages")
     logger.info(f"  Input: {args.data_config}")
     logger.info(f"  Output: {args.output_dir}")
+    if language_filter:
+        logger.info(f"  Language filter: {language_filter}")
     if args.sortformer_model:
         logger.info(f"  Sortformer: {args.sortformer_model} (on full audio before VAD)")
     logger.info(f"  VAD: threshold={args.vad_threshold}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s")
