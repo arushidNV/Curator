@@ -21,12 +21,14 @@ with a NeMo-compatible JSONL manifest (16kHz mono).
 
 Pipeline:
     NeMoSpeechAudioReader (reads full audio from input_cfg)
+        -> MonoDownsampleStage (mono + resample, stores original SR/channels)
         -> InferenceSortformerStage (speaker diarization on full audio) [optional]
         -> VADSegmentationStage (segments into speech chunks, fan-out)
-        -> SEDInferenceStage (sound event detection on each segment)
-        -> SEDPostprocessingStage (converts framewise probs to event labels)
-        -> AmberNetLangIDStage (language identification per segment)
-        -> NeMoSpeechWriterStage (encodes to opus at 16kHz + original SR)
+        -> SqueezeWaveformStage (flatten VAD output shape)
+        -> SEDInferenceStage (sound event detection on each segment) [optional]
+        -> SEDPostprocessingStage (converts framewise probs to event labels) [optional]
+        -> LangID: AmberNet (NeMo, 20 langs) or SpeechBrain VoxLingua107 (107 langs)
+        -> NeMoSpeechWriterStage (encodes to opus at 16kHz)
 """
 
 from __future__ import annotations
@@ -62,10 +64,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
 
     vad = ap.add_argument_group("VAD (Silero)")
-    vad.add_argument("--vad_threshold", type=float, default=0.5, help="VAD confidence threshold.")
-    vad.add_argument("--min_duration_sec", type=float, default=2.0, help="Minimum segment duration (seconds).")
-    vad.add_argument("--max_duration_sec", type=float, default=60.0, help="Maximum segment duration (seconds).")
-    vad.add_argument("--speech_pad_ms", type=int, default=300, help="Padding before/after speech (ms).")
+    vad.add_argument(
+        "--vad_threshold", type=float, default=0.5,
+        help="VAD confidence threshold (0.5 is Silero's recommended default).",
+    )
+    vad.add_argument(
+        "--min_duration_sec", type=float, default=0.5,
+        help="Minimum segment duration (seconds). Segments shorter than this are discarded.",
+    )
+    vad.add_argument(
+        "--max_duration_sec", type=float, default=40.0,
+        help="Maximum segment duration (seconds). Longer speech regions are split.",
+    )
+    vad.add_argument(
+        "--speech_pad_ms", type=int, default=300,
+        help="Silero VAD internal padding (ms) — extends detected speech boundaries to avoid cutting onsets/offsets.",
+    )
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
     sed.add_argument("--sed_checkpoint", type=str, default=None, help="Path to PANNs CNN14 checkpoint. Enables SED.")
@@ -73,8 +87,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     sed.add_argument("--sed_batch_size", type=int, default=32, help="SED GPU batch size.")
     sed.add_argument("--sed_gpu_memory_gb", type=float, default=4.0, help="GPU memory for SED stage.")
 
-    lid = ap.add_argument_group("Language ID (AmberNet)")
-    lid.add_argument("--langid_model", type=str, default="langid_ambernet", help="NeMo LangID model name.")
+    lid = ap.add_argument_group("Language ID")
+    lid.add_argument(
+        "--langid_backend", type=str, default="ambernet", choices=["ambernet", "speechbrain"],
+        help="LangID backend: 'ambernet' (NeMo, 20 languages) or 'speechbrain' (VoxLingua107, 107 languages).",
+    )
+    lid.add_argument("--langid_model", type=str, default=None, help="Model name/path (default depends on backend).")
     lid.add_argument("--langid_gpu_memory_gb", type=float, default=4.0, help="GPU memory for LangID stage.")
     lid.add_argument("--skip_langid", action="store_true", default=False, help="Skip language ID stage.")
 
@@ -150,12 +168,24 @@ def main() -> None:
         )
 
     if not args.skip_langid:
-        stages.append(
-            AmberNetLangIDStage(
-                model_name=args.langid_model,
-                resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
+        if args.langid_backend == "speechbrain":
+            from nemo_curator.stages.audio.inference.speechbrain_langid import SpeechBrainLangIDStage
+
+            langid_source = args.langid_model or "speechbrain/lang-id-voxlingua107-ecapa"
+            stages.append(
+                SpeechBrainLangIDStage(
+                    source=langid_source,
+                    resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
+                )
             )
-        )
+        else:
+            langid_model = args.langid_model or "langid_ambernet"
+            stages.append(
+                AmberNetLangIDStage(
+                    model_name=langid_model,
+                    resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
+                )
+            )
 
     stages.append(
         NeMoSpeechWriterStage(
@@ -181,8 +211,9 @@ def main() -> None:
     if args.sed_checkpoint:
         logger.info(f"  SED: enabled (checkpoint={args.sed_checkpoint})")
     if not args.skip_langid:
-        logger.info(f"  LangID: {args.langid_model}")
-    logger.info(f"  Output: individual opus files at {args.target_sample_rate}Hz + original SR")
+        langid_desc = args.langid_model or ("speechbrain/lang-id-voxlingua107-ecapa" if args.langid_backend == "speechbrain" else "langid_ambernet")
+        logger.info(f"  LangID: {args.langid_backend} ({langid_desc})")
+    logger.info(f"  Output: individual opus files at {args.target_sample_rate}Hz")
 
     t0 = time.time()
     pipeline.run(executor=executor)

@@ -35,10 +35,14 @@ from nemo_curator.tasks import AudioTask
 class MonoDownsampleStage(ProcessingStage[AudioTask, AudioTask]):
     """Convert in-memory waveform to mono and resample to target sample rate.
 
-    Unlike ``MonoConversionStage`` (which reads from files and rejects
-    mismatched sample rates), this stage operates on waveforms already
-    loaded in ``task.data`` and actively resamples to the desired rate.
-    Typically placed after a reader stage and before VAD.
+    Why this stage exists instead of relying on lhotse's read-time resampling:
+
+    - NeMoSpeechAudioReader loads audio at the *native* sample rate so that
+      ``original_sampling_rate`` is preserved for the output manifest.
+    - This stage provides an explicit, visible pipeline step for conversion,
+      making the pipeline DAG self-documenting.
+    - It stores ``original_sampling_rate`` and ``original_channels`` before
+      conversion so downstream stages (e.g., the writer) can record provenance.
 
     Args:
         target_sample_rate: Desired output sample rate in Hz.
@@ -65,13 +69,17 @@ class MonoDownsampleStage(ProcessingStage[AudioTask, AudioTask]):
             return task
 
         wav = np.asarray(wav, dtype=np.float32)
+
+        # Store original metadata before conversion
+        task.data["original_sampling_rate"] = sr
+        task.data["original_channels"] = wav.shape[0] if wav.ndim > 1 else 1
+
         if wav.ndim > 1:
             wav = wav.mean(axis=0)
 
         if sr != self.target_sample_rate:
             import librosa
 
-            task.data["original_sampling_rate"] = sr
             wav = librosa.resample(wav, orig_sr=sr, target_sr=self.target_sample_rate)
 
         task.data[self.waveform_key] = wav

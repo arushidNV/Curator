@@ -71,16 +71,22 @@ def _parse_sortformer_segments(raw_segments: list) -> list[dict[str, Any]]:
 
 
 def _write_rttm(segments: list[dict[str, Any]], sess_name: str, rttm_out_dir: str) -> None:
-    """Write diarization segments to an RTTM file."""
+    """Write diarization segments to an RTTM file.
+
+    Called once per full-audio recording (before VAD fan-out), so one file per input —
+    not a per-segment bottleneck.
+    """
     os.makedirs(rttm_out_dir, exist_ok=True)
     rttm_path = os.path.join(rttm_out_dir, f"{sess_name}.rttm")
+    lines: list[str] = []
+    for seg in segments:
+        duration = seg["end"] - seg["start"]
+        if duration <= 0:
+            logger.warning(f"Skipping degenerate segment with non-positive duration: {seg!r}")
+            continue
+        lines.append(f"SPEAKER {sess_name} 1 {seg['start']:.3f} {duration:.3f} <NA> <NA> {seg['speaker']} <NA> <NA>\n")
     with open(rttm_path, "w") as f:
-        for seg in segments:
-            duration = seg["end"] - seg["start"]
-            if duration <= 0:
-                logger.warning(f"Skipping degenerate segment with non-positive duration: {seg!r}")
-                continue
-            f.write(f"SPEAKER {sess_name} 1 {seg['start']:.3f} {duration:.3f} <NA> <NA> {seg['speaker']} <NA> <NA>\n")
+        f.writelines(lines)
 
 
 @dataclass

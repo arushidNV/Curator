@@ -120,19 +120,22 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             return {RayStageSpecKeys.IS_ACTOR_STAGE: True}
         return {"is_actor_stage": True}
 
-    def _to_numpy_mono(self, waveform: Any) -> np.ndarray:
+    def _ensure_numpy(self, waveform: Any) -> np.ndarray:
+        """Ensure waveform is a 1-D numpy float32 array.
+
+        Upstream MonoDownsampleStage handles mono conversion and resampling;
+        this is a lightweight safety net for type coercion only.
+        """
         if not isinstance(waveform, np.ndarray):
             import torch
 
             if isinstance(waveform, torch.Tensor):
-                waveform = waveform.numpy()
+                waveform = waveform.cpu().numpy()
             else:
                 waveform = np.asarray(waveform, dtype=np.float32)
 
         if waveform.ndim > 1:
             waveform = waveform.squeeze()
-        if waveform.ndim > 1:
-            waveform = waveform.mean(axis=0)
 
         return waveform.astype(np.float32)
 
@@ -140,13 +143,6 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         buf = io.BytesIO()
         sf.write(buf, waveform, sr, format="OGG", subtype="OPUS")
         return buf.getvalue()
-
-    def _resample(self, waveform: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        if orig_sr == target_sr:
-            return waveform
-        import librosa
-
-        return librosa.resample(waveform, orig_sr=orig_sr, target_sr=target_sr)
 
     def process_batch(self, tasks: list[AudioTask]) -> list[FileGroupTask]:
         return [self.process(task) for task in tasks]
@@ -163,7 +159,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         if waveform is None or (hasattr(waveform, "__len__") and len(waveform) == 0):
             return FileGroupTask(task_id=task.task_id, dataset_name=task.dataset_name, data=[])
 
-        waveform = self._to_numpy_mono(waveform)
+        waveform = self._ensure_numpy(waveform)
 
         # Derive filename from original audio path + offset
         original_file = task.data.get("original_file", task.data.get("audio_filepath", ""))
@@ -185,6 +181,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         # Build manifest entry
         duration = task.data.get("duration_sec") or (len(waveform) / sr if sr > 0 else 0)
         original_sr = task.data.get("original_sampling_rate", sr)
+        original_channels = task.data.get("original_channels", 1)
         rel_path = os.path.join(shard_subdir, filename) if shard_subdir else filename
         manifest_entry = {
             "audio_filepath": rel_path,
@@ -192,6 +189,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             "sample_rate": sr,
             "sampling_rate": sr,
             "original_sampling_rate": original_sr,
+            "original_channels": original_channels,
         }
 
         original_file = task.data.get("original_file", task.data.get("audio_filepath", ""))
