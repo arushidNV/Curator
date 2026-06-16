@@ -11,23 +11,18 @@ MAIN GOAL: Listen carefully to the audio and revise the reference so it faithful
 - Do NOT remove substantive content that is spoken in the audio (remove reference words only if they are not spoken).
 - Do NOT paraphrase, polish grammar, or rewrite sentences that already match the audio.
 - Prefer minimal edits: fix mismatches and insert missing speech artifacts.
-- Write the output in {language}, using the script and spelling natural to that language.
+- Preserve named entities from the reference in their exact written form (see ENTITIES).
+
+ENTITIES (names, places, brands, titles, etc.):
+- Keep every named entity from the reference in its exact written form: spelling, casing, script, and punctuation. This includes names, places, brands, titles, acronyms, and other proper nouns.
+- Do not transliterate, translate, re-spell, normalize, or "correct" an entity into another script or language unless the audio clearly shows a different entity or form was spoken.
 
 KEEP REFERENCE DISFLUENCIES:
-- If the reference already has fillers, repetitions, false starts, colloquial or informal forms, or grammatical errors, keep them.
-- Do NOT clean up or remove disfluencies that are already in the reference and are spoken in the audio.
-
-BACKGROUND / QUIET SPEECH:
-- Keep all speech in the reference that is audible in the audio, including quieter or secondary voices.
-- Do NOT drop words just because they are softer or less prominent than the main speaker.
-
-FILLER WORDS:
+- If the reference already has fillers, repetitions, false starts, colloquial reductions, or grammatical errors, keep them.
 - Add hesitation markers and fillers natural to {language} wherever they are spoken in the audio but missing from the reference.
-- Do NOT remove fillers that are already in the reference and are spoken in the audio.
-
-REPETITIONS:
+- Do NOT clean up, normalize, or remove disfluencies that are already in the reference and are spoken in the audio.
 - Add consecutive instances of the same word or short phrase when spoken unintentionally.
-- Do NOT remove repetitions already in the reference if they are spoken in the audio.
+  - Example: reference "I think" → "I I think" if that is what is spoken.
 
 FALSE STARTS:
 - Add incomplete words or phrases the speaker abandons, marked with a hyphen.
@@ -46,3 +41,4 @@ NUMERICALS:
 Output format:
 - Return ONLY the revised transcription text in {language}.
 - No explanations, no JSON, no lists.
+

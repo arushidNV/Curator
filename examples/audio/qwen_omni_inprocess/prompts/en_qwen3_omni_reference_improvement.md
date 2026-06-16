@@ -11,28 +11,23 @@ MAIN GOAL: Listen carefully to the audio and revise the reference so it faithful
 - Do NOT remove substantive content that is spoken in the audio (remove reference words only if they are not spoken).
 - Do NOT paraphrase, polish grammar or rewrite sentences that already match the audio.
 - Prefer minimal edits: fix mismatches and insert missing speech artifacts.
+- Preserve named entities from the reference in their exact written form (see ENTITIES).
+
+ENTITIES (names, places, brands, titles, etc.):
+- Keep every named entity from the reference in its exact written form: spelling, casing, script, and punctuation. This includes names, places, brands, titles, acronyms, and other proper nouns.
+- Do not ever transliterate, translate, re-spell, normalize, or "correct" an entity into another script.
 
 KEEP REFERENCE DISFLUENCIES:
-- If the reference already has fillers ("um", "uh", "hm", "ah"), repetitions, false starts, colloquial reductions, or grammatical errors, keep them.
+- If the reference already has fillers, repetitions, false starts, colloquial reductions, or grammatical errors, keep them.
+- Add hesitation markers and fillers natural to English wherever they are spoken in the audio but missing from the reference.
 - Do NOT clean up, normalize, or remove disfluencies that are already in the reference and are spoken in the audio.
-- Only remove a disfluency from the reference if you are certain it was not spoken.
-
-BACKGROUND / QUIET / OVERLAPPING SPEECH:
-- The reference may include more than just the loudest speaker: background talk, distant speech, overlap, or a second speaker mixed in.
-- Treat every part of the reference as real speech to preserve unless the audio clearly shows it was not spoken.
-- Do NOT drop words or phrases because they sound like background speech, are softer, or come from a less prominent speaker.
-- If you can hear that part in the audio — even quietly — keep it in the transcript.
-- If background or secondary speech is audible but missing from the reference, add it.
-- Do NOT shorten the transcript to only the foreground or loudest voice.
-
-FILLER WORDS:
-- Add hesitation markers like "um", "uh", "hm", "ah", etc. wherever they are spoken in the audio but missing from the reference.
-- Do NOT remove fillers that are already in the reference and are spoken in the audio.
-
-REPETITIONS:
 - Add consecutive instances of the same word or short phrase when spoken unintentionally.
   - Example: reference "I think" → "I I think" if that is what is spoken.
-- Do NOT remove repetitions already in the reference if they are spoken in the audio.
+
+
+BACKGROUND / QUIET / OVERLAPPING SPEECH:
+- Keep all audible speech in the reference, including quieter, distant, or overlapping voices — not just the loudest speaker.
+- Add background or secondary speech that is audible but missing; do not drop words because they sound like background.
 
 FALSE STARTS:
 - Add incomplete words or phrases the speaker abandons, marked with a hyphen.
@@ -52,4 +47,3 @@ NUMERICALS:
 
 Output format:
 - Return ONLY the revised transcription text.
-- No explanations, no JSON, no lists.
