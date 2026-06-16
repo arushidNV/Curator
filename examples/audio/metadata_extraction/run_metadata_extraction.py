@@ -86,11 +86,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     sed.add_argument("--sed_threshold", type=float, default=0.5, help="SED event confidence threshold.")
     sed.add_argument("--sed_batch_size", type=int, default=32, help="SED GPU batch size.")
     sed.add_argument("--sed_gpu_memory_gb", type=float, default=4.0, help="GPU memory for SED stage.")
+    sed.add_argument(
+        "--sed_emit_superclasses", type=lambda x: x.lower() not in ("false", "0", "no"),
+        default=True,
+        help="Emit superclass labels only — speech/music/noise (default: True). Set to False for all 527 AudioSet classes.",
+    )
 
     lid = ap.add_argument_group("Language ID")
     lid.add_argument(
-        "--langid_backend", type=str, default="ambernet", choices=["ambernet", "speechbrain"],
-        help="LangID backend: 'ambernet' (NeMo, 20 languages) or 'speechbrain' (VoxLingua107, 107 languages).",
+        "--langid_backend", type=str, default="speechbrain", choices=["ambernet", "speechbrain"],
+        help="LangID backend: 'speechbrain' (VoxLingua107, 107 languages, default) or 'ambernet' (NeMo, 20 languages).",
     )
     lid.add_argument("--langid_model", type=str, default=None, help="Model name/path (default depends on backend).")
     lid.add_argument("--langid_gpu_memory_gb", type=float, default=4.0, help="GPU memory for LangID stage.")
@@ -164,6 +169,7 @@ def main() -> None:
         stages.append(
             SEDPostprocessingStage(
                 threshold=args.sed_threshold,
+                emit_superclasses=args.sed_emit_superclasses,
             )
         )
 

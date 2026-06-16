@@ -271,7 +271,9 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         for task, segments in zip(tasks, all_segments, strict=True):
             self._apply_results(task, segments)
 
-            if self.rttm_out_dir is not None:
+        # Write RTTM files after all GPU results are applied (batch disk I/O)
+        if self.rttm_out_dir is not None:
+            for task, segments in zip(tasks, all_segments, strict=True):
                 sess_name = task.data.get("session_name") or task.task_id
                 _write_rttm(segments, sess_name, self.rttm_out_dir)
 
