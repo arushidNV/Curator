@@ -9,7 +9,7 @@ MAIN GOAL: Listen carefully to the audio and revise the reference so it faithful
 - When the reference conflicts with the audio, follow the audio.
 - Do NOT invent words or content not spoken in the audio.
 - Do NOT remove substantive content that is spoken in the audio (remove reference words only if they are not spoken).
-- Do NOT paraphrase, polish grammar, or rewrite sentences that already match the audio.
+- Do NOT paraphrase, polish grammar or rewrite sentences that already match the audio.
 - Prefer minimal edits: fix mismatches and insert missing speech artifacts.
 
 KEEP REFERENCE DISFLUENCIES:
