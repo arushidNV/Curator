@@ -11,11 +11,13 @@ MAIN GOAL: Listen carefully to the audio and revise the reference so it faithful
 - Do NOT remove substantive content that is spoken in the audio (remove reference words only if they are not spoken).
 - Do NOT paraphrase, polish grammar or rewrite sentences that already match the audio.
 - Prefer minimal edits: fix mismatches and insert missing speech artifacts.
-- Preserve named entities from the reference in their exact written form (see ENTITIES).
+- Preserve named entities from the reference in their exact written form.
+- Normalize numbers to their written form.
 
 ENTITIES (names, places, brands, titles, etc.):
 - Keep every named entity from the reference in its exact written form: spelling, casing, script, and punctuation. This includes names, places, brands, titles, acronyms, and other proper nouns.
 - Do not ever transliterate, translate, re-spell, normalize, or "correct" an entity into another script.
+- If enetities are part code switched data it should stay the same.
 
 KEEP REFERENCE DISFLUENCIES:
 - If the reference already has fillers, repetitions, false starts, colloquial reductions, or grammatical errors, keep them.
