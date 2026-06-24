@@ -12,19 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generic text-to-text LLM stage with per-process model caching.
+"""Generic text-to-text LLM stage with shared model caching.
 
-Each pipeline stage runs as its own actor (its own process) under the
-Ray Data / Xenna / Ray actor-pool executors, so every stage loads and
-owns its own vLLM engine and may use its own ``max_model_len`` /
-sampling config. The module-level ``_model_cache`` only deduplicates
-loads *within a single process* (keyed by ``model_id``); it does not
-share one engine across stages.
+Multiple ``TextLLMStage`` instances that share the same ``model_id``
+will reuse a single vLLM engine loaded once per GPU worker, avoiding
+redundant model loads when chaining several prompt-based stages in one
+pipeline.
 """
 
 from __future__ import annotations
 
-import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -48,39 +45,12 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
-# ── Per-process model cache ─────────────────────────────────────────
-# Module-level cache keyed by model_id. Dedupes loads WITHIN one actor
-# process only — each stage is its own actor/process, so this never
-# shares an engine across stages (each stage keeps its own max_model_len).
+# ── Shared model cache ──────────────────────────────────────────────
+# Class-level cache so multiple TextLLMStage instances with the same
+# model_id share a single vLLM engine on each worker.
 
 _model_cache: dict[str, Any] = {}
 _cache_lock = threading.Lock()
-
-
-def _isolate_compile_caches() -> None:
-    """Give this actor process its own torch.compile / inductor / triton caches.
-
-    Multiple vLLM engines co-located on one node otherwise race on the *shared*
-    default cache dirs (``~/.cache``, ``/tmp/torchinductor_<user>``,
-    ``/tmp/triton``). That race corrupts the inductor cache pickle
-    ("pickle data was truncated" / "CompiledFxGraph has no compiled_fn_runner"),
-    kills the EngineCore, and its restart then hangs at CUDA-graph capture —
-    wedging the whole pipeline (idle GPUs → killed by the cluster idle reaper).
-    Keying every cache dir by PID isolates each engine. Each Ray actor runs one
-    engine in its own process, and vLLM's spawned EngineCore subprocess inherits
-    these env vars, so all of an actor's (re)starts share one private cache while
-    different actors never collide. Must run before the ``LLM(...)`` constructor.
-    """
-    root = os.environ.get("COMPILE_CACHE_ROOT", os.environ.get("TMPDIR", "/tmp"))
-    base = os.path.join(root, f"compile_cache_{os.getpid()}")
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(base, "inductor")
-    os.environ["TRITON_CACHE_DIR"] = os.path.join(base, "triton")
-    os.environ["VLLM_CACHE_ROOT"] = os.path.join(base, "vllm")
-    try:
-        os.makedirs(base, exist_ok=True)
-    except OSError as exc:  # non-fatal — torch/triton/vllm create them lazily too
-        logger.warning(f"_isolate_compile_caches: could not pre-create {base}: {exc}")
-    logger.info(f"Per-process compile caches under {base} (pid={os.getpid()})")
 
 
 def _get_or_load_model(  # noqa: PLR0913
@@ -102,34 +72,12 @@ def _get_or_load_model(  # noqa: PLR0913
             msg = "vLLM is required for TextLLMStage. pip install vllm"
             raise ImportError(msg)
 
-        # Isolate this process's compile caches BEFORE building the engine, so
-        # co-located stages don't race on the shared inductor/triton cache.
-        _isolate_compile_caches()
-
-        # enforce_eager skips torch.compile + CUDA-graph capture. Set
-        # VLLM_ENFORCE_EAGER=1 to avoid the graph-capture cost on every engine
-        # (re)spawn and the CUDA-graph-replay hang class that wedges the pipeline
-        # when Ray Data tears down / respawns an actor mid-stream.
-        enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0").lower() in ("1", "true", "yes")
-
-        # Optionally force-disable vLLM V1 async scheduling — the
-        # `step_with_batch_queue` path that deadlocks (SM-100%/mem-0% spin) after
-        # Ray Data tears down/respawns an actor mid-stream. VLLM_ASYNC_SCHEDULING=0
-        # forces synchronous stepping; unset → vLLM default (auto-on in V1).
-        _async = os.environ.get("VLLM_ASYNC_SCHEDULING", "").strip().lower()
-        async_kwargs: dict[str, Any] = {}
-        if _async in ("0", "false", "no"):
-            async_kwargs["async_scheduling"] = False
-        elif _async in ("1", "true", "yes"):
-            async_kwargs["async_scheduling"] = True
-
         logger.info(
-            "TextLLMStage: loading %s (tp=%d, max_model_len=%d, kv_cache=%s, enforce_eager=%s)",
+            "TextLLMStage: loading %s (tp=%d, max_model_len=%d, kv_cache=%s)",
             model_id,
             tensor_parallel_size,
             max_model_len,
             kv_cache_dtype,
-            enforce_eager,
         )
         llm = LLM(
             model=model_id,
@@ -142,9 +90,8 @@ def _get_or_load_model(  # noqa: PLR0913
             enable_prefix_caching=True,
             prefix_caching_hash_algo="xxhash",
             kv_cache_dtype=kv_cache_dtype,
-            enforce_eager=enforce_eager,
+            enforce_eager=False,
             seed=1234,
-            **async_kwargs,
         )
         tokenizer = llm.get_tokenizer()
         _model_cache[model_id] = {"llm": llm, "tokenizer": tokenizer}
@@ -161,18 +108,14 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     ``output_text_key``.  Optionally validates the output and falls
     back to the original text.
 
-    Each stage runs as its own actor/process and loads its own vLLM
-    engine (the module-level cache only dedupes within one process), so
-    each stage may use its own ``max_model_len`` / sampling config.
+    Multiple instances sharing the same ``model_id`` will reuse a
+    single vLLM engine on each worker (class-level cache).
 
     Args:
         model_id: HuggingFace model identifier.
         prompt_text: System prompt string (takes precedence over prompt_file).
         prompt_file: Path to a file containing the system prompt.
         text_key: Input field to read text from.
-        reference_text_key: Optional second input field (e.g. ground-truth
-            transcript). When set, ``{reference_text}`` and ``{ground_truth}``
-            placeholders in the prompt are filled from this field.
         output_text_key: Output field to write the result to.
         skip_me_key: Field that flags entries to skip.
         notes_key: Field for additional_notes tracking.
@@ -192,7 +135,6 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     prompt_text: str | None = None
     prompt_file: str | None = None
     text_key: str = "pnc_text"
-    reference_text_key: str | None = None
     output_text_key: str = "output_text"
     skip_me_key: str = "_skipme"
     notes_key: str = "additional_notes"
@@ -289,10 +231,7 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     # ── I/O contract ─────────────────────────────────────────────────
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        keys = [self.text_key, self.skip_me_key]
-        if self.reference_text_key:
-            keys.append(self.reference_text_key)
-        return [], keys
+        return [], [self.text_key, self.skip_me_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.output_text_key]
@@ -301,18 +240,10 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
 
     def _format_prompt(self, user_text: str, task_data: dict | None = None) -> str:
         prompt_template = self._system_prompt
-        task_data = task_data or {}
 
         if "{language}" in prompt_template:
-            lang = task_data.get("source_lang", "English")
+            lang = task_data.get("source_lang", "English") if task_data else "English"
             prompt_template = prompt_template.replace("{language}", lang)
-
-        if self.reference_text_key:
-            ref_text = str(task_data.get(self.reference_text_key, "") or "").strip()
-            if "{reference_text}" in prompt_template:
-                prompt_template = prompt_template.replace("{reference_text}", ref_text)
-            if "{ground_truth}" in prompt_template:
-                prompt_template = prompt_template.replace("{ground_truth}", ref_text)
 
         if "{text}" in prompt_template:
             prompt_template = prompt_template.replace("{text}", user_text)
