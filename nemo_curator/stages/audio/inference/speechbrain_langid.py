@@ -63,6 +63,7 @@ class SpeechBrainLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     output_key: str = "language"
     confidence_key: str = "language_confidence"
     min_duration_sec: float = 1.0
+    batch_size: int = 32
     resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=4.0))
 
     _classifier: Any = field(default=None, init=False, repr=False)

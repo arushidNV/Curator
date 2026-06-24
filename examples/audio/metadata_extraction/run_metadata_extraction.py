@@ -80,6 +80,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--speech_pad_ms", type=int, default=300,
         help="Silero VAD internal padding (ms) — extends detected speech boundaries to avoid cutting onsets/offsets.",
     )
+    vad.add_argument(
+        "--min_interval_ms", type=int, default=500,
+        help="Minimum silence gap (ms) between speech segments — higher values merge more, reducing short segments.",
+    )
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
     sed.add_argument("--sed_checkpoint", type=str, default=None, help="Path to PANNs CNN14 checkpoint. Enables SED.")
@@ -112,6 +116,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     diar.add_argument("--sortformer_batch_size", type=int, default=1, help="Sortformer inference batch size.")
     diar.add_argument("--rttm_out_dir", type=str, default=None, help="Directory to write RTTM files.")
 
+    io = ap.add_argument_group("I/O")
+    io.add_argument(
+        "--max_io_threads", type=int, default=8,
+        help="Max concurrent threads for loading audio from S3/object storage (default: 8).",
+    )
+
     out = ap.add_argument_group("Output")
     out.add_argument("--target_sample_rate", type=int, default=16000, help="Output sample rate.")
 
@@ -130,6 +140,7 @@ def main() -> None:
             corpus_filter=corpus_filter,
             language_filter=language_filter,
             output_dir=args.output_dir,
+            max_io_threads=args.max_io_threads,
         ),
         MonoDownsampleStage(target_sample_rate=args.target_sample_rate),
     ]
@@ -142,6 +153,7 @@ def main() -> None:
                 model_name=model_name,
                 model_path=model_path,
                 inference_batch_size=args.sortformer_batch_size,
+                batch_size=2,
                 rttm_out_dir=args.rttm_out_dir,
                 resources=Resources(gpu_memory_gb=args.sortformer_gpu_memory_gb),
             )
@@ -150,6 +162,7 @@ def main() -> None:
     stages.append(
         VADSegmentationStage(
             threshold=args.vad_threshold,
+            min_interval_ms=args.min_interval_ms,
             min_duration_sec=args.min_duration_sec,
             max_duration_sec=args.max_duration_sec,
             speech_pad_ms=args.speech_pad_ms,
@@ -213,7 +226,10 @@ def main() -> None:
         logger.info(f"  Language filter: {language_filter}")
     if args.sortformer_model:
         logger.info(f"  Sortformer: {args.sortformer_model} (on full audio before VAD)")
-    logger.info(f"  VAD: threshold={args.vad_threshold}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s")
+    logger.info(
+        f"  VAD: threshold={args.vad_threshold}, min_interval_ms={args.min_interval_ms}, "
+        f"speech_pad_ms={args.speech_pad_ms}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s"
+    )
     if args.sed_checkpoint:
         logger.info(f"  SED: enabled (checkpoint={args.sed_checkpoint})")
     if not args.skip_langid:

@@ -252,6 +252,11 @@ class NeMoSpeechDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         )
         return tasks
 
+    def process_batch(self, tasks: list[_EmptyTask]) -> list[FileGroupTask]:
+        results: list[FileGroupTask] = []
+        for task in tasks:
+            results.extend(self.process(task))
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +274,21 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
     The reader does not parse manifests itself — NeMo's adapters handle
     all I/O (including lazy line-by-line streaming for large files).
+
+    When ``process_batch`` receives multiple single-entry tasks (non-tarred),
+    audio files are loaded concurrently using threads to overlap S3/network
+    latency. This significantly speeds up reading large files from object
+    storage.
+
+    Args:
+        max_io_threads: Maximum number of concurrent I/O threads for
+            loading audio files in ``process_batch``. Only applies to
+            single-entry (non-tarred) tasks. Defaults to 8.
     """
 
     name: str = "nemo_speech_reader"
+    max_io_threads: int = 8
+    batch_size: int = 8
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -302,67 +319,100 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
         return CutSet(LazyNeMoIterator(manifest_path))
 
-    def process(self, task: FileGroupTask) -> list[AudioTask]:
+    @staticmethod
+    def _load_audio(audio_path: str, hint_sr: int | None = None, hint_duration: float = 0.0) -> tuple[np.ndarray, int, float]:
+        """Load audio from a file path (local or S3) and return (waveform, sr, duration).
+
+        Tries lhotse first, falls back to smart_open + torchcodec.
+        Returns a 1-D float32 numpy array.
+        """
+        audio: np.ndarray | None = None
+        sr: int = 0
+        duration: float = 0.0
+
+        try:
+            from lhotse import Recording
+            from lhotse.audio import AudioSource
+            from nemo.utils.data_utils import is_datastore_path
+
+            if hint_sr:
+                source_type = "url" if is_datastore_path(audio_path) else "file"
+                rec = Recording(
+                    id=audio_path,
+                    sources=[AudioSource(type=source_type, channels=[0], source=audio_path)],
+                    sampling_rate=int(hint_sr),
+                    num_samples=int(hint_duration * hint_sr),
+                    duration=hint_duration,
+                    channel_ids=[0],
+                )
+            else:
+                rec = Recording.from_file(audio_path)
+            audio = rec.load_audio().squeeze()
+            sr = rec.sampling_rate
+            duration = rec.duration
+        except Exception:  # noqa: BLE001
+            try:
+                import smart_open
+                from torchcodec.decoders import AudioDecoder
+
+                with smart_open.open(audio_path, "rb") as f:
+                    samples = AudioDecoder(f.read()).get_all_samples()
+                audio = samples.data.numpy().squeeze()
+                sr = samples.sample_rate
+            except Exception:  # noqa: BLE001
+                logger.warning(f"Skipping unreadable audio: {audio_path}")
+                raise
+
+        if audio.ndim > 1:
+            audio = audio.mean(axis=0)
+        audio = np.asarray(audio, dtype=np.float32)
+        if duration <= 0 and sr > 0:
+            duration = len(audio) / sr
+        return audio, sr, duration
+
+    def _process_single_entry(self, task: FileGroupTask) -> list[AudioTask]:
+        """Load a single audio file and return one AudioTask."""
+        corpus = task.reader_config.get("corpus", "unknown")
+        shard_key = task.reader_config.get("shard_key", task.task_id)
+        language = task.reader_config.get("language", "")
+        entry = task.reader_config["entry"]
+
+        audio_path = task.data[0]
+        hint_sr = entry.get("sampling_rate") or entry.get("sample_rate")
+
+        try:
+            audio, sr, duration = self._load_audio(
+                audio_path, hint_sr=hint_sr, hint_duration=entry.get("duration", 0.0),
+            )
+        except Exception:  # noqa: BLE001
+            return []
+
+        entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
+        entry_data.update({
+            "waveform": audio,
+            "sampling_rate": sr,
+            "sample_rate": sr,
+            "duration": duration,
+            "num_channels": 1,
+            "corpus": corpus,
+            "audio_filepath": audio_path,
+        })
+        if language and "source_lang" not in entry_data:
+            entry_data["source_lang"] = language
+
+        shard_total = task.reader_config.get("shard_total", 0)
+        metadata = {**task._metadata, "_shard_key": shard_key, "_shard_total": shard_total}
+        return [AudioTask(task_id=task.task_id, dataset_name=corpus, data=entry_data, _metadata=metadata)]
+
+    def _process_cutset(self, task: FileGroupTask) -> list[AudioTask]:
+        """Load all cuts from a manifest/tar shard and return AudioTasks."""
         corpus = task.reader_config.get("corpus", "unknown")
         shard_key = task.reader_config.get("shard_key", task.task_id)
         language = task.reader_config.get("language", "")
         metadata = dict(task._metadata)
 
-        # Single-entry mode: load one audio file directly
-        entry = task.reader_config.get("entry")
-        if entry is not None:
-            audio_path = task.data[0]
-            sr = entry.get("sampling_rate") or entry.get("sample_rate")
-            try:
-                from lhotse import Recording
-                from lhotse.audio import AudioSource
-                from nemo.utils.data_utils import is_datastore_path
-
-                if sr:
-                    source_type = "url" if is_datastore_path(audio_path) else "file"
-                    rec = Recording(
-                        id=audio_path,
-                        sources=[AudioSource(type=source_type, channels=[0], source=audio_path)],
-                        sampling_rate=int(sr),
-                        num_samples=int(entry.get("duration", 0) * sr),
-                        duration=entry.get("duration", 0),
-                        channel_ids=[0],
-                    )
-                else:
-                    rec = Recording.from_file(audio_path)
-                audio = rec.load_audio().squeeze()
-                sr = rec.sampling_rate
-            except Exception:  # noqa: BLE001
-                try:
-                    import smart_open
-                    from torchcodec.decoders import AudioDecoder
-
-                    with smart_open.open(audio_path, "rb") as f:
-                        samples = AudioDecoder(f.read()).get_all_samples()
-                    audio = samples.data.numpy().squeeze()
-                    sr = samples.sample_rate
-                except Exception:  # noqa: BLE001
-                    logger.warning(f"Skipping unreadable audio: {audio_path}")
-                    return []
-            if audio.ndim > 1:
-                audio = audio.mean(axis=0)
-            entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
-            entry_data["waveform"] = audio.astype(np.float32)
-            entry_data["sampling_rate"] = rec.sampling_rate
-            entry_data["sample_rate"] = rec.sampling_rate
-            entry_data["duration"] = rec.duration
-            entry_data["num_channels"] = 1
-            entry_data["corpus"] = corpus
-            entry_data["audio_filepath"] = audio_path
-            if language and "source_lang" not in entry_data:
-                entry_data["source_lang"] = language
-            shard_total = task.reader_config.get("shard_total", 0)
-            return [AudioTask(task_id=task.task_id, dataset_name=corpus, data=entry_data,
-                              _metadata={**metadata, "_shard_key": shard_key, "_shard_total": shard_total})]
-
         manifest_path = task.data[0]
         tar_path = task.data[1] if len(task.data) >= 2 else None  # noqa: PLR2004
-
         cutset = self._make_cutset(manifest_path, tar_path)
 
         mode = "tarred" if tar_path else "non-tarred"
@@ -392,12 +442,14 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 logger.info(f"  [{shard_key}] loaded {loaded}")
 
             entry_data = dict(cut.custom) if cut.custom else {}
-            entry_data["waveform"] = audio.astype(np.float32)
-            entry_data["sampling_rate"] = target_sr
-            entry_data["sample_rate"] = target_sr
-            entry_data["duration"] = cut.duration
-            entry_data["num_channels"] = 1
-            entry_data["corpus"] = corpus
+            entry_data.update({
+                "waveform": np.asarray(audio, dtype=np.float32),
+                "sampling_rate": target_sr,
+                "sample_rate": target_sr,
+                "duration": cut.duration,
+                "num_channels": 1,
+                "corpus": corpus,
+            })
             if "audio_filepath" not in entry_data and cut.recording and cut.recording.sources:
                 src = cut.recording.sources[0].source
                 entry_data["audio_filepath"] = src if isinstance(src, str) else cut.id
@@ -418,6 +470,51 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         logger.info(f"Shard {shard_key}: emitted {len(results)} AudioTasks")
         return results
 
+    def process(self, task: FileGroupTask) -> list[AudioTask]:
+        if task.reader_config.get("entry") is not None:
+            return self._process_single_entry(task)
+        return self._process_cutset(task)
+
+    def process_batch(self, tasks: list[FileGroupTask]) -> list[AudioTask]:
+        if len(tasks) <= 1:
+            return [at for task in tasks for at in self.process(task)]
+
+        single_entry_tasks: list[FileGroupTask] = []
+        other_tasks: list[FileGroupTask] = []
+        for task in tasks:
+            if task.reader_config.get("entry") is not None:
+                single_entry_tasks.append(task)
+            else:
+                other_tasks.append(task)
+
+        results: list[AudioTask] = []
+
+        if single_entry_tasks:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            n_threads = min(self.max_io_threads, len(single_entry_tasks))
+            logger.info(
+                f"NeMoSpeechReader: loading {len(single_entry_tasks)} audio files "
+                f"with {n_threads} I/O threads"
+            )
+            with ThreadPoolExecutor(max_workers=n_threads) as pool:
+                future_to_task = {
+                    pool.submit(self._process_single_entry, t): t
+                    for t in single_entry_tasks
+                }
+                for future in as_completed(future_to_task):
+                    src_task = future_to_task[future]
+                    try:
+                        results.extend(future.result())
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            f"Failed to load audio for task {src_task.task_id}: {exc}"
+                        )
+
+        for task in other_tasks:
+            results.extend(self._process_cutset(task))
+
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +529,11 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
     Reads NeMo ``input_cfg`` YAML configs and uses NeMo's lhotse
     adapters (``LazyNeMoIterator`` / ``LazyNeMoTarredIterator``)
     for audio loading.
+
+    Args:
+        max_io_threads: Maximum concurrent threads for loading audio
+            from S3/object storage. Higher values overlap more network
+            latency but use more memory. Defaults to 8.
     """
 
     name: str = "nemo_speech_audio_reader"
@@ -439,6 +541,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
     corpus_filter: list[str] | None = None
     language_filter: list[str] | None = None
     output_dir: str | None = None
+    max_io_threads: int = 8
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -452,7 +555,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
                 language_filter=self.language_filter,
                 output_dir=self.output_dir,
             ),
-            NeMoSpeechReaderStage(),
+            NeMoSpeechReaderStage(max_io_threads=self.max_io_threads),
         ]
 
     def inputs(self) -> tuple[list[str], list[str]]:
