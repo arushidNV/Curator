@@ -53,7 +53,7 @@ from nemo_curator.stages.resources import Resources
 def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Metadata extraction pipeline for unsegmented audio")
 
-    ap.add_argument("--data_config", type=str, required=True, help="Path to input_cfg YAML.")
+    ap.add_argument("--data_config", type=str, default=None, help="Path to input_cfg YAML.")
     ap.add_argument("--output_dir", type=str, required=True, help="Output directory for opus files + manifest.")
     ap.add_argument("--corpus", type=str, default=None, help="Filter to specific corpus in the YAML.")
     ap.add_argument(
@@ -77,7 +77,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum segment duration (seconds). Longer speech regions are split.",
     )
     vad.add_argument(
-        "--speech_pad_ms", type=int, default=300,
+        "--speech_pad_ms", type=int, default=100,
         help="Silero VAD internal padding (ms) — extends detected speech boundaries to avoid cutting onsets/offsets.",
     )
     vad.add_argument(
@@ -113,13 +113,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="HuggingFace model id or local .nemo path. Enables Sortformer diarization on full audio.",
     )
     diar.add_argument("--sortformer_gpu_memory_gb", type=float, default=8.0, help="GPU memory for Sortformer stage.")
+    diar.add_argument(
+        "--sortformer_gpus",
+        type=float,
+        default=None,
+        help="GPUs per Sortformer actor (e.g. 1.0 for one full GPU). Overrides sortformer_gpu_memory_gb.",
+    )
     diar.add_argument("--sortformer_batch_size", type=int, default=1, help="Sortformer inference batch size.")
     diar.add_argument("--rttm_out_dir", type=str, default=None, help="Directory to write RTTM files.")
 
     io = ap.add_argument_group("I/O")
     io.add_argument(
         "--max_io_threads", type=int, default=8,
-        help="Max concurrent threads for loading audio from S3/object storage (default: 8).",
+        help="Max concurrent threads per reader batch for loading audio from S3/object storage (default: 8).",
+    )
+    io.add_argument(
+        "--read_concurrency", type=int, default=2,
+        help="Max parallel Ray reader tasks (default: 2). Increase to overlap more S3/AIS reads.",
+    )
+    io.add_argument(
+        "--writer_concurrency", type=int, default=1,
+        help="Parallel Ray writer actors for opus + manifest output (default: 1).",
     )
 
     out = ap.add_argument_group("Output")
@@ -128,10 +142,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main() -> None:
-    args = _build_arg_parser().parse_args()
-
-    language_filter = [lang.strip() for lang in args.language.split(",")] if args.language else None
+def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -> list:
     corpus_filter = [args.corpus] if args.corpus else None
 
     stages = [
@@ -141,6 +152,7 @@ def main() -> None:
             language_filter=language_filter,
             output_dir=args.output_dir,
             max_io_threads=args.max_io_threads,
+            read_concurrency=args.read_concurrency,
         ),
         MonoDownsampleStage(target_sample_rate=args.target_sample_rate),
     ]
@@ -148,6 +160,10 @@ def main() -> None:
     if args.sortformer_model:
         model_path = args.sortformer_model if args.sortformer_model.endswith(".nemo") else None
         model_name = args.sortformer_model if model_path is None else "nvidia/diar_streaming_sortformer_4spk-v2"
+        if args.sortformer_gpus is not None:
+            sortformer_resources = Resources(gpus=args.sortformer_gpus)
+        else:
+            sortformer_resources = Resources(gpu_memory_gb=args.sortformer_gpu_memory_gb)
         stages.append(
             InferenceSortformerStage(
                 model_name=model_name,
@@ -155,7 +171,7 @@ def main() -> None:
                 inference_batch_size=args.sortformer_batch_size,
                 batch_size=2,
                 rttm_out_dir=args.rttm_out_dir,
-                resources=Resources(gpu_memory_gb=args.sortformer_gpu_memory_gb),
+                resources=sortformer_resources,
             )
         )
 
@@ -210,22 +226,41 @@ def main() -> None:
         NeMoSpeechWriterStage(
             output_dir=args.output_dir,
             target_sample_rate=args.target_sample_rate,
+            writer_concurrency=args.writer_concurrency,
         )
     )
+    return stages
 
-    pipeline = Pipeline(name="metadata_extraction", stages=stages)
+
+def main() -> None:
+    args = _build_arg_parser().parse_args()
+
+    if not args.data_config:
+        msg = "--data_config is required"
+        raise SystemExit(msg)
+
+    language_filter = [lang.strip() for lang in args.language.split(",")] if args.language else None
+    stages = _build_stages(args, language_filter)
+    pipeline_name = "metadata_extraction"
+
+    pipeline = Pipeline(name=pipeline_name, stages=stages)
 
     from nemo_curator.backends.ray_data import RayDataExecutor
 
     executor = RayDataExecutor()
 
-    logger.info(f"Metadata extraction pipeline: {len(stages)} stages")
-    logger.info(f"  Input: {args.data_config}")
+    logger.info(f"Metadata extraction pipeline: {len(stages)} stages ({pipeline_name})")
     logger.info(f"  Output: {args.output_dir}")
+    logger.info(f"  Input: {args.data_config}")
     if language_filter:
         logger.info(f"  Language filter: {language_filter}")
     if args.sortformer_model:
-        logger.info(f"  Sortformer: {args.sortformer_model} (on full audio before VAD)")
+        sf_desc = (
+            f"gpus={args.sortformer_gpus}/actor"
+            if args.sortformer_gpus is not None
+            else f"gpu_memory_gb={args.sortformer_gpu_memory_gb}"
+        )
+        logger.info(f"  Sortformer: {args.sortformer_model} ({sf_desc}, on full audio before VAD)")
     logger.info(
         f"  VAD: threshold={args.vad_threshold}, min_interval_ms={args.min_interval_ms}, "
         f"speech_pad_ms={args.speech_pad_ms}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s"
@@ -233,9 +268,11 @@ def main() -> None:
     if args.sed_checkpoint:
         logger.info(f"  SED: enabled (checkpoint={args.sed_checkpoint})")
     if not args.skip_langid:
-        langid_desc = args.langid_model or ("speechbrain/lang-id-voxlingua107-ecapa" if args.langid_backend == "speechbrain" else "langid_ambernet")
+        langid_desc = args.langid_model or (
+            "speechbrain/lang-id-voxlingua107-ecapa" if args.langid_backend == "speechbrain" else "langid_ambernet"
+        )
         logger.info(f"  LangID: {args.langid_backend} ({langid_desc})")
-    logger.info(f"  Output: individual opus files at {args.target_sample_rate}Hz")
+    logger.info(f"  Target sample rate: {args.target_sample_rate}Hz, writer_concurrency={args.writer_concurrency}")
 
     t0 = time.time()
     pipeline.run(executor=executor)
