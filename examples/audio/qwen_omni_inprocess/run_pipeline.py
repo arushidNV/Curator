@@ -22,7 +22,7 @@ Model selection:
 
     ``--primary_model``   (required unless --language is given)
         qwen_omni      → InferenceQwenOmniStage       (Qwen3-Omni vLLM, ``--model_id``)
-                         recommended: en de es fr it pt ru nl
+                         recommended: en de es fr it pt ru nl zh ja ko ar
         parakeet_v3    → InferenceParakeetStage        (Parakeet-TDT v3, ``--parakeet_v3_model_id``)
                          recommended: pl cs ro hu el fi da sv
         whisper        → InferenceFasterWhisperStage   (Whisper Large V3, ``--whisper_model_size_or_path``)
@@ -113,7 +113,7 @@ PARAKEET_RIVA_DEFAULT_MODEL_ID = (
 )
 
 # Recommended language codes for each primary inference model (used for auto-selection via --language).
-QWEN_OMNI_RECOMMENDED_LANGS        = {"en", "de", "es", "fr", "it", "pt", "ru", "nl"}
+QWEN_OMNI_RECOMMENDED_LANGS        = {"en", "de", "es", "fr", "it", "pt", "ru", "nl", "zh", "ja", "ko", "ar"}
 PARAKEET_V3_PRIMARY_LANGS           = {"pl", "cs", "ro", "hu", "el", "fi", "da", "sv"}
 WHISPER_RECOMMENDED_LANGS           = {"lt", "lv", "hr", "et", "bg", "sk", "sl", "mt", "uk"}
 PARAKEET_RIVA_PRIMARY_LANGS         = frozenset({"hi", "ta", "bn"})  # languages covered by the local Riva Parakeet .nemo
