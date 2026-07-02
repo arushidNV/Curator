@@ -70,6 +70,11 @@ def _parse_sortformer_segments(raw_segments: list) -> list[dict[str, Any]]:
     return segments
 
 
+def _safe_rttm_basename(sess_name: str) -> str:
+    """Filesystem-safe RTTM filename stem (task ids may contain shard path slashes)."""
+    return sess_name.replace("\\", "_").replace("/", "_")
+
+
 def _write_rttm(segments: list[dict[str, Any]], sess_name: str, rttm_out_dir: str) -> None:
     """Write diarization segments to an RTTM file.
 
@@ -77,7 +82,7 @@ def _write_rttm(segments: list[dict[str, Any]], sess_name: str, rttm_out_dir: st
     not a per-segment bottleneck.
     """
     os.makedirs(rttm_out_dir, exist_ok=True)
-    rttm_path = os.path.join(rttm_out_dir, f"{sess_name}.rttm")
+    rttm_path = os.path.join(rttm_out_dir, f"{_safe_rttm_basename(sess_name)}.rttm")
     lines: list[str] = []
     for seg in segments:
         duration = seg["end"] - seg["start"]
@@ -225,6 +230,9 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
     def process(self, task: AudioTask) -> AudioTask:
         """Run speaker diarization on a single task."""
+        if task.data.get("read_error"):
+            return task
+
         waveform = task.data.get(self.waveform_key)
         if waveform is not None:
             sr = task.data.get(self.sample_rate_key)
@@ -251,7 +259,11 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if len(tasks) == 0:
             return []
 
-        waveforms = [t.data.get(self.waveform_key) for t in tasks]
+        to_process = [t for t in tasks if not t.data.get("read_error")]
+        if not to_process:
+            return tasks
+
+        waveforms = [t.data.get(self.waveform_key) for t in to_process]
         has_waveform = [w is not None for w in waveforms]
         if any(has_waveform) and not all(has_waveform):
             msg = "Sortformer: batch contains a mix of waveform and filepath tasks; all tasks must use the same mode"
@@ -259,23 +271,23 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         use_waveform = has_waveform[0]
 
         if use_waveform:
-            sr = tasks[0].data.get(self.sample_rate_key)
+            sr = to_process[0].data.get(self.sample_rate_key)
             if sr is None:
                 msg = f"Sortformer: waveform provided but '{self.sample_rate_key}' is missing"
                 raise ValueError(msg)
             all_segments = self._diarize(waveforms, sample_rate=sr)
         else:
-            paths = [t.data[self.filepath_key] for t in tasks]
+            paths = [t.data[self.filepath_key] for t in to_process]
             all_segments = self._diarize(paths)
 
-        for task, segments in zip(tasks, all_segments, strict=True):
+        for task, segments in zip(to_process, all_segments, strict=True):
             self._apply_results(task, segments)
 
         # Write RTTM files after all GPU results are applied (batch disk I/O)
         if self.rttm_out_dir is not None:
-            for task, segments in zip(tasks, all_segments, strict=True):
+            for task, segments in zip(to_process, all_segments, strict=True):
                 sess_name = task.data.get("session_name") or task.task_id
                 _write_rttm(segments, sess_name, self.rttm_out_dir)
 
-        logger.info(f"Sortformer: diarized {len(tasks)} samples")
+        logger.info(f"Sortformer: diarized {len(to_process)} samples")
         return tasks

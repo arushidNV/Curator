@@ -242,6 +242,12 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
             msg = "VAD model failed to initialize. Cannot process audio."
             raise RuntimeError(msg)
 
+        # Read failures from the reader flow straight to the writer (manifest audit trail).
+        # Drop any residual waveform so downstream GPU stages skip them.
+        if task.data.get("read_error"):
+            task.data.pop(self.waveform_key, None)
+            return [task]
+
         audio_result = self._resolve_audio(task.data)
         if audio_result is None:
             return []
@@ -254,7 +260,14 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
                 if self.nested:
                     task.data["segments"] = []
                     return task
-                return []
+                task.data["vad_empty"] = True
+                if "duration_sec" not in task.data:
+                    n_samples = waveform.shape[-1] if waveform.dim() > 0 else 0
+                    task.data["duration_sec"] = n_samples / sample_rate if sample_rate else 0.0
+                # Drop the full-file waveform: nothing to segment, and forwarding an
+                # unbounded-length array into SED/LangID OOMs the shared GPU.
+                task.data.pop(self.waveform_key, None)
+                return [task]
 
             original_file = task.data.get("audio_filepath", "unknown")
             file_name = os.path.basename(original_file) if original_file != "unknown" else task.task_id

@@ -74,8 +74,14 @@ class TestWriteRttm:
         assert lines[1].startswith("SPEAKER test_session 1 3.000 2.000")
         assert "speaker_1" in lines[1]
 
+    def test_sanitizes_slashes_in_session_name(self, tmp_path: Path) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "speaker": "speaker_0"}]
+        sess_name = "audio-riva-originals/nl/pilot_90files_5"
+        _write_rttm(segments, sess_name, str(tmp_path))
+        rttm_path = tmp_path / "audio-riva-originals_nl_pilot_90files_5.rttm"
+        assert rttm_path.exists()
+        assert "SPEAKER audio-riva-originals/nl/pilot_90files_5" in rttm_path.read_text()
 
-class TestInferenceSortformerStage:
     def test_setup_on_node_pre_caches_model(self) -> None:
         stage = InferenceSortformerStage(model_name="nvidia/diar_streaming_sortformer_4spk-v2")
         with patch("nemo_curator.stages.audio.inference.sortformer.snapshot_download") as mock_dl:
