@@ -170,9 +170,6 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
         prompt_text: System prompt string (takes precedence over prompt_file).
         prompt_file: Path to a file containing the system prompt.
         text_key: Input field to read text from.
-        reference_text_key: Optional second input field (e.g. ground-truth
-            transcript). When set, ``{reference_text}`` and ``{ground_truth}``
-            placeholders in the prompt are filled from this field.
         output_text_key: Output field to write the result to.
         skip_me_key: Field that flags entries to skip.
         notes_key: Field for additional_notes tracking.
@@ -192,7 +189,6 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     prompt_text: str | None = None
     prompt_file: str | None = None
     text_key: str = "pnc_text"
-    reference_text_key: str | None = None
     output_text_key: str = "output_text"
     skip_me_key: str = "_skipme"
     notes_key: str = "additional_notes"
@@ -289,10 +285,7 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
     # ── I/O contract ─────────────────────────────────────────────────
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        keys = [self.text_key, self.skip_me_key]
-        if self.reference_text_key:
-            keys.append(self.reference_text_key)
-        return [], keys
+        return [], [self.text_key, self.skip_me_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.output_text_key]
@@ -301,18 +294,10 @@ class TextLLMStage(ProcessingStage[AudioTask, AudioTask]):
 
     def _format_prompt(self, user_text: str, task_data: dict | None = None) -> str:
         prompt_template = self._system_prompt
-        task_data = task_data or {}
 
         if "{language}" in prompt_template:
-            lang = task_data.get("source_lang", "English")
+            lang = task_data.get("source_lang", "English") if task_data else "English"
             prompt_template = prompt_template.replace("{language}", lang)
-
-        if self.reference_text_key:
-            ref_text = str(task_data.get(self.reference_text_key, "") or "").strip()
-            if "{reference_text}" in prompt_template:
-                prompt_template = prompt_template.replace("{reference_text}", ref_text)
-            if "{ground_truth}" in prompt_template:
-                prompt_template = prompt_template.replace("{ground_truth}", ref_text)
 
         if "{text}" in prompt_template:
             prompt_template = prompt_template.replace("{text}", user_text)
