@@ -133,7 +133,7 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
                 set_note(
                     task.data,
                     self.name,
-                    f"used {self.reference_source_label} (primary hallucination)",
+                    f"recovered:reference_text (hallucination_detected, fallback={self.reference_text_key})",
                     self.notes_key,
                 )
                 return task

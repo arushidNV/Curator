@@ -239,6 +239,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=40.0,
         help="Min chars/s above which text is considered impossibly dense.",
     )
+    tf.add_argument(
+        "--use_reference_on_hallucination",
+        action="store_true",
+        default=False,
+        help=(
+            "When the primary prediction is flagged as a hallucination and no recovery model "
+            "provides a valid prediction, fall back to the field named by --reference_text_key "
+            "(e.g. granary_v1_prediction, the original 'text' field from the manifest)."
+        ),
+    )
+    tf.add_argument(
+        "--reference_text_key",
+        type=str,
+        default=None,
+        metavar="FIELD",
+        help=(
+            "Manifest field to use as reference text when --use_reference_on_hallucination is set. "
+            "Typically 'granary_v1_prediction' (the original 'text' field renamed by InitializeFields)."
+        ),
+    )
 
     sed = ap.add_argument_group("SED (sound event detection)")
     sed.add_argument("--sed_checkpoint", type=str, default=None,
@@ -542,7 +562,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             source_lang_key=args.source_lang_key,
             pred_text_key="primary_model_prediction",
             disfluency_text_key="primary_model_prediction_s2",
-            keep_waveform=True,
+            keep_waveform=has_recovery,
             num_workers_override=args.primary_num_workers,
         ))
 
@@ -553,7 +573,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             inference_batch_size=args.parakeet_inference_batch_size,
             source_lang_key=args.source_lang_key,
             pred_text_key="primary_model_prediction",
-            keep_waveform=True,
+            keep_waveform=has_recovery,
             batch_size=args.asr_batch_size,
             num_workers_override=args.primary_num_workers,
         ))
@@ -565,7 +585,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             device=args.whisper_device,
             compute_type=args.whisper_compute_type,
             pred_text_key="primary_model_prediction",
-            keep_waveform=True,
+            keep_waveform=has_recovery,
             source_lang_key=args.source_lang_key,
             batch_size=args.asr_batch_size,
             num_workers_override=args.primary_num_workers,
@@ -579,7 +599,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             inference_batch_size=args.parakeet_inference_batch_size,
             source_lang_key=args.source_lang_key,
             pred_text_key="primary_model_prediction",
-            keep_waveform=True,
+            keep_waveform=has_recovery,
             batch_size=args.asr_batch_size,
             num_workers_override=args.primary_num_workers,
         ))
@@ -591,7 +611,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             decode_mode=args.indic_monolingual_decode,
             source_lang_key=args.source_lang_key,
             pred_text_key="primary_model_prediction",
-            keep_waveform=True,
+            keep_waveform=has_recovery,
             batch_size=args.asr_batch_size,
             num_workers_override=args.primary_num_workers,
         ))
@@ -696,6 +716,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         primary_text_key=primary_text_key,
         asr_text_key="fallback_model_prediction",
         primary_source_label="primary",
+        reference_text_key=args.reference_text_key,
+        use_reference_on_hallucination=args.use_reference_on_hallucination,
     ))
 
     stages.extend([
