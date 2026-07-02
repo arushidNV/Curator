@@ -51,6 +51,79 @@ except (ImportError, ModuleNotFoundError):
 _TARGET_SR = 16000
 
 
+def _shard_progress_path(output_dir: str, shard_subdir: str) -> str:
+    safe = shard_subdir.replace("/", "_")
+    return os.path.join(output_dir, f".{safe}.shard_progress.json")
+
+
+def _record_shard_input(output_dir: str, shard_subdir: str, input_id: str, shard_total: int) -> None:
+    """Track unique source files per shard on disk (safe across writer actors)."""
+    if not shard_subdir or not input_id or shard_total <= 0:
+        return
+
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+
+    progress_path = _shard_progress_path(output_dir, shard_subdir)
+    os.makedirs(os.path.dirname(progress_path) or output_dir, exist_ok=True)
+
+    with open(progress_path, "a+", encoding="utf-8") as f:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            raw = f.read().strip()
+            data = json.loads(raw) if raw else {"seen": []}
+            seen = data.setdefault("seen", [])
+            if input_id not in seen:
+                seen.append(input_id)
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f)
+            f.flush()
+            if fcntl is not None:
+                os.fsync(f.fileno())
+            if len(seen) >= shard_total:
+                done_path = os.path.join(output_dir, f"{shard_subdir}.jsonl.done")
+                os.makedirs(os.path.dirname(done_path), exist_ok=True)
+                with open(done_path, "w", encoding="utf-8"):
+                    pass
+                logger.info(f"Shard {shard_subdir} complete: {len(seen)}/{shard_total} inputs recorded")
+        finally:
+            if fcntl is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _append_manifest_line(manifest_path: str, line: str) -> None:
+    """Append one JSONL line after the matching opus file is on disk."""
+    with open(manifest_path, "a", encoding="utf-8") as f:
+        try:
+            import fcntl
+
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except ImportError:
+            f.write(line + "\n")
+            f.flush()
+
+
+def _write_opus_atomic(out_path: str, opus_bytes: bytes) -> None:
+    """Write opus to a temp file, fsync, then rename so manifest never references a partial file."""
+    parent = os.path.dirname(out_path)
+    os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{out_path}.tmp.{os.getpid()}"
+    with open(tmp_path, "wb") as f:
+        f.write(opus_bytes)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, out_path)
+
+
 @dataclass
 class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
     """Write audio segments as individual opus files with a JSONL manifest.
@@ -71,6 +144,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
     target_sample_rate: int = _TARGET_SR
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
+    writer_concurrency: int = 1
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     _total_written: int = field(default=0, init=False, repr=False)
@@ -113,7 +187,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         return ["data"], []
 
     def num_workers(self) -> int | None:
-        return 1
+        return max(1, self.writer_concurrency)
 
     def ray_stage_spec(self) -> dict[str, Any]:
         if RayStageSpecKeys is not None:
@@ -144,6 +218,25 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         sf.write(buf, waveform, sr, format="OGG", subtype="OPUS")
         return buf.getvalue()
 
+    def _shard_manifest_path(self, shard_subdir: str) -> str:
+        name = f"{shard_subdir}.jsonl" if shard_subdir else "manifest.jsonl"
+        return os.path.join(self.output_dir, name)
+
+    def _emit_manifest_only(
+        self,
+        task: AudioTask,
+        manifest_entry: dict[str, Any],
+        shard_subdir: str,
+        input_id: str,
+        shard_total: int,
+    ) -> FileGroupTask:
+        """Write a manifest-only row (no opus) for placeholder tasks and record shard progress."""
+        manifest_path = self._shard_manifest_path(shard_subdir)
+        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+        _append_manifest_line(manifest_path, json.dumps(manifest_entry))
+        _record_shard_input(self.output_dir, shard_subdir, input_id, shard_total)
+        return FileGroupTask(task_id=task.task_id, dataset_name=task.dataset_name, data=[])
+
     def process_batch(self, tasks: list[AudioTask]) -> list[FileGroupTask]:
         return [self.process(task) for task in tasks]
 
@@ -153,6 +246,44 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         if shard_key and self._shard_counts.get(shard_key) == -1:
             return FileGroupTask(task_id=task.task_id, dataset_name=task.dataset_name, data=[])
 
+        shard_subdir = shard_key or ""
+        shard_total = int(task._metadata.get("_shard_total", 0))
+        original_file = task.data.get("original_file", task.data.get("audio_filepath", ""))
+        input_id = original_file or task.task_id
+
+        if task.data.get("vad_empty"):
+            manifest_entry: dict[str, Any] = {
+                "audio_filepath": "",
+                "duration": 0.0,
+                "sample_rate": self.target_sample_rate,
+                "sampling_rate": self.target_sample_rate,
+                "vad_empty": True,
+            }
+            if original_file:
+                manifest_entry["original_audio_filepath"] = original_file
+            source_duration = task.data.get("duration_sec") or task.data.get("duration")
+            if source_duration is not None:
+                manifest_entry["source_duration"] = round(float(source_duration), 4)
+            for key in ("language", "language_confidence", "sed_events", "num_speakers", "corpus", "shard_id"):
+                if key in task.data:
+                    manifest_entry[key] = task.data[key]
+            return self._emit_manifest_only(task, manifest_entry, shard_subdir, input_id, shard_total)
+
+        if task.data.get("read_error"):
+            manifest_entry = {
+                "audio_filepath": "",
+                "duration": 0.0,
+                "sample_rate": self.target_sample_rate,
+                "sampling_rate": self.target_sample_rate,
+                "read_error": True,
+            }
+            if original_file:
+                manifest_entry["original_audio_filepath"] = original_file
+            for key in ("corpus", "shard_id", "source_lang"):
+                if key in task.data:
+                    manifest_entry[key] = task.data[key]
+            return self._emit_manifest_only(task, manifest_entry, shard_subdir, input_id, shard_total)
+
         waveform = task.data.get(self.waveform_key)
         sr = task.data.get(self.sample_rate_key, self.target_sample_rate)
 
@@ -161,22 +292,22 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
 
         waveform = self._ensure_numpy(waveform)
 
-        # Derive filename from original audio path + offset
-        original_file = task.data.get("original_file", task.data.get("audio_filepath", ""))
+        # Derive filename from the original audio basename.
         base_name = os.path.splitext(os.path.basename(original_file))[0] if original_file else str(self._total_written)
         offset_ms = int(task.data.get("start_ms", 0))
-        filename = f"{base_name}_{offset_ms}ms.opus"
+        if offset_ms == 0:
+            filename = f"{base_name}.opus"
+        else:
+            filename = f"{base_name}_{offset_ms}ms.opus"
 
         # Use shard_key as subdirectory to mirror input structure
-        shard_subdir = shard_key or ""
         segment_dir = os.path.join(self.output_dir, shard_subdir)
         os.makedirs(segment_dir, exist_ok=True)
 
-        # Write opus (already at target SR from upstream ResampleStage)
+        # Write opus (already at target SR from upstream ResampleStage), then manifest.
         opus_bytes = self._encode_opus(waveform, sr)
         out_path = os.path.join(segment_dir, filename)
-        with open(out_path, "wb") as f:
-            f.write(opus_bytes)
+        _write_opus_atomic(out_path, opus_bytes)
 
         # Build manifest entry
         duration = task.data.get("duration_sec") or (len(waveform) / sr if sr > 0 else 0)
@@ -208,37 +339,26 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         if "num_speakers" in task.data:
             manifest_entry["num_speakers"] = task.data["num_speakers"]
 
+        # Forward all remaining text/metadata fields from upstream stages
+        _INTERNAL_KEYS = {
+            self.waveform_key, self.sample_rate_key,
+            "waveform", "sampling_rate", "sample_rate", "num_channels",
+            "original_file", "audio_filepath", "start_ms", "end_ms",
+            "language", "language_confidence", "sed_events", "num_speakers",
+            "duration", "duration_sec", "original_sampling_rate", "original_channels",
+            "corpus", "shard_id",
+        }
+        for key, value in task.data.items():
+            if key not in _INTERNAL_KEYS and key not in manifest_entry:
+                manifest_entry[key] = value
+
         # Write to per-shard manifest
-        shard_manifest_path = (
-            os.path.join(self.output_dir, f"{shard_subdir}.jsonl")
-            if shard_subdir
-            else os.path.join(self.output_dir, "manifest.jsonl")
-        )
+        shard_manifest_path = self._shard_manifest_path(shard_subdir)
         os.makedirs(os.path.dirname(shard_manifest_path), exist_ok=True)
-        with open(shard_manifest_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(manifest_entry) + "\n")
+        _append_manifest_line(shard_manifest_path, json.dumps(manifest_entry))
 
         self._total_written += 1
-
-        # Checkpointing: track per-shard progress by unique input files (not segments).
-        # After VAD, one input audio produces many segments — count unique original files
-        # to compare against shard_total (number of input entries in the manifest).
-        shard_total = task._metadata.get("_shard_total", 0)
-        if shard_key:
-            input_id = task.data.get("original_file") or task.data.get("audio_filepath") or task.task_id
-            if "_seen_inputs" not in self.__dict__:
-                self._seen_inputs: dict[str, set] = {}
-            if shard_key not in self._seen_inputs:
-                self._seen_inputs[shard_key] = set()
-            self._seen_inputs[shard_key].add(input_id)
-            if shard_total > 0 and len(self._seen_inputs[shard_key]) >= shard_total:
-                done_path = os.path.join(self.output_dir, f"{shard_subdir}.jsonl.done")
-                os.makedirs(os.path.dirname(done_path), exist_ok=True)
-                open(done_path, "w").close()
-                logger.info(
-                    f"Shard {shard_key} complete: {len(self._seen_inputs[shard_key])} inputs processed, "
-                    f"{self._total_written} total segments written"
-                )
+        _record_shard_input(self.output_dir, shard_subdir, input_id, shard_total)
 
         return FileGroupTask(
             task_id=task.task_id,
