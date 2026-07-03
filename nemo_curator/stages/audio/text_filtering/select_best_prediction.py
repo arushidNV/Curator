@@ -51,6 +51,12 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
   ``reference_text_key`` (e.g. the dataset's original transcript) is
   used instead, if non-empty.
 
+    When the primary model does not support the sample's language and no
+    fallback/recovery model produced a usable transcription, the text at
+    ``reference_text_key`` (the original manifest ground truth) is used
+    instead, if non-empty, and ``source_key`` is set to
+    ``ground_truth_source_label``.
+
     This allows downstream stages (FastTextLID, RegexSubstitution) to
     always read from ``best_prediction`` regardless of which model
     produced the final text.
@@ -74,6 +80,7 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     reference_text_key: str | None = None
     use_reference_on_hallucination: bool = False
     reference_source_label: str = "reference"
+    ground_truth_source_label: str = "ground_truth"
     name: str = "SelectBestPrediction"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
@@ -95,6 +102,17 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
         notes_dict = notes if isinstance(notes, dict) else {}
         primary_lang_skipped = "lang_not_supported" in str(notes_dict.get(self.primary_text_key, ""))
         fallback_lang_skipped = "lang_not_supported" in str(notes_dict.get(self.asr_text_key, ""))
+
+        # Ground truth fallback: primary lang unsupported and no fallback model
+        # produced a usable transcription -> use the original manifest text.
+        if primary_lang_skipped and not asr_pred and self.reference_text_key:
+            ref_text = str(task.data.get(self.reference_text_key, "") or "").strip()
+            if ref_text:
+                task.data[self.output_key] = ref_text
+                task.data[self.source_key] = self.ground_truth_source_label
+                task.data[self.skip_me_key] = ""
+                set_note(task.data, self.name, "Ground Truth", self.notes_key)
+                return task
 
         # Case 3: both models skipped (language not supported by either)
         if primary_lang_skipped and fallback_lang_skipped:
