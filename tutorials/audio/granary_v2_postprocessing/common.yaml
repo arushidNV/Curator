@@ -1,14 +1,15 @@
 # Granary v2 ASR post-processing regex rules.
 #
-# Covered languages (46):
+# Covered languages (48):
 #   Latin:      en, de, es, fr, it, pt, pl, cs, nl, ro, hu, fi, lt, da, sv,
 #               lv, hr, et, sk, sl, mt, id, tl/fil, tr, vi
 #   Greek:      el
 #   Cyrillic:   ru, uk, bg
 #   Devanagari: hi, mr
-#   Bengali:    bn
+#   Bengali:    bn, as
 #   Gurmukhi:   pa
 #   Gujarati:   gu
+#   Odia:       or
 #   Tamil:      ta
 #   Telugu:     te
 #   Kannada:    kn
@@ -35,11 +36,26 @@
 - {"pattern": "Ё", "repl": "Е"}
 - {"pattern": "ё", "repl": "е"}
 
-# Devanagari punctuation (hi, mr)
+# Double smart quotes (as, or, fil)
+- {"pattern": "“", "repl": ""}     # left double smart quote “
+- {"pattern": "”", "repl": ""}     # right double smart quote ”
+
+# Guillemets (fa)
+- {"pattern": "«", "repl": ""}     # left guillemet «
+- {"pattern": "»", "repl": ""}     # right guillemet »
+
+# Invisible / formatting characters (strip)
+- {"pattern": "‎", "repl": ""}     # LTR mark (fa)
+- {"pattern": "‏", "repl": ""}     # RTL mark
+- {"pattern": "­", "repl": ""}     # soft hyphen (fil)
+- {"pattern": "﻿", "repl": ""}     # BOM / zero-width no-break space
+
+# Devanagari / Odia punctuation (hi, mr, or)
+# Odia uses the same danda (U+0964) and double danda (U+0965)
 - {"pattern": "\u0964", "repl": "."}    # danda ।
 - {"pattern": "\u0965", "repl": "."}    # double danda ॥
 
-# Arabic / Urdu punctuation (ar, ur)
+# Arabic / Urdu punctuation (ar, ur, fa)
 - {"pattern": "\u06D4", "repl": "."}    # Arabic full stop ۔
 - {"pattern": "\u060C", "repl": ","}    # Arabic comma ،
 - {"pattern": "\u061B", "repl": ","}    # Arabic semicolon ؛
@@ -78,6 +94,7 @@
 #   Bengali             \u0980-\u09FF
 #   Gurmukhi            \u0A00-\u0A7F
 #   Gujarati            \u0A80-\u0AFF
+#   Odia                \u0B00-\u0B7F
 #   Tamil               \u0B80-\u0BFF
 #   Telugu              \u0C00-\u0C7F
 #   Kannada             \u0C80-\u0CFF
@@ -91,7 +108,7 @@
 #   Katakana            \u30A0-\u30FF
 #   CJK Unified         \u4E00-\u9FFF
 #   Hangul Syllables    \uAC00-\uD7AF
-- {"pattern": "[^ !$%',-.0123456789;?ABCDEFGHIJKLMNOPQRSßTUVWXYŸZabcdefghijklmnopqrsẞtuvwxyÿz¡£¿ÀÁÂÃÄÅÆÇÈÉÊÌÍÎÑÒÓÔÕÖØÙÚÜÝàáâãäåæçèéêëìíîïñòóôõöøùúûüýĀāĂăĄąĆćĊċČčĎďĐđĒēĖėĘęĚěĠġĢģĦħĪīĮįĶķĹĺĻļĽľŁłŃńŅņŇňŐőŒœŔŕŘřŚśŠšŤťŪūŮůŰűŲųŹźŻżŽžȘșȚțΆΈΉΌΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩάέήίαβγδεζηθικλμνξοπρστυφχψωϊόύώЁЄІЇАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяёєіїҐґ€₴₽/:\u011E\u011F\u0130\u0131\u015E\u015F\u01A0-\u01B0\u0590-\u05FF\u0600-\u06FF\u0750-\u077F\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F\u0E00-\u0E7F\u1EA0-\u1EFF\u200C\u200D\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]", "repl": " "}
+- {"pattern": "[^ !$%',-.0123456789;?ABCDEFGHIJKLMNOPQRSßTUVWXYŸZabcdefghijklmnopqrsẞtuvwxyÿz¡£¿ÀÁÂÃÄÅÆÇÈÉÊÌÍÎÑÒÓÔÕÖØÙÚÜÝàáâãäåæçèéêëìíîïñòóôõöøùúûüýĀāĂăĄąĆćĊċČčĎďĐđĒēĖėĘęĚěĠġĢģĦħĪīĮįĶķĹĺĻļĽľŁłŃńŅņŇňŐőŒœŔŕŘřŚśŠšŤťŪūŮůŰűŲųŹźŻżŽžȘșȚțΆΈΉΌΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩάέήίαβγδεζηθικλμνξοπρστυφχψωϊόύώЁЄІЇАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяёєіїҐґ€₴₽/:\u011E\u011F\u0130\u0131\u015E\u015F\u01A0-\u01B0\u0590-\u05FF\u0600-\u06FF\u0750-\u077F\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF\u0B00-\u0B7F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F\u0E00-\u0E7F\u1EA0-\u1EFF\u200C\u200D\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]", "repl": " "}
 
 # Trailing cleanup
 - {"pattern": '\s+\.', "repl": "."}
