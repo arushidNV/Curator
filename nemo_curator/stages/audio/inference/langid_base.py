@@ -1,0 +1,115 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Shared base for spoken-language-identification stages.
+
+Holds the waveform normalization / resampling logic common to the AmberNet and
+SpeechBrain LangID stages so the two only differ in model loading and inference.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+import torch
+
+from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.resources import Resources
+from nemo_curator.tasks import AudioTask
+
+
+@dataclass
+class BaseLangIDStage(ProcessingStage[AudioTask, AudioTask]):
+    """Common config + waveform preprocessing for LangID stages.
+
+    Subclasses provide model loading (``setup``/``teardown``) and a
+    ``process_batch`` that runs inference on prepared waveforms.
+
+    Args:
+        target_sr: Target sample rate for the model (default 16000).
+        waveform_key: Task data key for the audio waveform.
+        sample_rate_key: Task data key for the sample rate.
+        output_key: Task data key to write the predicted language.
+        confidence_key: Task data key to write prediction confidence.
+        min_duration_sec: Minimum segment duration for LangID (skip shorter).
+        batch_size: Number of segments to process at once.
+    """
+
+    target_sr: int = 16000
+    waveform_key: str = "waveform"
+    sample_rate_key: str = "sample_rate"
+    output_key: str = "language"
+    confidence_key: str = "language_confidence"
+    min_duration_sec: float = 1.0
+    batch_size: int = 32
+    resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=4.0))
+
+    _resamplers: dict[tuple[int, int], Any] = field(default_factory=dict, init=False, repr=False)
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], [self.waveform_key, self.sample_rate_key]
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], [self.output_key, self.confidence_key]
+
+    def _set_empty(self, task: AudioTask) -> None:
+        task.data[self.output_key] = ""
+        task.data[self.confidence_key] = 0.0
+
+    def _resample(self, waveform: np.ndarray, sr: int) -> torch.Tensor:
+        """Resample a 1-D float32 array to ``target_sr`` using a cached transform."""
+        audio = torch.from_numpy(np.ascontiguousarray(waveform, dtype=np.float32))
+        if sr != self.target_sr:
+            import torchaudio
+
+            key = (sr, self.target_sr)
+            resampler = self._resamplers.get(key)
+            if resampler is None:
+                resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.target_sr)
+                self._resamplers[key] = resampler
+            audio = resampler(audio)
+        return audio
+
+    def _prepare_audio(self, task: AudioTask) -> torch.Tensor | None:
+        """Normalize a task's waveform to a 1-D 16kHz tensor, or None if it should be skipped.
+
+        Skipped tasks (missing/empty/too-short waveform) get empty results written in place.
+        """
+        waveform = task.data.get(self.waveform_key)
+        sr = task.data.get(self.sample_rate_key, self.target_sr)
+
+        if waveform is None:
+            self._set_empty(task)
+            return None
+
+        if isinstance(waveform, torch.Tensor):
+            waveform = waveform.squeeze().cpu().numpy()
+        else:
+            waveform = np.asarray(waveform, dtype=np.float32)
+        if waveform.ndim > 1:
+            waveform = waveform.squeeze()
+        if waveform.size == 0:
+            self._set_empty(task)
+            return None
+
+        if len(waveform) / sr < self.min_duration_sec:
+            self._set_empty(task)
+            return None
+
+        return self._resample(waveform, sr)
+
+    def process(self, task: AudioTask) -> AudioTask:
+        return self.process_batch([task])[0]
