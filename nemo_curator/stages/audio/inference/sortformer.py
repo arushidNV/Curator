@@ -228,6 +228,20 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if self.store_segments:
             task.data[self.diar_segments_key] = segments
 
+    def _session_name(self, task: AudioTask) -> str:
+        """RTTM session/name key: explicit session_name, else the audio basename, else task_id.
+
+        Keying on the audio basename (not task_id) keeps RTTMs matchable to their
+        source recording; task_id defaults to "" and would collide across recordings.
+        """
+        sess_name = task.data.get("session_name")
+        if sess_name:
+            return sess_name
+        filepath = task.data.get(self.filepath_key)
+        if filepath:
+            return os.path.splitext(os.path.basename(filepath))[0]
+        return task.task_id
+
     def process(self, task: AudioTask) -> AudioTask:
         """Run speaker diarization on a single task."""
         if task.data.get("read_error"):
@@ -248,10 +262,10 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             segments = self._diarize([filepath])[0]
 
         if self.rttm_out_dir is not None:
-            sess_name = task.data.get("session_name") or task.task_id
-            _write_rttm(segments, sess_name, self.rttm_out_dir)
+            _write_rttm(segments, self._session_name(task), self.rttm_out_dir)
 
         self._apply_results(task, segments)
+        task.task_id = f"{task.task_id}_sortformer"
         return task
 
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
@@ -286,8 +300,10 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         # Write RTTM files after all GPU results are applied (batch disk I/O)
         if self.rttm_out_dir is not None:
             for task, segments in zip(to_process, all_segments, strict=True):
-                sess_name = task.data.get("session_name") or task.task_id
-                _write_rttm(segments, sess_name, self.rttm_out_dir)
+                _write_rttm(segments, self._session_name(task), self.rttm_out_dir)
+
+        for task in to_process:
+            task.task_id = f"{task.task_id}_sortformer"
 
         logger.info(f"Sortformer: diarized {len(to_process)} samples")
         return tasks

@@ -24,20 +24,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 import torch
 from loguru import logger
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
+    from nemo_curator.tasks import AudioTask
 
-from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.resources import Resources
-from nemo_curator.tasks import AudioTask
+from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage
 
 
 @dataclass
-class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
+class AmberNetLangIDStage(BaseLangIDStage):
     """Language identification using NeMo's AmberNet model.
 
     Processes audio segments and adds a ``language`` field with the
@@ -48,25 +46,13 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
 
     Args:
         model_name: NeMo model name for from_pretrained.
-        target_sr: Target sample rate for the model (default 16000).
-        waveform_key: Task data key for the audio waveform.
-        sample_rate_key: Task data key for the sample rate.
-        output_key: Task data key to write the predicted language.
-        confidence_key: Task data key to write prediction confidence.
-        min_duration_sec: Minimum segment duration for LangID (skip shorter).
-        batch_size: Number of segments to process at once.
+
+    See :class:`~nemo_curator.stages.audio.inference.langid_base.BaseLangIDStage`
+    for the shared waveform/output arguments.
     """
 
     name: str = "AmberNetLangID"
     model_name: str = "langid_ambernet"
-    target_sr: int = 16000
-    waveform_key: str = "waveform"
-    sample_rate_key: str = "sample_rate"
-    output_key: str = "language"
-    confidence_key: str = "language_confidence"
-    min_duration_sec: float = 1.0
-    batch_size: int = 32
-    resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=4.0))
 
     model: Any = field(default=None, init=False, repr=False)
 
@@ -94,24 +80,6 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
             del self.model
             self.model = None
 
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.waveform_key, self.sample_rate_key]
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.output_key, self.confidence_key]
-
-    def _resample_if_needed(self, waveform: np.ndarray, sr: int) -> torch.Tensor:
-        audio = torch.from_numpy(waveform).float()
-        if sr != self.target_sr:
-            import torchaudio
-
-            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.target_sr)
-            audio = resampler(audio)
-        return audio
-
-    def process(self, task: AudioTask) -> AudioTask:
-        return self.process_batch([task])[0]
-
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
         if len(tasks) == 0:
             return []
@@ -124,33 +92,9 @@ class AmberNetLangIDStage(ProcessingStage[AudioTask, AudioTask]):
         audio_lengths: list[int] = []
 
         for i, task in enumerate(tasks):
-            waveform = task.data.get(self.waveform_key)
-            sr = task.data.get(self.sample_rate_key, self.target_sr)
-
-            if waveform is None:
-                task.data[self.output_key] = ""
-                task.data[self.confidence_key] = 0.0
+            audio = self._prepare_audio(task)
+            if audio is None:
                 continue
-
-            # Normalize to 1-D numpy float32
-            if isinstance(waveform, torch.Tensor):
-                waveform = waveform.squeeze().cpu().numpy()
-            else:
-                waveform = np.asarray(waveform, dtype=np.float32)
-            if waveform.ndim > 1:
-                waveform = waveform.squeeze()
-            if waveform.size == 0:
-                task.data[self.output_key] = ""
-                task.data[self.confidence_key] = 0.0
-                continue
-
-            duration = len(waveform) / sr
-            if duration < self.min_duration_sec:
-                task.data[self.output_key] = ""
-                task.data[self.confidence_key] = 0.0
-                continue
-
-            audio = self._resample_if_needed(waveform, sr)
             valid_indices.append(i)
             audio_signals.append(audio)
             audio_lengths.append(len(audio))

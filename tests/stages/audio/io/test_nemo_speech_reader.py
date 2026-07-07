@@ -68,3 +68,23 @@ class TestDedupEntriesByStem:
         result = _dedup_entries_by_stem(entries, "shard")
         assert len(result) == 1
         assert result[0]["audio_filepath"] == "s3://b/audios/w.opus"
+
+    def test_keeps_distinct_recordings_sharing_basename_across_dirs(self) -> None:
+        # Different directories, same basename -> genuinely distinct recordings.
+        # Basename-only dedup would drop one; directory-aware dedup keeps both.
+        entries = [
+            {"audio_filepath": "s3://b/set_a/utt_001.wav"},
+            {"audio_filepath": "s3://b/set_b/utt_001.wav"},
+        ]
+        result = _dedup_entries_by_stem(entries, "shard")
+        paths = [e["audio_filepath"] for e in result]
+        assert paths == ["s3://b/set_a/utt_001.wav", "s3://b/set_b/utt_001.wav"]
+
+    def test_same_dir_same_stem_still_dedups(self) -> None:
+        entries = [
+            {"audio_filepath": "s3://b/set_a/utt_001.wav"},
+            {"audio_filepath": "s3://b/set_a/utt_001.opus"},
+        ]
+        result = _dedup_entries_by_stem(entries, "shard")
+        assert len(result) == 1
+        assert result[0]["audio_filepath"] == "s3://b/set_a/utt_001.opus"

@@ -228,6 +228,16 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
         return ensure_waveform_2d(waveform), sample_rate
 
+    def _as_read_error(self, task: AudioTask) -> AudioTask:
+        """Turn a task into a read_error placeholder and drop its waveform.
+
+        Read errors flow straight to the writer for the manifest audit trail; dropping
+        the waveform keeps downstream GPU stages (SED/LangID) from touching them.
+        """
+        task.data["read_error"] = True
+        task.data.pop(self.waveform_key, None)
+        return task
+
     def process(self, task: AudioTask) -> AudioTask | list[AudioTask]:
         """
         Process a single AudioTask.
@@ -245,8 +255,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         # Read failures from the reader flow straight to the writer (manifest audit trail).
         # Drop any residual waveform so downstream GPU stages skip them.
         if task.data.get("read_error"):
-            task.data.pop(self.waveform_key, None)
-            return [task]
+            return [self._as_read_error(task)]
 
         audio_result = self._resolve_audio(task.data)
         if audio_result is None:
@@ -297,8 +306,11 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
                 output_tasks.append(seg_task)
 
         except Exception as e:  # noqa: BLE001
+            # A crash here (e.g. a corrupt/degenerate waveform) must not silently drop
+            # the recording — that would leave its shard one input short forever and
+            # ``.jsonl.done`` would never be written. Forward a read_error placeholder.
             logger.exception(f"Error during VAD segmentation: {e}")
-            return []
+            return [self._as_read_error(task)]
         else:
             return output_tasks
 

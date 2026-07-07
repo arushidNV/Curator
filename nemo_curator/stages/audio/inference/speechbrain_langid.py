@@ -24,20 +24,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 import torch
 from loguru import logger
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
+    from nemo_curator.tasks import AudioTask
 
-from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.resources import Resources
-from nemo_curator.tasks import AudioTask
+from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage
 
 
 @dataclass
-class SpeechBrainLangIDStage(ProcessingStage[AudioTask, AudioTask]):
+class SpeechBrainLangIDStage(BaseLangIDStage):
     """Language identification using SpeechBrain's VoxLingua107 ECAPA-TDNN model.
 
     Supports 107 languages with high accuracy. Operates on in-memory waveforms,
@@ -46,25 +44,14 @@ class SpeechBrainLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     Args:
         source: HuggingFace model source (default: speechbrain/lang-id-voxlingua107-ecapa).
         savedir: Directory to cache the downloaded model.
-        target_sr: Target sample rate for the model (default 16000).
-        waveform_key: Task data key for the audio waveform.
-        sample_rate_key: Task data key for the sample rate.
-        output_key: Task data key to write the predicted language.
-        confidence_key: Task data key to write prediction confidence.
-        min_duration_sec: Minimum segment duration for LangID (skip shorter).
+
+    See :class:`~nemo_curator.stages.audio.inference.langid_base.BaseLangIDStage`
+    for the shared waveform/output arguments.
     """
 
     name: str = "SpeechBrainLangID"
     source: str = "speechbrain/lang-id-voxlingua107-ecapa"
     savedir: str = "/tmp/speechbrain_langid"
-    target_sr: int = 16000
-    waveform_key: str = "waveform"
-    sample_rate_key: str = "sample_rate"
-    output_key: str = "language"
-    confidence_key: str = "language_confidence"
-    min_duration_sec: float = 1.0
-    batch_size: int = 32
-    resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=4.0))
 
     _classifier: Any = field(default=None, init=False, repr=False)
 
@@ -91,24 +78,6 @@ class SpeechBrainLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     def teardown(self) -> None:
         self._classifier = None
 
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.waveform_key, self.sample_rate_key]
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.output_key, self.confidence_key]
-
-    def _resample_if_needed(self, waveform: np.ndarray, sr: int) -> torch.Tensor:
-        audio = torch.from_numpy(waveform).float()
-        if sr != self.target_sr:
-            import torchaudio
-
-            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.target_sr)
-            audio = resampler(audio)
-        return audio
-
-    def process(self, task: AudioTask) -> AudioTask:
-        return self.process_batch([task])[0]
-
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
         if len(tasks) == 0:
             return []
@@ -116,35 +85,38 @@ class SpeechBrainLangIDStage(ProcessingStage[AudioTask, AudioTask]):
             msg = "Model not initialised — setup() was not called"
             raise RuntimeError(msg)
 
-        for task in tasks:
-            waveform = task.data.get(self.waveform_key)
-            sr = task.data.get(self.sample_rate_key, self.target_sr)
+        valid_indices: list[int] = []
+        audio_signals: list[torch.Tensor] = []
+        audio_lengths: list[int] = []
 
-            if waveform is None:
-                task.data[self.output_key] = ""
-                task.data[self.confidence_key] = 0.0
+        for i, task in enumerate(tasks):
+            audio = self._prepare_audio(task)
+            if audio is None:
                 continue
+            valid_indices.append(i)
+            audio_signals.append(audio)
+            audio_lengths.append(len(audio))
 
-            if isinstance(waveform, torch.Tensor):
-                waveform = waveform.squeeze().cpu().numpy()
-            else:
-                waveform = np.asarray(waveform, dtype=np.float32)
-            if waveform.ndim > 1:
-                waveform = waveform.squeeze()
-            if waveform.size == 0:
-                task.data[self.output_key] = ""
-                task.data[self.confidence_key] = 0.0
-                continue
+        if not audio_signals:
+            return tasks
 
-            duration = len(waveform) / sr
-            if duration < self.min_duration_sec:
-                task.data[self.output_key] = ""
-                task.data[self.confidence_key] = 0.0
-                continue
+        # Pad to a single [B, T] batch and classify in one forward pass. wav_lens is the
+        # relative (0-1) valid length of each row so padding is ignored by the model.
+        max_len = max(audio_lengths)
+        batch_tensor = torch.zeros(len(audio_signals), max_len)
+        for j, sig in enumerate(audio_signals):
+            batch_tensor[j, : len(sig)] = sig
+        wav_lens = torch.tensor([length / max_len for length in audio_lengths])
 
-            audio = self._resample_if_needed(waveform, sr).unsqueeze(0)
-            out_prob, score, index, label = self._classifier.classify_batch(audio)
-            task.data[self.output_key] = label[0]
-            task.data[self.confidence_key] = score.squeeze().item()
+        _out_prob, score, _index, label = self._classifier.classify_batch(batch_tensor, wav_lens)
+
+        # The model's final layer is Softmax(apply_log=True), so `score` is a log-probability
+        # (<= 0). Exponentiate to a linear 0-1 confidence.
+        confidence = torch.exp(score)
+
+        for j, task_idx in enumerate(valid_indices):
+            task = tasks[task_idx]
+            task.data[self.output_key] = label[j]
+            task.data[self.confidence_key] = confidence[j].item()
 
         return tasks

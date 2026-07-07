@@ -118,6 +118,59 @@ class TestNeMoSpeechWriterStage:
         stage.process(task2)
         assert (output_dir / "shard_b.jsonl.done").is_file()
 
+    def test_distinct_dirs_same_basename_do_not_collide(self, tmp_path: Path) -> None:
+        output_dir = tmp_path / "out"
+        stage = NeMoSpeechWriterStage(output_dir=str(output_dir), writer_concurrency=1)
+        stage.setup()
+        metadata = {"_shard_key": "shard_a", "_shard_total": 2}
+
+        for src in ("s3://bucket/set_a/utt_001.wav", "s3://bucket/set_b/utt_001.wav"):
+            task = AudioTask(
+                task_id=src,
+                dataset_name="test",
+                data={
+                    "waveform": np.zeros(16000, dtype=np.float32),
+                    "sample_rate": 16000,
+                    "duration_sec": 1.0,
+                    "original_file": src,
+                },
+                _metadata=metadata,
+            )
+            stage.process(task)
+
+        # Two distinct sources sharing a basename must produce two distinct opus files.
+        opus_files = list(output_dir.rglob("*.opus"))
+        assert len(opus_files) == 2
+        lines = (output_dir / "shard_a.jsonl").read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 2
+        paths = {json.loads(line)["audio_filepath"] for line in lines}
+        assert len(paths) == 2
+
+    def test_diar_segments_not_forwarded_into_segment_rows(self, tmp_path: Path) -> None:
+        output_dir = tmp_path / "out"
+        stage = NeMoSpeechWriterStage(output_dir=str(output_dir), writer_concurrency=1)
+        stage.setup()
+
+        task = AudioTask(
+            task_id="clip_0",
+            dataset_name="test",
+            data={
+                "waveform": np.zeros(16000, dtype=np.float32),
+                "sample_rate": 16000,
+                "duration_sec": 1.0,
+                "original_file": "s3://bucket/audio/clip_0.wav",
+                "num_speakers": 2,
+                # Recording-level diarization must NOT be copied into per-segment rows.
+                "diar_segments": [{"start": 0.0, "end": 1.0, "speaker": "speaker_0"}],
+            },
+            _metadata={"_shard_key": "shard_a", "_shard_total": 1},
+        )
+        stage.process(task)
+
+        entry = json.loads((output_dir / "shard_a.jsonl").read_text(encoding="utf-8").strip())
+        assert "diar_segments" not in entry
+        assert entry["num_speakers"] == 2
+
     def test_shard_done_tracks_unique_sources_across_segments(self, tmp_path: Path) -> None:
         output_dir = tmp_path / "out"
         stage = NeMoSpeechWriterStage(output_dir=str(output_dir), writer_concurrency=1)

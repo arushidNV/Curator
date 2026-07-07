@@ -61,30 +61,36 @@ _FORMAT_PRIORITY = {".opus": 0, ".wav": 1, ".flac": 2, ".ogg": 3, ".m4a": 4, ".m
 
 
 def _dedup_entries_by_stem(entries: list[dict], shard_key: str) -> list[dict]:
-    """Drop entries whose audio_filepath shares a basename stem (same recording,
-    different container), keeping the preferred format. Preserves input order.
+    """Drop entries that are the same recording in a different container, keeping
+    the preferred format. Preserves input order.
 
-    Prevents identical output filenames (keyed on stem + offset) from colliding
-    and avoids reprocessing the same audio multiple times.
+    The dedup key is the full path minus its extension (directory included), so only
+    genuine same-recording duplicates (e.g. ``d/vid1.opus`` vs ``d/vid1.wav``) collapse.
+    Distinct recordings that merely share a basename across directories
+    (``set_a/utt_001.wav`` vs ``set_b/utt_001.wav``) are kept — using the basename
+    alone would silently drop one of them.
+
+    Prevents identical output filenames from colliding and avoids reprocessing the
+    same audio multiple times.
     """
-    best: dict[str, tuple[int, int]] = {}  # stem -> (format_rank, index into entries)
+    best: dict[str, tuple[int, int]] = {}  # path-stem -> (format_rank, index into entries)
     order: list[str] = []
     for i, entry in enumerate(entries):
         path = entry.get("audio_filepath", "")
         if not path:
             continue
-        stem = os.path.splitext(os.path.basename(path))[0]
+        key = os.path.splitext(path)[0]  # directory-preserving stem
         rank = _FORMAT_PRIORITY.get(os.path.splitext(path)[1].lower(), 99)
-        if stem not in best:
-            best[stem] = (rank, i)
-            order.append(stem)
-        elif rank < best[stem][0]:
-            best[stem] = (rank, i)
+        if key not in best:
+            best[key] = (rank, i)
+            order.append(key)
+        elif rank < best[key][0]:
+            best[key] = (rank, i)
 
-    deduped = [entries[best[stem][1]] for stem in order]
+    deduped = [entries[best[key][1]] for key in order]
     dropped = len(entries) - len(deduped)
     if dropped:
-        logger.warning(f"[{shard_key}] deduplicated {dropped} duplicate source(s) sharing a stem (kept preferred format)")
+        logger.warning(f"[{shard_key}] deduplicated {dropped} duplicate source(s) (same recording, kept preferred format)")
     return deduped
 
 
@@ -373,16 +379,45 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         return CutSet(LazyNeMoIterator(manifest_path))
 
     @staticmethod
+    def _ffprobe_sample_rate(path: str) -> int | None:
+        """Return the source's native audio sample rate via ffprobe, or None if unknown."""
+        import shutil
+        import subprocess
+
+        ffprobe_bin = shutil.which("ffprobe")
+        if ffprobe_bin is None:
+            return None
+        cmd = [
+            ffprobe_bin, "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate", "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, check=False)  # noqa: S603
+        if proc.returncode != 0:
+            return None
+        try:
+            return int(proc.stdout.decode("utf-8", "replace").strip().splitlines()[0])
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
     def _load_audio_ffmpeg(audio_path: str, target_sr: int = _TARGET_SR) -> tuple[np.ndarray, int]:
         """Decode any format (m4a/mp3/mp4/...) to mono float32 via the ffmpeg CLI.
 
-        Streams bytes through smart_open (S3/AIS aware) into ffmpeg stdin and reads
-        raw f32le PCM from stdout. This is the most container-robust path: it needs
-        only the ffmpeg binary, not torchaudio's ffmpeg backend or torchcodec's
-        native libraries (both of which are frequently missing/broken in images).
+        Streams bytes through smart_open (S3/AIS aware) to a temp file, probes the
+        native sample rate with ffprobe, and decodes at that rate so the original
+        sample rate is preserved for manifest provenance (downstream MonoDownsample
+        handles the resample to the pipeline target). Only when probing fails do we
+        fall back to ``target_sr``. Using a temp file (not a pipe) keeps seekable
+        containers like mp4/m4a — whose moov atom may sit at the end — decodable.
+
+        This is the most container-robust path: it needs only the ffmpeg/ffprobe
+        binaries, not torchaudio's ffmpeg backend or torchcodec's native libraries
+        (both of which are frequently missing/broken in images).
         """
         import shutil
         import subprocess
+        import tempfile
 
         import smart_open
 
@@ -394,20 +429,27 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         with smart_open.open(audio_path, "rb") as f:
             raw = f.read()
 
-        cmd = [
-            ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-i", "pipe:0",
-            "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", str(target_sr),
-            "pipe:1",
-        ]
-        proc = subprocess.run(cmd, input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)  # noqa: S603
+        suffix = os.path.splitext(audio_path)[1] or ".bin"
+        with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+            tmp.write(raw)
+            tmp.flush()
+
+            out_sr = NeMoSpeechReaderStage._ffprobe_sample_rate(tmp.name) or target_sr
+            cmd = [
+                ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-i", tmp.name,
+                "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", str(out_sr),
+                "pipe:1",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, check=False)  # noqa: S603
+
         if proc.returncode != 0 or not proc.stdout:
             stderr_tail = proc.stderr.decode("utf-8", "replace").strip()[-500:]
             msg = f"ffmpeg decode failed (rc={proc.returncode}): {stderr_tail}"
             raise RuntimeError(msg)
 
         audio = np.frombuffer(proc.stdout, dtype=np.float32).copy()
-        return audio, target_sr
+        return audio, out_sr
 
     @staticmethod
     def _load_audio(audio_path: str, hint_sr: int | None = None, hint_duration: float = 0.0) -> tuple[np.ndarray, int, float]:
@@ -482,6 +524,32 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             duration = len(audio) / sr
         return audio, sr, duration
 
+    def _read_error_task(self, task: FileGroupTask) -> AudioTask:
+        """Build a read_error placeholder AudioTask for a source that could not be read.
+
+        Emitting a placeholder (rather than dropping the task) is what lets a shard
+        complete: the writer records the source as seen and writes an audit row, so
+        ``.jsonl.done`` is eventually written even when a file deterministically fails.
+        """
+        corpus = task.reader_config.get("corpus", "unknown")
+        shard_key = task.reader_config.get("shard_key", task.task_id)
+        language = task.reader_config.get("language", "")
+        entry = task.reader_config.get("entry") or {}
+        audio_path = task.data[0] if task.data else entry.get("audio_filepath", "")
+
+        entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
+        entry_data.update({
+            "read_error": True,
+            "corpus": corpus,
+            "audio_filepath": audio_path,
+            "original_file": audio_path,
+        })
+        if language and "source_lang" not in entry_data:
+            entry_data["source_lang"] = language
+        shard_total = task.reader_config.get("shard_total", 0)
+        metadata = {**task._metadata, "_shard_key": shard_key, "_shard_total": shard_total}
+        return AudioTask(task_id=task.task_id, dataset_name=corpus, data=entry_data, _metadata=metadata)
+
     def _process_single_entry(self, task: FileGroupTask) -> list[AudioTask]:
         """Load a single audio file and return one AudioTask."""
         corpus = task.reader_config.get("corpus", "unknown")
@@ -498,18 +566,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Unreadable audio, emitting read-error placeholder: {audio_path} ({exc})")
-            entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
-            entry_data.update({
-                "read_error": True,
-                "corpus": corpus,
-                "audio_filepath": audio_path,
-                "original_file": audio_path,
-            })
-            if language and "source_lang" not in entry_data:
-                entry_data["source_lang"] = language
-            shard_total = task.reader_config.get("shard_total", 0)
-            metadata = {**task._metadata, "_shard_key": shard_key, "_shard_total": shard_total}
-            return [AudioTask(task_id=task.task_id, dataset_name=corpus, data=entry_data, _metadata=metadata)]
+            return [self._read_error_task(task)]
 
         entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
         entry_data.update({
@@ -631,9 +688,14 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                     try:
                         results.extend(future.result())
                     except Exception as exc:  # noqa: BLE001
+                        # Emit a placeholder so the shard can still complete instead of
+                        # stalling forever on a deterministically-failing input.
                         logger.warning(
-                            f"Failed to load audio for task {src_task.task_id}: {exc}"
+                            f"Failed to load audio for task {src_task.task_id}, "
+                            f"emitting read-error placeholder: {exc}"
                         )
+                        if src_task.reader_config.get("entry") is not None:
+                            results.append(self._read_error_task(src_task))
 
         for task in other_tasks:
             results.extend(self._process_cutset(task))

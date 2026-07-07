@@ -112,6 +112,18 @@ def _append_manifest_line(manifest_path: str, line: str) -> None:
             f.flush()
 
 
+def _source_output_stem(original_file: str) -> str:
+    """Directory-preserving output stem for a source path.
+
+    Strips the URI scheme and leading slashes but keeps intermediate directories, so
+    distinct recordings that share a basename across directories (e.g.
+    ``set_a/utt_001`` vs ``set_b/utt_001``) map to distinct output files instead of
+    silently overwriting each other.
+    """
+    path = original_file.split("://", 1)[-1].lstrip("/")
+    return os.path.splitext(path)[0]
+
+
 def _write_opus_atomic(out_path: str, opus_bytes: bytes) -> None:
     """Write opus to a temp file, fsync, then rename so manifest never references a partial file."""
     parent = os.path.dirname(out_path)
@@ -292,8 +304,9 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
 
         waveform = self._ensure_numpy(waveform)
 
-        # Derive filename from the original audio basename.
-        base_name = os.path.splitext(os.path.basename(original_file))[0] if original_file else str(self._total_written)
+        # Derive filename from the original audio path, preserving directory structure
+        # so distinct recordings that share a basename across dirs don't collide.
+        base_name = _source_output_stem(original_file) if original_file else str(self._total_written)
         offset_ms = int(task.data.get("start_ms", 0))
         if offset_ms == 0:
             filename = f"{base_name}.opus"
@@ -339,7 +352,10 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         if "num_speakers" in task.data:
             manifest_entry["num_speakers"] = task.data["num_speakers"]
 
-        # Forward all remaining text/metadata fields from upstream stages
+        # Forward all remaining text/metadata fields from upstream stages.
+        # Recording-level / internal keys are excluded so per-segment rows stay small
+        # and accurate: e.g. diar_segments is the whole recording's diarization and
+        # must NOT be copied into every clip row (O(N*M) bloat + misleading metadata).
         _INTERNAL_KEYS = {
             self.waveform_key, self.sample_rate_key,
             "waveform", "sampling_rate", "sample_rate", "num_channels",
@@ -347,6 +363,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             "language", "language_confidence", "sed_events", "num_speakers",
             "duration", "duration_sec", "original_sampling_rate", "original_channels",
             "corpus", "shard_id",
+            "diar_segments", "session_name", "segment_num", "vad_empty", "read_error",
         }
         for key, value in task.data.items():
             if key not in _INTERNAL_KEYS and key not in manifest_entry:
