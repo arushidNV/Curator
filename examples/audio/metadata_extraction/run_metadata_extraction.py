@@ -84,6 +84,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--min_interval_ms", type=int, default=500,
         help="Minimum silence gap (ms) between speech segments — higher values merge more, reducing short segments.",
     )
+    vad.add_argument(
+        "--vad_backend",
+        choices=["torch", "onnx"],
+        default="onnx",
+        help="Silero runtime. ONNX Runtime is recommended for CPU preprocessing.",
+    )
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
     sed.add_argument("--sed_checkpoint", type=str, default=None, help="Path to PANNs CNN14 checkpoint. Enables SED.")
@@ -120,6 +126,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="GPUs per Sortformer actor (e.g. 1.0 for one full GPU). Overrides sortformer_gpu_memory_gb.",
     )
     diar.add_argument("--sortformer_batch_size", type=int, default=1, help="Sortformer inference batch size.")
+    diar.add_argument(
+        "--sortformer_stage_batch_size",
+        type=int,
+        default=8,
+        help="Number of recordings delivered to each Sortformer actor call.",
+    )
+    diar.add_argument(
+        "--sortformer_precision",
+        choices=["fp32", "fp16", "bf16"],
+        default="bf16",
+        help="Sortformer CUDA inference precision.",
+    )
+    diar.add_argument(
+        "--sortformer_compile",
+        action="store_true",
+        help="Compile Sortformer's forward pass with torch.compile (first batch has compilation overhead).",
+    )
     diar.add_argument("--rttm_out_dir", type=str, default=None, help="Directory to write RTTM files.")
 
     io = ap.add_argument_group("I/O")
@@ -169,7 +192,9 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 model_name=model_name,
                 model_path=model_path,
                 inference_batch_size=args.sortformer_batch_size,
-                batch_size=2,
+                batch_size=args.sortformer_stage_batch_size,
+                precision=args.sortformer_precision,
+                compile_model=args.sortformer_compile,
                 rttm_out_dir=args.rttm_out_dir,
                 resources=sortformer_resources,
             )
@@ -182,6 +207,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             min_duration_sec=args.min_duration_sec,
             max_duration_sec=args.max_duration_sec,
             speech_pad_ms=args.speech_pad_ms,
+            backend=args.vad_backend,
             nested=False,
         )
     )
@@ -260,9 +286,13 @@ def main() -> None:
             if args.sortformer_gpus is not None
             else f"gpu_memory_gb={args.sortformer_gpu_memory_gb}"
         )
-        logger.info(f"  Sortformer: {args.sortformer_model} ({sf_desc}, on full audio before VAD)")
+        logger.info(
+            f"  Sortformer: {args.sortformer_model} ({sf_desc}, precision={args.sortformer_precision}, "
+            f"compile={args.sortformer_compile}, on full audio before VAD)"
+        )
     logger.info(
-        f"  VAD: threshold={args.vad_threshold}, min_interval_ms={args.min_interval_ms}, "
+        f"  VAD: backend={args.vad_backend}, threshold={args.vad_threshold}, "
+        f"min_interval_ms={args.min_interval_ms}, "
         f"speech_pad_ms={args.speech_pad_ms}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s"
     )
     if args.sed_checkpoint:

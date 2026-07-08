@@ -25,6 +25,22 @@ from nemo_curator.tasks import AudioTask
 
 @pytest.mark.gpu
 class TestVADSegmentationStage:
+    @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.load_silero_vad")
+    def test_onnx_backend_loads_official_silero_model(self, mock_load_vad: MagicMock) -> None:
+        mock_model = MagicMock()
+        mock_load_vad.return_value = mock_model
+
+        stage = VADSegmentationStage(backend="onnx", onnx_opset_version=16)
+        stage.setup()
+
+        mock_load_vad.assert_called_once_with(onnx=True, opset_version=16)
+        assert stage._device == torch.device("cpu")
+        mock_model.to.assert_not_called()
+
+    def test_rejects_unknown_backend(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported Silero backend"):
+            VADSegmentationStage(backend="tensorrt")  # type: ignore[arg-type]
+
     @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.get_speech_timestamps")
     @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.load_silero_vad")
     def test_process_returns_segments(self, mock_load_vad: MagicMock, mock_get_ts: MagicMock) -> None:
@@ -277,9 +293,10 @@ class TestVADSegmentationStage:
         assert spec[RayStageSpecKeys.IS_FANOUT_STAGE] is True
 
     def test_pickling(self) -> None:
-        stage = VADSegmentationStage(min_duration_sec=2.0, threshold=0.6)
+        stage = VADSegmentationStage(min_duration_sec=2.0, threshold=0.6, backend="onnx")
         pickled = pickle.dumps(stage)
         restored = pickle.loads(pickled)  # noqa: S301
         assert restored.min_duration_sec == 2.0
         assert restored.threshold == 0.6
+        assert restored.backend == "onnx"
         assert restored._vad_model is None

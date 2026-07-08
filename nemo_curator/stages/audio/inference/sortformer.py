@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import os
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
+import torch
 from huggingface_hub import snapshot_download
 from loguru import logger
 from nemo.collections.asr.models import SortformerEncLabelModel
@@ -127,6 +129,14 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         spkcache_update_period: Speaker cache update period in frames.
         spkcache_len: Speaker cache size in frames.
         inference_batch_size: Batch size passed to diarize().
+        precision: Inference precision. ``"bf16"`` and ``"fp16"`` use CUDA
+            autocast while keeping model weights in their checkpoint format.
+        compile_model: Compile the model forward pass with ``torch.compile``.
+        compile_mode: Compilation mode passed to ``torch.compile``.
+        compile_dynamic: Enable dynamic-shape compilation for variable audio lengths.
+        avoid_cuda_cache_flush: Avoid NeMo's wrapper-level ``empty_cache`` call
+            after every inference batch. The caching allocator is retained.
+        allow_tf32: Allow TF32 matmuls for the FP32 CUDA path.
         name: Stage name.
     """
 
@@ -147,9 +157,22 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     spkcache_update_period: int = 300
     spkcache_len: int = 188
     inference_batch_size: int = 1
+    precision: Literal["fp32", "fp16", "bf16"] = "fp32"
+    compile_model: bool = False
+    compile_mode: str = "reduce-overhead"
+    compile_dynamic: bool = True
+    compile_fallback: bool = True
+    avoid_cuda_cache_flush: bool = True
+    allow_tf32: bool = True
     name: str = "Sortformer_inference"
     batch_size: int = 8
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0, gpu_memory_gb=8.0))
+
+    def __post_init__(self) -> None:
+        super().__init__()
+        if self.precision not in {"fp32", "fp16", "bf16"}:
+            msg = f"Unsupported Sortformer precision: {self.precision!r}"
+            raise ValueError(msg)
 
     def setup_on_node(
         self, _node_info: NodeInfo | None = None, _worker_metadata: WorkerMetadata | None = None
@@ -172,6 +195,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if self.diar_model is not None:
             self.diar_model.eval()
             self._configure_streaming()
+            self._configure_acceleration()
             return
 
         restore_path = self.model_path
@@ -192,6 +216,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
         self.diar_model.eval()
         self._configure_streaming()
+        self._configure_acceleration()
 
     def _configure_streaming(self) -> None:
         """Apply streaming configuration to the loaded model."""
@@ -201,6 +226,58 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         sm.fifo_len = self.fifo_len
         sm.spkcache_update_period = self.spkcache_update_period
         sm.spkcache_len = self.spkcache_len
+
+    def _configure_acceleration(self) -> None:
+        """Configure optional open-source PyTorch inference optimizations."""
+        if self.allow_tf32 and torch.cuda.is_available():
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+
+        if self.compile_model:
+            if not hasattr(torch, "compile"):
+                msg = "compile_model=True requires PyTorch with torch.compile support"
+                if self.compile_fallback:
+                    logger.warning(f"{msg}; continuing without compilation")
+                else:
+                    raise RuntimeError(msg)
+            else:
+                try:
+                    # NeMo's diarization mixin calls self.forward() for every batch. By
+                    # replacing only forward we retain its dataloader, streaming-state,
+                    # timestamp postprocessing, and public diarize() API.
+                    self.diar_model.forward = torch.compile(
+                        self.diar_model.forward,
+                        mode=self.compile_mode,
+                        dynamic=self.compile_dynamic,
+                    )
+                    logger.info(
+                        f"Sortformer forward compiled (mode={self.compile_mode}, dynamic={self.compile_dynamic})"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    if not self.compile_fallback:
+                        raise
+                    logger.warning(f"Sortformer torch.compile failed; using eager inference: {e}")  # noqa: TRY400
+
+        if self.avoid_cuda_cache_flush and hasattr(self.diar_model, "_diarize_forward"):
+            model = self.diar_model
+
+            def _diarize_forward_without_cache_flush(batch: Any) -> torch.Tensor:
+                # Mirrors NeMo's small wrapper without torch.cuda.empty_cache().
+                # The allocator can reuse these blocks on the next batch.
+                with torch.inference_mode():
+                    predictions = model.forward(audio_signal=batch[0], audio_signal_length=batch[1])
+                    return predictions.to("cpu")
+
+            model._diarize_forward = _diarize_forward_without_cache_flush
+
+    def _autocast_context(self) -> AbstractContextManager[Any]:
+        if self.precision == "fp32" or not torch.cuda.is_available():
+            return nullcontext()
+        dtype = torch.float16 if self.precision == "fp16" else torch.bfloat16
+        if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            logger.warning("BF16 is not supported by this GPU; using FP32 for Sortformer")
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=dtype)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -219,7 +296,8 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         kwargs: dict[str, Any] = {"audio": audio, "batch_size": self.inference_batch_size}
         if sample_rate is not None:
             kwargs["sample_rate"] = sample_rate
-        predicted_segments = self.diar_model.diarize(**kwargs)
+        with torch.inference_mode(), self._autocast_context():
+            predicted_segments = self.diar_model.diarize(**kwargs)
         return [_parse_sortformer_segments(segs) for segs in predicted_segments]
 
     def _apply_results(self, task: AudioTask, segments: list[dict[str, Any]]) -> None:

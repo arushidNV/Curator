@@ -15,7 +15,7 @@
 """
 VAD (Voice Activity Detection) segmentation stage.
 
-Segments audio into speech chunks using Silero VAD model,
+Segments audio into speech chunks using the Silero VAD Torch or ONNX model,
 filtering out silence and creating manageable segments for further processing.
 
 Supports both CPU and GPU execution. GPU is used when available and requested
@@ -39,7 +39,7 @@ Example:
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torchaudio
@@ -67,7 +67,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
     This stage takes a single AudioTask and segments it into speech chunks based on VAD,
     filtering out silence and creating manageable segments for further processing.
-    Uses Silero VAD model loaded via torch.hub.
+    Uses the model bundled by the official ``silero-vad`` package.
 
     Returns a list[AudioTask] with one AudioTask per detected speech segment (fan-out).
 
@@ -77,6 +77,9 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         max_duration_sec: Maximum segment duration in seconds.
         threshold: Voice activity detection threshold (0.0-1.0).
         speech_pad_ms: Padding in ms to add before/after speech segments.
+        backend: Silero inference backend. ``"torch"`` uses TorchScript and
+            ``"onnx"`` uses Silero's official ONNX Runtime wrapper.
+        onnx_opset_version: ONNX opset used by the bundled Silero model.
         waveform_key: Key to get waveform data.
         sample_rate_key: Key to get sample rate.
 
@@ -90,6 +93,8 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
     max_duration_sec: float = 60.0
     threshold: float = 0.5
     speech_pad_ms: int = 300
+    backend: Literal["torch", "onnx"] = "torch"
+    onnx_opset_version: int = 16
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
     nested: bool = False
@@ -100,6 +105,9 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
     def __post_init__(self):
         super().__init__()
+        if self.backend not in {"torch", "onnx"}:
+            msg = f"Unsupported Silero backend: {self.backend!r}. Expected 'torch' or 'onnx'."
+            raise ValueError(msg)
         self._vad_model = None
         self._device = None
 
@@ -140,9 +148,15 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="Sampling rate is a multiple of 16000")
-                model = load_silero_vad()
+                if self.backend == "onnx":
+                    model = load_silero_vad(onnx=True, opset_version=self.onnx_opset_version)
+                else:
+                    model = load_silero_vad()
 
-            use_gpu = self._resources.gpus > 0 and torch.cuda.is_available()
+            # Silero's official ONNX wrapper owns its ONNX Runtime session and
+            # is intentionally not moved with torch.Tensor.to(). This path is
+            # most useful for high-throughput CPU preprocessing.
+            use_gpu = self.backend == "torch" and self._resources.gpus > 0 and torch.cuda.is_available()
 
             if use_gpu:
                 self._device = torch.device("cuda")
@@ -150,7 +164,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
                 logger.info(f"Silero VAD model loaded on GPU: {self._device}")
             else:
                 self._device = torch.device("cpu")
-                logger.info("Silero VAD model loaded on CPU")
+                logger.info(f"Silero VAD model loaded on CPU ({self.backend} backend)")
 
             self._vad_model = model
         except Exception as e:
@@ -336,16 +350,17 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
                 vad_waveform = vad_waveform.to(device)
             vad_sample_rate = SILERO_TARGET_RATE
 
-        speech_timestamps = get_speech_timestamps(
-            vad_waveform,
-            self._vad_model,
-            sampling_rate=vad_sample_rate,
-            threshold=self.threshold,
-            min_speech_duration_ms=self.min_duration_sec * 1000,
-            max_speech_duration_s=self.max_duration_sec,
-            min_silence_duration_ms=self.min_interval_ms,
-            speech_pad_ms=self.speech_pad_ms,
-        )
+        with torch.inference_mode():
+            speech_timestamps = get_speech_timestamps(
+                vad_waveform,
+                self._vad_model,
+                sampling_rate=vad_sample_rate,
+                threshold=self.threshold,
+                min_speech_duration_ms=self.min_duration_sec * 1000,
+                max_speech_duration_s=self.max_duration_sec,
+                min_silence_duration_ms=self.min_interval_ms,
+                speech_pad_ms=self.speech_pad_ms,
+            )
 
         segments = []
         for ts in speech_timestamps:

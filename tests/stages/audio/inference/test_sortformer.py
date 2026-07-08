@@ -16,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from nemo_curator.stages.audio.inference.sortformer import (
     InferenceSortformerStage,
     _parse_sortformer_segments,
@@ -100,6 +102,49 @@ class TestWriteRttm:
         stage = InferenceSortformerStage(diar_model=mock_model)
         stage.setup()
         assert mock_model.sortformer_modules.chunk_len == 340
+
+    def test_rejects_unknown_precision(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported Sortformer precision"):
+            InferenceSortformerStage(precision="int8")  # type: ignore[arg-type]
+
+    @patch("nemo_curator.stages.audio.inference.sortformer.torch.cuda.is_available", return_value=False)
+    @patch("nemo_curator.stages.audio.inference.sortformer.torch.compile")
+    def test_optional_torch_compile_replaces_forward(
+        self, mock_compile: MagicMock, _mock_cuda: MagicMock
+    ) -> None:
+        mock_model = MagicMock()
+        mock_model.sortformer_modules = MagicMock()
+        original_forward = mock_model.forward
+        compiled_forward = MagicMock()
+        mock_compile.return_value = compiled_forward
+        stage = InferenceSortformerStage(diar_model=mock_model, compile_model=True)
+
+        stage.setup()
+
+        mock_compile.assert_called_once_with(original_forward, mode="reduce-overhead", dynamic=True)
+        assert mock_model.forward is compiled_forward
+
+    @patch("nemo_curator.stages.audio.inference.sortformer.torch.cuda.is_available", return_value=False)
+    def test_mixed_precision_falls_back_to_fp32_without_cuda(self, _mock_cuda: MagicMock) -> None:
+        stage = InferenceSortformerStage(precision="bf16")
+        with stage._autocast_context():
+            pass
+
+    def test_optimized_diarize_wrapper_keeps_cuda_cache_warm(self) -> None:
+        mock_model = MagicMock()
+        mock_model.sortformer_modules = MagicMock()
+        predictions = MagicMock()
+        cpu_predictions = MagicMock()
+        mock_model.forward.return_value = predictions
+        predictions.to.return_value = cpu_predictions
+        stage = InferenceSortformerStage(diar_model=mock_model, avoid_cuda_cache_flush=True)
+
+        stage.setup()
+        result = mock_model._diarize_forward(["audio", "length"])
+
+        mock_model.forward.assert_called_once_with(audio_signal="audio", audio_signal_length="length")
+        predictions.to.assert_called_once_with("cpu")
+        assert result is cpu_predictions
 
     def test_streaming_config_applied(self) -> None:
         mock_model = MagicMock()
