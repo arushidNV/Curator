@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -131,8 +131,8 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         inference_batch_size: Batch size passed to diarize().
         precision: Inference precision. ``"bf16"`` and ``"fp16"`` use CUDA
             autocast while keeping model weights in their checkpoint format.
-        avoid_cuda_cache_flush: Avoid NeMo's wrapper-level ``empty_cache`` call
-            after every inference batch. The caching allocator is retained.
+        avoid_cuda_cache_flush: Avoid NeMo's wrapper-level and internal
+            ``empty_cache`` calls during inference. The caching allocator is retained.
         allow_tf32: Allow TF32 matmuls for the FP32 CUDA path.
         name: Stage name.
     """
@@ -230,9 +230,9 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             model = self.diar_model
 
             def _diarize_forward_without_cache_flush(batch: Any) -> torch.Tensor:
-                # Mirrors NeMo's small wrapper without torch.cuda.empty_cache().
-                # The allocator can reuse these blocks on the next batch.
-                with torch.inference_mode():
+                # Keep allocator blocks reusable across both NeMo's forward path
+                # and this wrapper. Curator stage actors execute inference serially.
+                with torch.inference_mode(), self._cuda_cache_context():
                     predictions = model.forward(audio_signal=batch[0], audio_signal_length=batch[1])
                     return predictions.to("cpu")
 
@@ -246,6 +246,20 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             logger.warning("BF16 is not supported by this GPU; using FP32 for Sortformer")
             return nullcontext()
         return torch.autocast(device_type="cuda", dtype=dtype)
+
+    @contextmanager
+    def _cuda_cache_context(self) -> Any:
+        """Optionally suppress NeMo's unconditional per-forward cache flush."""
+        if not self.avoid_cuda_cache_flush or not torch.cuda.is_available():
+            yield
+            return
+
+        empty_cache = torch.cuda.empty_cache
+        torch.cuda.empty_cache = lambda: None
+        try:
+            yield
+        finally:
+            torch.cuda.empty_cache = empty_cache
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
