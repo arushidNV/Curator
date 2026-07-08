@@ -158,6 +158,8 @@ data/
 AGENTS.md
 alm_output/
 benchmark_results/
+.benchmark_cache/
+.benchmark_results/
 
 # Fern: generated API reference from `libraries` in docs.yml (`fern docs md generate`).
 # Regenerated in CI (fern-docs-ci.yml, publish-fern-docs.yml); do not commit.

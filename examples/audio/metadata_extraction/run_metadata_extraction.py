@@ -125,7 +125,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="GPUs per Sortformer actor (e.g. 1.0 for one full GPU). Overrides sortformer_gpu_memory_gb.",
     )
-    diar.add_argument("--sortformer_batch_size", type=int, default=1, help="Sortformer inference batch size.")
+    diar.add_argument("--sortformer_batch_size", type=int, default=8, help="Sortformer inference batch size.")
     diar.add_argument(
         "--sortformer_stage_batch_size",
         type=int,
@@ -135,13 +135,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     diar.add_argument(
         "--sortformer_precision",
         choices=["fp32", "fp16", "bf16"],
-        default="bf16",
+        default="fp32",
         help="Sortformer CUDA inference precision.",
     )
     diar.add_argument(
-        "--sortformer_compile",
+        "--sortformer_reuse_cuda_cache",
         action="store_true",
-        help="Compile Sortformer's forward pass with torch.compile (first batch has compilation overhead).",
+        help="Keep the CUDA caching allocator warm between Sortformer batches; recommended for batch size 8 or more.",
     )
     diar.add_argument("--rttm_out_dir", type=str, default=None, help="Directory to write RTTM files.")
 
@@ -194,7 +194,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 inference_batch_size=args.sortformer_batch_size,
                 batch_size=args.sortformer_stage_batch_size,
                 precision=args.sortformer_precision,
-                compile_model=args.sortformer_compile,
+                avoid_cuda_cache_flush=args.sortformer_reuse_cuda_cache,
                 rttm_out_dir=args.rttm_out_dir,
                 resources=sortformer_resources,
             )
@@ -288,7 +288,7 @@ def main() -> None:
         )
         logger.info(
             f"  Sortformer: {args.sortformer_model} ({sf_desc}, precision={args.sortformer_precision}, "
-            f"compile={args.sortformer_compile}, on full audio before VAD)"
+            f"reuse_cuda_cache={args.sortformer_reuse_cuda_cache}, on full audio before VAD)"
         )
     logger.info(
         f"  VAD: backend={args.vad_backend}, threshold={args.vad_threshold}, "

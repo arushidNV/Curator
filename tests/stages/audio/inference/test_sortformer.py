@@ -108,23 +108,6 @@ class TestWriteRttm:
             InferenceSortformerStage(precision="int8")  # type: ignore[arg-type]
 
     @patch("nemo_curator.stages.audio.inference.sortformer.torch.cuda.is_available", return_value=False)
-    @patch("nemo_curator.stages.audio.inference.sortformer.torch.compile")
-    def test_optional_torch_compile_replaces_forward(
-        self, mock_compile: MagicMock, _mock_cuda: MagicMock
-    ) -> None:
-        mock_model = MagicMock()
-        mock_model.sortformer_modules = MagicMock()
-        original_forward = mock_model.forward
-        compiled_forward = MagicMock()
-        mock_compile.return_value = compiled_forward
-        stage = InferenceSortformerStage(diar_model=mock_model, compile_model=True)
-
-        stage.setup()
-
-        mock_compile.assert_called_once_with(original_forward, mode="reduce-overhead", dynamic=True)
-        assert mock_model.forward is compiled_forward
-
-    @patch("nemo_curator.stages.audio.inference.sortformer.torch.cuda.is_available", return_value=False)
     def test_mixed_precision_falls_back_to_fp32_without_cuda(self, _mock_cuda: MagicMock) -> None:
         stage = InferenceSortformerStage(precision="bf16")
         with stage._autocast_context():

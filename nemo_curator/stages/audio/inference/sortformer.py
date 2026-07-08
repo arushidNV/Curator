@@ -131,9 +131,6 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         inference_batch_size: Batch size passed to diarize().
         precision: Inference precision. ``"bf16"`` and ``"fp16"`` use CUDA
             autocast while keeping model weights in their checkpoint format.
-        compile_model: Compile the model forward pass with ``torch.compile``.
-        compile_mode: Compilation mode passed to ``torch.compile``.
-        compile_dynamic: Enable dynamic-shape compilation for variable audio lengths.
         avoid_cuda_cache_flush: Avoid NeMo's wrapper-level ``empty_cache`` call
             after every inference batch. The caching allocator is retained.
         allow_tf32: Allow TF32 matmuls for the FP32 CUDA path.
@@ -158,11 +155,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     spkcache_len: int = 188
     inference_batch_size: int = 1
     precision: Literal["fp32", "fp16", "bf16"] = "fp32"
-    compile_model: bool = False
-    compile_mode: str = "reduce-overhead"
-    compile_dynamic: bool = True
-    compile_fallback: bool = True
-    avoid_cuda_cache_flush: bool = True
+    avoid_cuda_cache_flush: bool = False
     allow_tf32: bool = True
     name: str = "Sortformer_inference"
     batch_size: int = 8
@@ -232,31 +225,6 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if self.allow_tf32 and torch.cuda.is_available():
             torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
-
-        if self.compile_model:
-            if not hasattr(torch, "compile"):
-                msg = "compile_model=True requires PyTorch with torch.compile support"
-                if self.compile_fallback:
-                    logger.warning(f"{msg}; continuing without compilation")
-                else:
-                    raise RuntimeError(msg)
-            else:
-                try:
-                    # NeMo's diarization mixin calls self.forward() for every batch. By
-                    # replacing only forward we retain its dataloader, streaming-state,
-                    # timestamp postprocessing, and public diarize() API.
-                    self.diar_model.forward = torch.compile(
-                        self.diar_model.forward,
-                        mode=self.compile_mode,
-                        dynamic=self.compile_dynamic,
-                    )
-                    logger.info(
-                        f"Sortformer forward compiled (mode={self.compile_mode}, dynamic={self.compile_dynamic})"
-                    )
-                except Exception as e:  # noqa: BLE001
-                    if not self.compile_fallback:
-                        raise
-                    logger.warning(f"Sortformer torch.compile failed; using eager inference: {e}")  # noqa: TRY400
 
         if self.avoid_cuda_cache_flush and hasattr(self.diar_model, "_diarize_forward"):
             model = self.diar_model
