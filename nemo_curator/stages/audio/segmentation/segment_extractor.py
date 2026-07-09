@@ -56,7 +56,10 @@ class SegmentExtractorStage(ProcessingStage[AudioTask, AudioTask]):
         return ["data"], [self.filepath_key, "segment_start", "segment_end", "segment_idx"]
 
     def ray_stage_spec(self) -> dict[str, Any]:
-        from nemo_curator.backends.experimental.ray_data.utils import RayStageSpecKeys
+        try:
+            from nemo_curator.backends.utils import RayStageSpecKeys
+        except ImportError:
+            from nemo_curator.backends.experimental.ray_data.utils import RayStageSpecKeys
 
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 

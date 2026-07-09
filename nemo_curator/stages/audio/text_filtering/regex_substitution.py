@@ -78,7 +78,7 @@ class RegexSubstitutionStage(ProcessingStage[AudioTask, AudioTask]):
             text = re.sub(rule["pattern"], rule["repl"], text, count=rule.get("count", 0))
         text = re.sub(r"\s+", " ", text).strip()
         task.data[self.output_text_key] = text
-        if not text and not task.data[self.skip_me_key]:
+        if not text and not task.data.get(self.skip_me_key, ""):
             task.data[self.skip_me_key] = "Empty after regex cleaning"
         return task
 

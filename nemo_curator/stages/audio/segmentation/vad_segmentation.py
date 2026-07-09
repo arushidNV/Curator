@@ -47,7 +47,10 @@ from loguru import logger
 from silero_vad import get_speech_timestamps, load_silero_vad
 
 from nemo_curator.backends.base import WorkerMetadata
-from nemo_curator.backends.experimental.utils import RayStageSpecKeys
+try:
+    from nemo_curator.backends.utils import RayStageSpecKeys
+except ImportError:
+    from nemo_curator.backends.experimental.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.common import ensure_waveform_2d, load_audio_file
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
@@ -225,6 +228,16 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
         return ensure_waveform_2d(waveform), sample_rate
 
+    def _as_read_error(self, task: AudioTask) -> AudioTask:
+        """Turn a task into a read_error placeholder and drop its waveform.
+
+        Read errors flow straight to the writer for the manifest audit trail; dropping
+        the waveform keeps downstream GPU stages (SED/LangID) from touching them.
+        """
+        task.data["read_error"] = True
+        task.data.pop(self.waveform_key, None)
+        return task
+
     def process(self, task: AudioTask) -> AudioTask | list[AudioTask]:
         """
         Process a single AudioTask.
@@ -239,6 +252,11 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
             msg = "VAD model failed to initialize. Cannot process audio."
             raise RuntimeError(msg)
 
+        # Read failures from the reader flow straight to the writer (manifest audit trail).
+        # Drop any residual waveform so downstream GPU stages skip them.
+        if task.data.get("read_error"):
+            return [self._as_read_error(task)]
+
         audio_result = self._resolve_audio(task.data)
         if audio_result is None:
             return []
@@ -251,7 +269,14 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
                 if self.nested:
                     task.data["segments"] = []
                     return task
-                return []
+                task.data["vad_empty"] = True
+                if "duration_sec" not in task.data:
+                    n_samples = waveform.shape[-1] if waveform.dim() > 0 else 0
+                    task.data["duration_sec"] = n_samples / sample_rate if sample_rate else 0.0
+                # Drop the full-file waveform: nothing to segment, and forwarding an
+                # unbounded-length array into SED/LangID OOMs the shared GPU.
+                task.data.pop(self.waveform_key, None)
+                return [task]
 
             original_file = task.data.get("audio_filepath", "unknown")
             file_name = os.path.basename(original_file) if original_file != "unknown" else task.task_id
@@ -281,8 +306,11 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
                 output_tasks.append(seg_task)
 
         except Exception as e:  # noqa: BLE001
+            # A crash here (e.g. a corrupt/degenerate waveform) must not silently drop
+            # the recording — that would leave its shard one input short forever and
+            # ``.jsonl.done`` would never be written. Forward a read_error placeholder.
             logger.exception(f"Error during VAD segmentation: {e}")
-            return []
+            return [self._as_read_error(task)]
         else:
             return output_tasks
 

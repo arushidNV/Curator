@@ -100,7 +100,67 @@ class TestVADSegmentationStage:
         result = stage.process(task)
 
         assert isinstance(result, list)
-        assert len(result) == 0
+        assert len(result) == 1
+        assert result[0].data.get("vad_empty") is True
+        # Full-file waveform must be dropped so downstream GPU stages skip it (avoids OOM).
+        assert result[0].data.get("waveform") is None
+        assert result[0].data.get("duration_sec") == pytest.approx(5.0, abs=0.1)
+
+    @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.get_speech_timestamps")
+    @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.load_silero_vad")
+    def test_read_error_passthrough(self, mock_load_vad: MagicMock, mock_get_ts: MagicMock) -> None:
+        mock_load_vad.return_value = MagicMock()
+
+        task = AudioTask(
+            data={
+                "read_error": True,
+                "audio_filepath": "s3://bucket/broken.m4a",
+                "original_file": "s3://bucket/broken.m4a",
+            },
+            task_id="test",
+            dataset_name="test",
+        )
+
+        stage = VADSegmentationStage()
+        stage.setup()
+        result = stage.process(task)
+
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0].data.get("read_error") is True
+        assert result[0].data.get("waveform") is None
+        mock_get_ts.assert_not_called()
+
+    @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.get_speech_timestamps")
+    @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.load_silero_vad")
+    def test_vad_exception_emits_read_error_placeholder(
+        self, mock_load_vad: MagicMock, mock_get_ts: MagicMock
+    ) -> None:
+        mock_load_vad.return_value = MagicMock()
+        # A crash during segmentation must not silently drop the recording, or its
+        # shard would never reach shard_total and .jsonl.done would never be written.
+        mock_get_ts.side_effect = RuntimeError("boom")
+
+        waveform = torch.randn(1, 48000 * 5)
+        task = AudioTask(
+            data={
+                "waveform": waveform,
+                "sample_rate": 48000,
+                "audio_filepath": "s3://bucket/x.wav",
+                "original_file": "s3://bucket/x.wav",
+            },
+            task_id="test",
+            dataset_name="test",
+        )
+
+        stage = VADSegmentationStage(min_duration_sec=1.0)
+        stage.setup()
+        result = stage.process(task)
+
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0].data.get("read_error") is True
+        assert result[0].data.get("waveform") is None
 
     @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.get_speech_timestamps")
     @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.load_silero_vad")
