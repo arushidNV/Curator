@@ -1,0 +1,33 @@
+# TensorRT-LLM ASR runtime dependencies for the (Indic) Canary stage
+# (nemo_curator.stages.audio.inference.indic_canary).
+#
+# These are intentionally NOT part of the `audio_cuda12` extra / uv.lock:
+# tensorrt_llm pins transformers<4.52, wheel<=0.45.1, pillow==10.3.0 and torch~2.7,
+# which are mutually exclusive with Curator's stack (nemo_toolkit needs
+# transformers>=4.57, torch 2.9.1+cu128). Co-resolving them is impossible, so this
+# runtime is installed as a separate step on top of an existing audio venv.
+#
+# Install (into the Curator venv, after `uv sync --extra audio_cuda12`):
+#   uv pip install -r requirements-trt-llm.txt
+# or:
+#   pip install -r requirements-trt-llm.txt
+#
+# Linux x86_64 only -- no macOS / aarch64 wheels are published.
+# Pinned to the CUDA-12 0.20.x line to match the validated Canary engine
+# (TensorRT 10.9 serialization); the 1.x line targets CUDA 13.
+
+--extra-index-url https://pypi.nvidia.com
+datasets
+kaldialign
+lhotse
+onnx_graphsurgeon
+onnxscript
+
+# --- Offline engine-build toolchain (only needed to convert a .nemo -> TRT-LLM
+#     engine via convert_checkpoint.py / conformer_onnx_trt.py / trtllm-build;
+#     not needed to run inference against a prebuilt engine) ---
+safetensors
+
+# --- Inference runtime (required by the Curator stage) ---
+tensorrt_llm>=0.20.0,<0.21.0
+torchtune
