@@ -47,14 +47,15 @@ from loguru import logger
 from silero_vad import get_speech_timestamps, load_silero_vad
 
 from nemo_curator.backends.base import WorkerMetadata
-try:
-    from nemo_curator.backends.utils import RayStageSpecKeys
-except ImportError:
-    from nemo_curator.backends.experimental.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.common import ensure_waveform_2d, load_audio_file
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
+
+try:
+    from nemo_curator.backends.utils import RayStageSpecKeys
+except ImportError:
+    from nemo_curator.backends.experimental.utils import RayStageSpecKeys
 
 SILERO_SUPPORTED_RATES = {8000, 16000, 32000, 48000, 64000, 96000}
 SILERO_TARGET_RATE = 16000
@@ -77,8 +78,12 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         max_duration_sec: Maximum segment duration in seconds.
         threshold: Voice activity detection threshold (0.0-1.0).
         speech_pad_ms: Padding in ms to add before/after speech segments.
-        backend: Silero inference backend. ``"torch"`` uses TorchScript and
-            ``"onnx"`` uses Silero's official ONNX Runtime wrapper.
+        backend: Silero inference backend. ``"torch"`` uses TorchScript,
+            ``"onnx"`` uses Silero's official ONNX Runtime wrapper, and
+            ``"tensorrt"`` uses a persistent TensorRT engine on CUDA.
+        tensorrt_engine_path: Serialized Silero TensorRT engine. Required when
+            ``backend="tensorrt"``.
+        tensorrt_sample_rate: Fixed audio sample rate used to build the engine.
         onnx_opset_version: ONNX opset used by the bundled Silero model.
         waveform_key: Key to get waveform data.
         sample_rate_key: Key to get sample rate.
@@ -93,8 +98,10 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
     max_duration_sec: float = 60.0
     threshold: float = 0.5
     speech_pad_ms: int = 300
-    backend: Literal["torch", "onnx"] = "torch"
+    backend: Literal["torch", "onnx", "tensorrt"] = "torch"
     onnx_opset_version: int = 16
+    tensorrt_engine_path: str | None = None
+    tensorrt_sample_rate: int = SILERO_TARGET_RATE
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
     nested: bool = False
@@ -105,8 +112,11 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
     def __post_init__(self):
         super().__init__()
-        if self.backend not in {"torch", "onnx"}:
-            msg = f"Unsupported Silero backend: {self.backend!r}. Expected 'torch' or 'onnx'."
+        if self.backend not in {"torch", "onnx", "tensorrt"}:
+            msg = f"Unsupported Silero backend: {self.backend!r}. Expected 'torch', 'onnx', or 'tensorrt'."
+            raise ValueError(msg)
+        if self.backend == "tensorrt" and not self.tensorrt_engine_path:
+            msg = "tensorrt_engine_path is required for the Silero TensorRT backend"
             raise ValueError(msg)
         self._vad_model = None
         self._device = None
@@ -127,6 +137,8 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
     def teardown(self) -> None:
         if self._vad_model is not None:
+            if hasattr(self._vad_model, "close"):
+                self._vad_model.close()
             del self._vad_model
             self._vad_model = None
             if torch.cuda.is_available():
@@ -145,10 +157,20 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         if self._vad_model is not None:
             return
         self._check_gpu_availability(self._resources.gpus)
+        if self.backend == "tensorrt" and self._resources.gpus <= 0:
+            msg = "The Silero TensorRT backend requires resources=Resources(gpus=X) with X > 0"
+            raise RuntimeError(msg)
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="Sampling rate is a multiple of 16000")
-                if self.backend == "onnx":
+                if self.backend == "tensorrt":
+                    from nemo_curator.stages.audio.segmentation.silero_tensorrt import TensorRTSileroModel
+
+                    model = TensorRTSileroModel(
+                        self.tensorrt_engine_path,
+                        sample_rate=self.tensorrt_sample_rate,
+                    )
+                elif self.backend == "onnx":
                     model = load_silero_vad(onnx=True, opset_version=self.onnx_opset_version)
                 else:
                     model = load_silero_vad()
@@ -156,9 +178,12 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
             # Silero's official ONNX wrapper owns its ONNX Runtime session and
             # is intentionally not moved with torch.Tensor.to(). This path is
             # most useful for high-throughput CPU preprocessing.
-            use_gpu = self.backend == "torch" and self._resources.gpus > 0 and torch.cuda.is_available()
+            use_gpu = self.backend in {"torch", "tensorrt"} and self._resources.gpus > 0 and torch.cuda.is_available()
 
-            if use_gpu:
+            if self.backend == "tensorrt":
+                self._device = torch.device("cuda")
+                logger.info(f"Silero VAD TensorRT engine loaded on GPU: {self._device}")
+            elif use_gpu:
                 self._device = torch.device("cuda")
                 model = model.to(self._device)
                 logger.info(f"Silero VAD model loaded on GPU: {self._device}")
@@ -252,7 +277,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         task.data.pop(self.waveform_key, None)
         return task
 
-    def process(self, task: AudioTask) -> AudioTask | list[AudioTask]:
+    def process(self, task: AudioTask) -> AudioTask | list[AudioTask]:  # noqa: C901, PLR0911
         """
         Process a single AudioTask.
 
@@ -338,17 +363,21 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
         vad_sample_rate = sample_rate
         vad_waveform = waveform
-        if sample_rate not in SILERO_SUPPORTED_RATES:
-            logger.debug(f"Resampling audio from {sample_rate}Hz to {SILERO_TARGET_RATE}Hz for VAD")
+        target_rate = self.tensorrt_sample_rate if self.backend == "tensorrt" else SILERO_TARGET_RATE
+        needs_resample = (
+            sample_rate != target_rate if self.backend == "tensorrt" else sample_rate not in SILERO_SUPPORTED_RATES
+        )
+        if needs_resample:
+            logger.debug(f"Resampling audio from {sample_rate}Hz to {target_rate}Hz for VAD")
             device = waveform.device
             waveform_cpu = waveform.cpu() if waveform.device.type != "cpu" else waveform
             if waveform_cpu.dim() == 1:
                 waveform_cpu = waveform_cpu.unsqueeze(0)
-            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=SILERO_TARGET_RATE)
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_rate)
             vad_waveform = resampler(waveform_cpu).squeeze(0)
             if device.type != "cpu":
                 vad_waveform = vad_waveform.to(device)
-            vad_sample_rate = SILERO_TARGET_RATE
+            vad_sample_rate = target_rate
 
         with torch.inference_mode():
             speech_timestamps = get_speech_timestamps(

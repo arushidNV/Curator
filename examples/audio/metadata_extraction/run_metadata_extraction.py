@@ -65,30 +65,52 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     vad = ap.add_argument_group("VAD (Silero)")
     vad.add_argument(
-        "--vad_threshold", type=float, default=0.5,
+        "--vad_threshold",
+        type=float,
+        default=0.5,
         help="VAD confidence threshold (0.5 is Silero's recommended default).",
     )
     vad.add_argument(
-        "--min_duration_sec", type=float, default=0.5,
+        "--min_duration_sec",
+        type=float,
+        default=0.5,
         help="Minimum segment duration (seconds). Segments shorter than this are discarded.",
     )
     vad.add_argument(
-        "--max_duration_sec", type=float, default=40.0,
+        "--max_duration_sec",
+        type=float,
+        default=40.0,
         help="Maximum segment duration (seconds). Longer speech regions are split.",
     )
     vad.add_argument(
-        "--speech_pad_ms", type=int, default=100,
+        "--speech_pad_ms",
+        type=int,
+        default=100,
         help="Silero VAD internal padding (ms) — extends detected speech boundaries to avoid cutting onsets/offsets.",
     )
     vad.add_argument(
-        "--min_interval_ms", type=int, default=500,
+        "--min_interval_ms",
+        type=int,
+        default=500,
         help="Minimum silence gap (ms) between speech segments — higher values merge more, reducing short segments.",
     )
     vad.add_argument(
         "--vad_backend",
-        choices=["torch", "onnx"],
+        choices=["torch", "onnx", "tensorrt"],
         default="onnx",
-        help="Silero runtime. ONNX Runtime is recommended for CPU preprocessing.",
+        help="Silero runtime. ONNX Runtime is recommended on CPU; TensorRT requires a GPU engine.",
+    )
+    vad.add_argument(
+        "--vad_tensorrt_engine",
+        type=str,
+        default=None,
+        help="Silero TensorRT .plan/.engine path; required for --vad_backend=tensorrt.",
+    )
+    vad.add_argument(
+        "--vad_gpus",
+        type=float,
+        default=0.0,
+        help="GPUs per VAD actor. Set above zero for the TensorRT backend.",
     )
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
@@ -97,14 +119,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     sed.add_argument("--sed_batch_size", type=int, default=32, help="SED GPU batch size.")
     sed.add_argument("--sed_gpu_memory_gb", type=float, default=4.0, help="GPU memory for SED stage.")
     sed.add_argument(
-        "--sed_emit_superclasses", type=lambda x: x.lower() not in ("false", "0", "no"),
+        "--sed_emit_superclasses",
+        type=lambda x: x.lower() not in ("false", "0", "no"),
         default=True,
         help="Emit superclass labels only — speech/music/noise (default: True). Set to False for all 527 AudioSet classes.",
     )
 
     lid = ap.add_argument_group("Language ID")
     lid.add_argument(
-        "--langid_backend", type=str, default="speechbrain", choices=["ambernet", "speechbrain"],
+        "--langid_backend",
+        type=str,
+        default="speechbrain",
+        choices=["ambernet", "speechbrain"],
         help="LangID backend: 'speechbrain' (VoxLingua107, 107 languages, default) or 'ambernet' (NeMo, 20 languages).",
     )
     lid.add_argument("--langid_model", type=str, default=None, help="Model name/path (default depends on backend).")
@@ -127,6 +153,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     diar.add_argument("--sortformer_batch_size", type=int, default=8, help="Sortformer inference batch size.")
     diar.add_argument(
+        "--sortformer_backend",
+        choices=["pytorch", "tensorrt"],
+        default="pytorch",
+        help="Sortformer neural-network runtime. TensorRT remains in-process and requires an exported engine.",
+    )
+    diar.add_argument(
+        "--sortformer_tensorrt_engine",
+        type=str,
+        default=None,
+        help=(
+            "Sortformer streaming .plan/.engine path; required for --sortformer_backend=tensorrt. "
+            "The builder-generated <engine>.json sidecar must be present."
+        ),
+    )
+    diar.add_argument(
         "--sortformer_stage_batch_size",
         type=int,
         default=8,
@@ -147,15 +188,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     io = ap.add_argument_group("I/O")
     io.add_argument(
-        "--max_io_threads", type=int, default=8,
+        "--max_io_threads",
+        type=int,
+        default=8,
         help="Max concurrent threads per reader batch for loading audio from S3/object storage (default: 8).",
     )
     io.add_argument(
-        "--read_concurrency", type=int, default=2,
+        "--read_concurrency",
+        type=int,
+        default=2,
         help="Max parallel Ray reader tasks (default: 2). Increase to overlap more S3/AIS reads.",
     )
     io.add_argument(
-        "--writer_concurrency", type=int, default=1,
+        "--writer_concurrency",
+        type=int,
+        default=1,
         help="Parallel Ray writer actors for opus + manifest output (default: 1).",
     )
 
@@ -193,6 +240,8 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 model_path=model_path,
                 inference_batch_size=args.sortformer_batch_size,
                 batch_size=args.sortformer_stage_batch_size,
+                backend=args.sortformer_backend,
+                tensorrt_engine_path=args.sortformer_tensorrt_engine,
                 precision=args.sortformer_precision,
                 avoid_cuda_cache_flush=args.sortformer_reuse_cuda_cache,
                 rttm_out_dir=args.rttm_out_dir,
@@ -208,7 +257,9 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             max_duration_sec=args.max_duration_sec,
             speech_pad_ms=args.speech_pad_ms,
             backend=args.vad_backend,
+            tensorrt_engine_path=args.vad_tensorrt_engine,
             nested=False,
+            resources=Resources(cpus=1.0, gpus=args.vad_gpus),
         )
     )
     stages.append(SqueezeWaveformStage())
@@ -287,11 +338,12 @@ def main() -> None:
             else f"gpu_memory_gb={args.sortformer_gpu_memory_gb}"
         )
         logger.info(
-            f"  Sortformer: {args.sortformer_model} ({sf_desc}, precision={args.sortformer_precision}, "
+            f"  Sortformer: {args.sortformer_model} ({sf_desc}, backend={args.sortformer_backend}, "
+            f"precision={args.sortformer_precision}, "
             f"reuse_cuda_cache={args.sortformer_reuse_cuda_cache}, on full audio before VAD)"
         )
     logger.info(
-        f"  VAD: backend={args.vad_backend}, threshold={args.vad_threshold}, "
+        f"  VAD: backend={args.vad_backend}, gpus={args.vad_gpus}, threshold={args.vad_threshold}, "
         f"min_interval_ms={args.min_interval_ms}, "
         f"speech_pad_ms={args.speech_pad_ms}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s"
     )

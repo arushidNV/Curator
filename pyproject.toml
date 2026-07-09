@@ -117,6 +117,14 @@ audio_cuda12 = [
     "torchcodec",
 ]
 
+# Native in-process TensorRT backends for Sortformer and Silero. Keep this
+# version aligned with the CUDA 12.8 runtime in the 26.02 Curator container;
+# serialized engines are rebuilt on the target GPU rather than redistributed.
+audio_tensorrt = [
+    "nemo_curator[audio_cuda12]",
+    "tensorrt==10.9.0.34; platform_machine == 'x86_64' and platform_system == 'Linux'",
+]
+
 image_cpu = [
     "Pillow",
     "torchvision"

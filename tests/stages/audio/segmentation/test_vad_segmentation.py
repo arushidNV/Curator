@@ -20,6 +20,7 @@ import torch
 
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.segmentation.vad_segmentation import VADSegmentationStage
+from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
 
 
@@ -39,7 +40,33 @@ class TestVADSegmentationStage:
 
     def test_rejects_unknown_backend(self) -> None:
         with pytest.raises(ValueError, match="Unsupported Silero backend"):
-            VADSegmentationStage(backend="tensorrt")  # type: ignore[arg-type]
+            VADSegmentationStage(backend="openvino")  # type: ignore[arg-type]
+
+    def test_tensorrt_backend_requires_engine_path(self) -> None:
+        with pytest.raises(ValueError, match="tensorrt_engine_path is required"):
+            VADSegmentationStage(backend="tensorrt")
+
+    @patch("nemo_curator.stages.audio.segmentation.silero_tensorrt.TensorRTSileroModel")
+    @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.torch.cuda.is_available", return_value=True)
+    def test_tensorrt_backend_loads_persistent_gpu_model(
+        self,
+        mock_cuda: MagicMock,
+        mock_trt_model: MagicMock,
+    ) -> None:
+        assert mock_cuda.return_value is True
+        model = MagicMock()
+        mock_trt_model.return_value = model
+        stage = VADSegmentationStage(
+            backend="tensorrt",
+            tensorrt_engine_path="/models/silero.plan",
+            resources=Resources(cpus=1, gpus=1),
+        )
+
+        stage.setup()
+
+        mock_trt_model.assert_called_once_with("/models/silero.plan", sample_rate=16000)
+        assert stage._vad_model is model
+        assert stage._device == torch.device("cuda")
 
     @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.get_speech_timestamps")
     @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.load_silero_vad")

@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from nemo_curator.stages.audio.inference.sortformer import (
@@ -107,8 +108,38 @@ class TestWriteRttm:
         with pytest.raises(ValueError, match="Unsupported Sortformer precision"):
             InferenceSortformerStage(precision="int8")  # type: ignore[arg-type]
 
+    def test_tensorrt_backend_requires_engine_path(self) -> None:
+        with pytest.raises(ValueError, match="tensorrt_engine_path is required"):
+            InferenceSortformerStage(backend="tensorrt")
+
+    @patch("nemo_curator.stages.audio.inference.sortformer_tensorrt.TensorRTSortformerRunner")
+    def test_tensorrt_backend_replaces_only_streaming_forward(self, mock_runner_cls: MagicMock) -> None:
+        mock_model = MagicMock()
+        mock_model.sortformer_modules = MagicMock()
+        runner = mock_runner_cls.return_value
+        stage = InferenceSortformerStage(
+            diar_model=mock_model,
+            model_path="/models/sortformer.nemo",
+            backend="tensorrt",
+            tensorrt_engine_path="/models/sortformer.plan",
+        )
+
+        stage.setup()
+
+        mock_runner_cls.assert_called_once_with(
+            mock_model,
+            "/models/sortformer.plan",
+            model_path="/models/sortformer.nemo",
+            metadata_path=None,
+            validate_metadata=True,
+        )
+        assert mock_model.forward_streaming == runner.forward_streaming
+        stage.teardown()
+        runner.close.assert_called_once_with()
+
     @patch("nemo_curator.stages.audio.inference.sortformer.torch.cuda.is_available", return_value=False)
-    def test_mixed_precision_falls_back_to_fp32_without_cuda(self, _mock_cuda: MagicMock) -> None:
+    def test_mixed_precision_falls_back_to_fp32_without_cuda(self, mock_cuda: MagicMock) -> None:
+        assert mock_cuda.return_value is False
         stage = InferenceSortformerStage(precision="bf16")
         with stage._autocast_context():
             pass
@@ -175,8 +206,66 @@ class TestWriteRttm:
         assert result.task_id.endswith("_sortformer")
         mock_model.diarize.assert_called_once_with(
             audio=["/test/audio1.wav"],
-            batch_size=1,
+            batch_size=8,
         )
+
+    def test_process_batch_buckets_by_duration_and_restores_task_order(self) -> None:
+        mock_model = MagicMock()
+        mock_model.sortformer_modules = MagicMock()
+
+        def fake_diarize(*, audio, batch_size, sample_rate):  # noqa: ANN001, ANN202
+            assert batch_size == 2
+            assert sample_rate == 16000
+            return [[f"0 1 samples_{waveform.shape[-1]}"] for waveform in audio]
+
+        mock_model.diarize.side_effect = fake_diarize
+        stage = InferenceSortformerStage(diar_model=mock_model, inference_batch_size=2)
+        tasks = [
+            AudioTask(data={"waveform": np.zeros(size), "sample_rate": 16000}, task_id=f"task_{size}")
+            for size in (32000, 8000, 16000)
+        ]
+
+        result = stage.process_batch(tasks)
+
+        assert result == tasks
+        called_audio = mock_model.diarize.call_args.kwargs["audio"]
+        assert [waveform.shape[-1] for waveform in called_audio] == [8000, 16000, 32000]
+        assert [task.data["diar_segments"][0]["speaker"] for task in result] == [
+            "samples_32000",
+            "samples_8000",
+            "samples_16000",
+        ]
+        assert [task.task_id for task in result] == [
+            "task_32000_sortformer",
+            "task_8000_sortformer",
+            "task_16000_sortformer",
+        ]
+
+    def test_process_batch_groups_waveforms_by_sample_rate(self) -> None:
+        mock_model = MagicMock()
+        mock_model.sortformer_modules = MagicMock()
+        mock_model.diarize.side_effect = lambda **kwargs: [["0 1 speaker_0"] for _ in kwargs["audio"]]
+        stage = InferenceSortformerStage(diar_model=mock_model)
+        tasks = [
+            AudioTask(data={"waveform": np.zeros(8000), "sample_rate": 8000}, task_id="8k"),
+            AudioTask(data={"waveform": np.zeros(16000), "sample_rate": 16000}, task_id="16k"),
+        ]
+
+        stage.process_batch(tasks)
+
+        assert mock_model.diarize.call_count == 2
+        assert {call.kwargs["sample_rate"] for call in mock_model.diarize.call_args_list} == {8000, 16000}
+
+    def test_process_batch_leaves_read_errors_untouched(self) -> None:
+        mock_model = self._make_mock_model([["0 1 speaker_0"]])
+        stage = InferenceSortformerStage(diar_model=mock_model)
+        failed = AudioTask(data={"read_error": True}, task_id="failed")
+        valid = AudioTask(data={"audio_filepath": "/test/valid.wav"}, task_id="valid")
+
+        result = stage.process_batch([failed, valid])
+
+        assert result[0].task_id == "failed"
+        assert result[1].task_id == "valid_sortformer"
 
     def test_process_writes_rttm(self, tmp_path: Path) -> None:
         fake_output = [["0.00 2.50 speaker_0"]]

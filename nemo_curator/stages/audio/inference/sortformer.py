@@ -27,6 +27,8 @@ from nemo.collections.asr.models import SortformerEncLabelModel
 from nemo_curator.stages.base import ProcessingStage
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
+
     import numpy as np
 
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
@@ -128,12 +130,26 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         fifo_len: FIFO queue size in frames.
         spkcache_update_period: Speaker cache update period in frames.
         spkcache_len: Speaker cache size in frames.
-        inference_batch_size: Batch size passed to diarize().
+        inference_batch_size: Model batch size passed to ``diarize()``.  The
+            optimized default matches the stage batch size so Ray batches are
+            not silently serialized inside NeMo.
+        bucket_by_duration: Sort each model batch by audio duration to reduce
+            padding, then restore the original task order.
+        backend: ``"pytorch"`` or native in-process ``"tensorrt"`` execution
+            for the exported streaming graph.
+        tensorrt_engine_path: Serialized engine exported from the exact same
+            Sortformer checkpoint. Required for ``backend="tensorrt"``.
+        tensorrt_metadata_path: Optional engine metadata sidecar path. Defaults
+            to ``<engine>.json``.
+        validate_tensorrt_metadata: Verify model and engine SHA-256 values at
+            actor setup. Disable only for externally managed engines.
         precision: Inference precision. ``"bf16"`` and ``"fp16"`` use CUDA
             autocast while keeping model weights in their checkpoint format.
         avoid_cuda_cache_flush: Avoid NeMo's wrapper-level and internal
             ``empty_cache`` calls during inference. The caching allocator is retained.
-        allow_tf32: Allow TF32 matmuls for the FP32 CUDA path.
+        allow_tf32: Allow TF32 matmuls for the FP32 CUDA path.  Disabled by
+            default because it can move diarization boundaries; enable only
+            when that accuracy trade-off is accepted.
         name: Stage name.
     """
 
@@ -153,10 +169,15 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     fifo_len: int = 40
     spkcache_update_period: int = 300
     spkcache_len: int = 188
-    inference_batch_size: int = 1
+    inference_batch_size: int = 8
+    bucket_by_duration: bool = True
+    backend: Literal["pytorch", "tensorrt"] = "pytorch"
+    tensorrt_engine_path: str | None = None
+    tensorrt_metadata_path: str | None = None
+    validate_tensorrt_metadata: bool = True
     precision: Literal["fp32", "fp16", "bf16"] = "fp32"
     avoid_cuda_cache_flush: bool = False
-    allow_tf32: bool = True
+    allow_tf32: bool = False
     name: str = "Sortformer_inference"
     batch_size: int = 8
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0, gpu_memory_gb=8.0))
@@ -166,6 +187,16 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if self.precision not in {"fp32", "fp16", "bf16"}:
             msg = f"Unsupported Sortformer precision: {self.precision!r}"
             raise ValueError(msg)
+        if self.inference_batch_size < 1:
+            msg = "Sortformer inference_batch_size must be at least 1"
+            raise ValueError(msg)
+        if self.backend not in {"pytorch", "tensorrt"}:
+            msg = f"Unsupported Sortformer backend: {self.backend!r}"
+            raise ValueError(msg)
+        if self.backend == "tensorrt" and not self.tensorrt_engine_path:
+            msg = "tensorrt_engine_path is required for the Sortformer TensorRT backend"
+            raise ValueError(msg)
+        self._tensorrt_runner = None
 
     def setup_on_node(
         self, _node_info: NodeInfo | None = None, _worker_metadata: WorkerMetadata | None = None
@@ -222,6 +253,20 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
     def _configure_acceleration(self) -> None:
         """Configure optional open-source PyTorch inference optimizations."""
+        if self.backend == "tensorrt":
+            from nemo_curator.stages.audio.inference.sortformer_tensorrt import TensorRTSortformerRunner
+
+            self._tensorrt_runner = TensorRTSortformerRunner(
+                self.diar_model,
+                self.tensorrt_engine_path,
+                model_path=self.model_path,
+                metadata_path=self.tensorrt_metadata_path,
+                validate_metadata=self.validate_tensorrt_metadata,
+            )
+            self.diar_model.forward_streaming = self._tensorrt_runner.forward_streaming
+            logger.info(f"Sortformer TensorRT backend loaded from {self.tensorrt_engine_path}")
+            return
+
         if self.allow_tf32 and torch.cuda.is_available():
             torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -229,7 +274,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if self.avoid_cuda_cache_flush and hasattr(self.diar_model, "_diarize_forward"):
             model = self.diar_model
 
-            def _diarize_forward_without_cache_flush(batch: Any) -> torch.Tensor:
+            def _diarize_forward_without_cache_flush(batch: Sequence[torch.Tensor]) -> torch.Tensor:
                 # Keep allocator blocks reusable across both NeMo's forward path
                 # and this wrapper. Curator stage actors execute inference serially.
                 with torch.inference_mode(), self._cuda_cache_context():
@@ -239,7 +284,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             model._diarize_forward = _diarize_forward_without_cache_flush
 
     def _autocast_context(self) -> AbstractContextManager[Any]:
-        if self.precision == "fp32" or not torch.cuda.is_available():
+        if self.backend == "tensorrt" or self.precision == "fp32" or not torch.cuda.is_available():
             return nullcontext()
         dtype = torch.float16 if self.precision == "fp16" else torch.bfloat16
         if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
@@ -248,7 +293,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         return torch.autocast(device_type="cuda", dtype=dtype)
 
     @contextmanager
-    def _cuda_cache_context(self) -> Any:
+    def _cuda_cache_context(self) -> Iterator[None]:
         """Optionally suppress NeMo's unconditional per-forward cache flush."""
         if not self.avoid_cuda_cache_flush or not torch.cuda.is_available():
             yield
@@ -270,7 +315,14 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             out.append(self.diar_segments_key)
         return ["data"], out
 
-    def _diarize(self, audio: list[np.ndarray] | list[str], sample_rate: int | None = None) -> list[list[dict[str, Any]]]:
+    def teardown(self) -> None:
+        if self._tensorrt_runner is not None:
+            self._tensorrt_runner.close()
+            self._tensorrt_runner = None
+
+    def _diarize(
+        self, audio: list[np.ndarray] | list[str], sample_rate: int | None = None
+    ) -> list[list[dict[str, Any]]]:
         """Run Sortformer diarization on a list of audio inputs.
 
         Accepts either file paths or numpy arrays (with sample_rate).
@@ -317,7 +369,9 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         else:
             filepath = task.data.get(self.filepath_key)
             if filepath is None:
-                msg = f"Sortformer: neither '{self.waveform_key}' nor '{self.filepath_key}' found in task {task.task_id}"
+                msg = (
+                    f"Sortformer: neither '{self.waveform_key}' nor '{self.filepath_key}' found in task {task.task_id}"
+                )
                 raise ValueError(msg)
             segments = self._diarize([filepath])[0]
 
@@ -328,8 +382,15 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         task.task_id = f"{task.task_id}_sortformer"
         return task
 
-    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
-        """Run batched speaker diarization across multiple tasks."""
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:  # noqa: C901
+        """Run length-bucketed speaker diarization across multiple tasks.
+
+        NeMo's ``diarize`` API performs its own micro-batching.  Sorting the
+        supplied recordings by duration makes consecutive micro-batches more
+        uniform and avoids padding short recordings to the longest item in a
+        heterogeneous Ray batch.  Results are assigned back to the original
+        tasks, so pipeline order is unchanged.
+        """
         if len(tasks) == 0:
             return []
 
@@ -337,30 +398,49 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if not to_process:
             return tasks
 
-        waveforms = [t.data.get(self.waveform_key) for t in to_process]
-        has_waveform = [w is not None for w in waveforms]
-        if any(has_waveform) and not all(has_waveform):
-            msg = "Sortformer: batch contains a mix of waveform and filepath tasks; all tasks must use the same mode"
-            raise ValueError(msg)
-        use_waveform = has_waveform[0]
+        # Waveforms with different sample rates cannot share one NeMo call.
+        # File paths form a separate group because NeMo owns their decoding.
+        groups: dict[tuple[str, int | None], list[tuple[AudioTask, Any, float]]] = {}
+        for task in to_process:
+            waveform = task.data.get(self.waveform_key)
+            if waveform is not None:
+                sample_rate = task.data.get(self.sample_rate_key)
+                if sample_rate is None:
+                    msg = (
+                        f"Sortformer: waveform provided but '{self.sample_rate_key}' is missing in task {task.task_id}"
+                    )
+                    raise ValueError(msg)
+                duration = float(waveform.shape[-1]) / sample_rate
+                groups.setdefault(("waveform", sample_rate), []).append((task, waveform, duration))
+                continue
 
-        if use_waveform:
-            sr = to_process[0].data.get(self.sample_rate_key)
-            if sr is None:
-                msg = f"Sortformer: waveform provided but '{self.sample_rate_key}' is missing"
+            filepath = task.data.get(self.filepath_key)
+            if filepath is None:
+                msg = (
+                    f"Sortformer: neither '{self.waveform_key}' nor '{self.filepath_key}' found in task {task.task_id}"
+                )
                 raise ValueError(msg)
-            all_segments = self._diarize(waveforms, sample_rate=sr)
-        else:
-            paths = [t.data[self.filepath_key] for t in to_process]
-            all_segments = self._diarize(paths)
+            duration = float(task.data.get("duration_sec", task.data.get("duration", 0.0)))
+            groups.setdefault(("filepath", None), []).append((task, filepath, duration))
 
-        for task, segments in zip(to_process, all_segments, strict=True):
-            self._apply_results(task, segments)
+        results_by_task: dict[int, list[dict[str, Any]]] = {}
+        for (mode, sample_rate), group in groups.items():
+            ordered_group = sorted(group, key=lambda item: item[2]) if self.bucket_by_duration else group
+            model_inputs = [item[1] for item in ordered_group]
+            all_segments = self._diarize(
+                model_inputs,
+                sample_rate=sample_rate if mode == "waveform" else None,
+            )
+            for (task, _model_input, _duration), segments in zip(ordered_group, all_segments, strict=True):
+                results_by_task[id(task)] = segments
+
+        for task in to_process:
+            self._apply_results(task, results_by_task[id(task)])
 
         # Write RTTM files after all GPU results are applied (batch disk I/O)
         if self.rttm_out_dir is not None:
-            for task, segments in zip(to_process, all_segments, strict=True):
-                _write_rttm(segments, self._session_name(task), self.rttm_out_dir)
+            for task in to_process:
+                _write_rttm(results_by_task[id(task)], self._session_name(task), self.rttm_out_dir)
 
         for task in to_process:
             task.task_id = f"{task.task_id}_sortformer"
