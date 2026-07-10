@@ -90,7 +90,9 @@ def _dedup_entries_by_stem(entries: list[dict], shard_key: str) -> list[dict]:
     deduped = [entries[best[key][1]] for key in order]
     dropped = len(entries) - len(deduped)
     if dropped:
-        logger.warning(f"[{shard_key}] deduplicated {dropped} duplicate source(s) (same recording, kept preferred format)")
+        logger.warning(
+            f"[{shard_key}] deduplicated {dropped} duplicate source(s) (same recording, kept preferred format)"
+        )
     return deduped
 
 
@@ -129,19 +131,76 @@ def _manifest_to_shard_key(manifest_path: str, corpus: str) -> str:
     return rel
 
 
-
-
 # ---------------------------------------------------------------------------
 # YAML parsing (input_cfg format only)
 # ---------------------------------------------------------------------------
 
 
+def _as_plain_container(obj: Any) -> Any:  # noqa: ANN401
+    """Convert an OmegaConf node (as passed by Hydra ``instantiate``) to plain
+    Python containers, resolving interpolations like ``${input_manifest}``.
+
+    Non-OmegaConf objects (e.g. a list already loaded from YAML) pass through
+    unchanged, so this is safe to call on either an inline ``input_cfg`` or a
+    ``yaml.safe_load`` result.
+    """
+    try:
+        from omegaconf import OmegaConf
+    except ImportError:
+        return obj
+    if OmegaConf.is_config(obj):
+        return OmegaConf.to_container(obj, resolve=True)
+    return obj
+
+
+def _load_input_cfg(yaml_path: str | None, input_cfg: Any = None) -> list[dict[str, Any]]:  # noqa: ANN401
+    """Return the raw ``input_cfg`` list from either an inline object or a YAML file.
+
+    ``input_cfg`` (when provided) takes precedence over ``yaml_path`` and may be an
+    OmegaConf list (interpolations are resolved). This lets callers embed the config
+    inline in a pipeline YAML instead of maintaining a separate wrapper file.
+    """
+    if input_cfg is not None:
+        return _as_plain_container(input_cfg)
+    if yaml_path:
+        import yaml
+
+        with open(yaml_path, encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    msg = "Either input_cfg or yaml_path must be provided"
+    raise ValueError(msg)
+
+
+def _shards_from_cfg_entry(cfg: dict[str, Any], corpus: str, language: str) -> list[dict[str, Any]]:
+    """Expand a single ``input_cfg`` entry into one shard descriptor per manifest.
+
+    Tarred entries pair each expanded manifest with its tar path; non-tarred
+    entries emit one descriptor per expanded manifest path.
+    """
+    if "tarred_audio_filepaths" in cfg:
+        manifest_paths = _expand_nemo_path(cfg["manifest_filepath"])
+        tar_paths = _expand_nemo_path(cfg["tarred_audio_filepaths"])
+        if len(manifest_paths) != len(tar_paths):
+            msg = f"Manifest/tar count mismatch for {corpus}: {len(manifest_paths)} vs {len(tar_paths)}"
+            raise ValueError(msg)
+        return [
+            {"corpus": corpus, "manifest_path": mp, "tar_path": tp, "language": language}
+            for mp, tp in zip(manifest_paths, tar_paths, strict=False)
+        ]
+    if "manifest_filepath" in cfg:
+        return [
+            {"corpus": corpus, "manifest_path": mp, "language": language}
+            for mp in _expand_nemo_path(cfg["manifest_filepath"])
+        ]
+    return []
+
+
 def _parse_input_cfg(
-    yaml_path: str,
+    config: list[dict[str, Any]],
     corpus_filter: list[str] | None,
     language_filter: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Parse a NeMo ``input_cfg`` YAML into shard descriptors.
+    """Parse a NeMo ``input_cfg`` list into shard descriptors.
 
     Each descriptor has ``manifest_path``, optional ``tar_path``,
     ``corpus``, and ``language``.
@@ -149,13 +208,8 @@ def _parse_input_cfg(
     Only supports the standard NeMo config format with ``input_cfg``
     entries of type ``nemo_tarred`` or ``nemo``.
     """
-    import yaml
-
-    with open(yaml_path, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
     if not isinstance(config, list) or not config:
-        msg = f"Expected a YAML list, got {type(config)}"
+        msg = f"Expected an input_cfg list, got {type(config)}"
         raise ValueError(msg)
 
     shards: list[dict[str, Any]] = []
@@ -169,17 +223,7 @@ def _parse_input_cfg(
             if language_filter and language not in language_filter:
                 continue
 
-            if "tarred_audio_filepaths" in cfg:
-                manifest_paths = _expand_nemo_path(cfg["manifest_filepath"])
-                tar_paths = _expand_nemo_path(cfg["tarred_audio_filepaths"])
-                if len(manifest_paths) != len(tar_paths):
-                    msg = f"Manifest/tar count mismatch for {corpus}: {len(manifest_paths)} vs {len(tar_paths)}"
-                    raise ValueError(msg)
-                for mp, tp in zip(manifest_paths, tar_paths, strict=False):
-                    shards.append({"corpus": corpus, "manifest_path": mp, "tar_path": tp, "language": language})
-            elif "manifest_filepath" in cfg:
-                for mp in _expand_nemo_path(cfg["manifest_filepath"]):
-                    shards.append({"corpus": corpus, "manifest_path": mp, "language": language})
+            shards.extend(_shards_from_cfg_entry(cfg, corpus, language))
 
     return shards
 
@@ -199,13 +243,14 @@ class NeMoSpeechDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
 
     name: str = "nemo_speech_discovery"
     yaml_path: str = ""
+    input_cfg: Any = None
     corpus_filter: list[str] | None = None
     language_filter: list[str] | None = None
     output_dir: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.yaml_path:
-            msg = "yaml_path is required"
+        if not self.yaml_path and self.input_cfg is None:
+            msg = "Either input_cfg or yaml_path is required"
             raise ValueError(msg)
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -237,7 +282,8 @@ class NeMoSpeechDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         return completed
 
     def process(self, _task: _EmptyTask) -> list[FileGroupTask]:
-        shard_descs = _parse_input_cfg(self.yaml_path, self.corpus_filter, self.language_filter)
+        config = _load_input_cfg(self.yaml_path, self.input_cfg)
+        shard_descs = _parse_input_cfg(config, self.corpus_filter, self.language_filter)
 
         completed = self._scan_completed_shards()
         if completed:
@@ -258,12 +304,14 @@ class NeMoSpeechDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
                     logger.info(f"Removed partial output for {shard_key}")
 
             if "tar_path" in desc:
-                tasks.append(FileGroupTask(
-                    task_id=shard_key,
-                    dataset_name=corpus,
-                    data=[desc["manifest_path"], desc["tar_path"]],
-                    reader_config={"corpus": corpus, "shard_key": shard_key, "language": desc.get("language", "")},
-                ))
+                tasks.append(
+                    FileGroupTask(
+                        task_id=shard_key,
+                        dataset_name=corpus,
+                        data=[desc["manifest_path"], desc["tar_path"]],
+                        reader_config={"corpus": corpus, "shard_key": shard_key, "language": desc.get("language", "")},
+                    )
+                )
             else:
                 # Non-tarred: read manifest, emit one task per entry for parallel loading
                 import json
@@ -276,25 +324,33 @@ class NeMoSpeechDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
                         entries = [json.loads(line) for line in f if line.strip()]
                     entries = _dedup_entries_by_stem(entries, shard_key)
                     for i, entry in enumerate(entries):
-                        tasks.append(FileGroupTask(
-                            task_id=f"{shard_key}_{i}",
+                        tasks.append(
+                            FileGroupTask(
+                                task_id=f"{shard_key}_{i}",
+                                dataset_name=corpus,
+                                data=[entry.get("audio_filepath", "")],
+                                reader_config={
+                                    "corpus": corpus,
+                                    "shard_key": shard_key,
+                                    "language": desc.get("language", ""),
+                                    "entry": entry,
+                                    "shard_total": len(entries),
+                                },
+                            )
+                        )
+                except Exception:  # noqa: BLE001
+                    tasks.append(
+                        FileGroupTask(
+                            task_id=shard_key,
                             dataset_name=corpus,
-                            data=[entry.get("audio_filepath", "")],
+                            data=[desc["manifest_path"]],
                             reader_config={
                                 "corpus": corpus,
                                 "shard_key": shard_key,
                                 "language": desc.get("language", ""),
-                                "entry": entry,
-                                "shard_total": len(entries),
                             },
-                        ))
-                except Exception:  # noqa: BLE001
-                    tasks.append(FileGroupTask(
-                        task_id=shard_key,
-                        dataset_name=corpus,
-                        data=[desc["manifest_path"]],
-                        reader_config={"corpus": corpus, "shard_key": shard_key, "language": desc.get("language", "")},
-                    ))
+                        )
+                    )
 
         logger.info(
             f"UnifiedDiscovery: {len(tasks)} shards to process, {skipped} skipped "
@@ -388,8 +444,15 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         if ffprobe_bin is None:
             return None
         cmd = [
-            ffprobe_bin, "-v", "error", "-select_streams", "a:0",
-            "-show_entries", "stream=sample_rate", "-of", "default=noprint_wrappers=1:nokey=1",
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
             path,
         ]
         proc = subprocess.run(cmd, capture_output=True, check=False)  # noqa: S603
@@ -436,9 +499,21 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
             out_sr = NeMoSpeechReaderStage._ffprobe_sample_rate(tmp.name) or target_sr
             cmd = [
-                ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
-                "-i", tmp.name,
-                "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", str(out_sr),
+                ffmpeg_bin,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                tmp.name,
+                "-f",
+                "f32le",
+                "-acodec",
+                "pcm_f32le",
+                "-ac",
+                "1",
+                "-ar",
+                str(out_sr),
                 "pipe:1",
             ]
             proc = subprocess.run(cmd, capture_output=True, check=False)  # noqa: S603
@@ -452,70 +527,84 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         return audio, out_sr
 
     @staticmethod
-    def _load_audio(audio_path: str, hint_sr: int | None = None, hint_duration: float = 0.0) -> tuple[np.ndarray, int, float]:
+    def _decode_hint_recording(audio_path: str, hint_sr: int, hint_duration: float) -> tuple[np.ndarray, int, float]:
+        """Decode using a lhotse ``Recording`` built from manifest SR/duration hints."""
+        from lhotse import Recording
+        from lhotse.audio import AudioSource
+        from nemo.utils.data_utils import is_datastore_path
+
+        source_type = "url" if is_datastore_path(audio_path) else "file"
+        rec = Recording(
+            id=audio_path,
+            sources=[AudioSource(type=source_type, channels=[0], source=audio_path)],
+            sampling_rate=int(hint_sr),
+            num_samples=int(hint_duration * hint_sr),
+            duration=hint_duration,
+            channel_ids=[0],
+        )
+        return rec.load_audio().squeeze(), rec.sampling_rate, rec.duration
+
+    @staticmethod
+    def _decode_from_file(audio_path: str) -> tuple[np.ndarray, int, float]:
+        """Decode by letting lhotse probe the file header (``Recording.from_file``)."""
+        from lhotse import Recording
+
+        rec = Recording.from_file(audio_path)
+        return rec.load_audio().squeeze(), rec.sampling_rate, rec.duration
+
+    @staticmethod
+    def _decode_torchcodec(audio_path: str) -> tuple[np.ndarray, int, float]:
+        """Decode via torchcodec's ``AudioDecoder`` (last-resort fallback)."""
+        import smart_open
+        from torchcodec.decoders import AudioDecoder
+
+        with smart_open.open(audio_path, "rb") as f:
+            samples = AudioDecoder(f.read()).get_all_samples()
+        return samples.data.numpy().squeeze(), samples.sample_rate, 0.0
+
+    @staticmethod
+    def _load_audio(
+        audio_path: str, hint_sr: int | None = None, hint_duration: float = 0.0
+    ) -> tuple[np.ndarray, int, float]:
         """Load audio from a file path (local or S3) and return (waveform, sr, duration).
 
         Tries lhotse first, then an ffmpeg-CLI fallback, then torchcodec.
         Returns a 1-D float32 numpy array.
         """
-        from lhotse import Recording
-        from lhotse.audio import AudioSource
-        from nemo.utils.data_utils import is_datastore_path
+        ext = os.path.splitext(audio_path)[1].lower()
+        # MPEG containers need real header probing; manifest duration/SR hints are often wrong.
+        use_hint_recording = bool(hint_sr) and ext not in _MPEG_EXTENSIONS
+
+        # Ordered decoder attempts; the first that succeeds wins. ffmpeg returns
+        # (audio, sr) so its duration is padded to 0.0 and recomputed below.
+        attempts: list[tuple[str, Any]] = []
+        if use_hint_recording:
+            attempts.append(
+                (
+                    "hint-recording",
+                    lambda: NeMoSpeechReaderStage._decode_hint_recording(audio_path, hint_sr, hint_duration),
+                )
+            )
+        attempts.append(("from_file", lambda: NeMoSpeechReaderStage._decode_from_file(audio_path)))
+        attempts.append(("ffmpeg", lambda: (*NeMoSpeechReaderStage._load_audio_ffmpeg(audio_path), 0.0)))
+        attempts.append(("torchcodec", lambda: NeMoSpeechReaderStage._decode_torchcodec(audio_path)))
 
         audio: np.ndarray | None = None
         sr: int = 0
         duration: float = 0.0
-        ext = os.path.splitext(audio_path)[1].lower()
-        # MPEG containers need real header probing; manifest duration/SR hints are often wrong.
-        use_hint_recording = bool(hint_sr) and ext not in _MPEG_EXTENSIONS
         load_errors: list[str] = []
-
-        if use_hint_recording:
+        for name, decode in attempts:
             try:
-                source_type = "url" if is_datastore_path(audio_path) else "file"
-                rec = Recording(
-                    id=audio_path,
-                    sources=[AudioSource(type=source_type, channels=[0], source=audio_path)],
-                    sampling_rate=int(hint_sr),
-                    num_samples=int(hint_duration * hint_sr),
-                    duration=hint_duration,
-                    channel_ids=[0],
-                )
-                audio = rec.load_audio().squeeze()
-                sr = rec.sampling_rate
-                duration = rec.duration
+                audio, sr, duration = decode()
+                break
             except Exception as exc:  # noqa: BLE001
-                load_errors.append(f"hint-recording: {exc}")
+                load_errors.append(f"{name}: {exc}")
 
         if audio is None:
-            try:
-                rec = Recording.from_file(audio_path)
-                audio = rec.load_audio().squeeze()
-                sr = rec.sampling_rate
-                duration = rec.duration
-            except Exception as exc:  # noqa: BLE001
-                load_errors.append(f"from_file: {exc}")
-
-        if audio is None:
-            try:
-                audio, sr = NeMoSpeechReaderStage._load_audio_ffmpeg(audio_path)
-                duration = 0.0  # recomputed below from samples/sr
-            except Exception as exc:  # noqa: BLE001
-                load_errors.append(f"ffmpeg: {exc}")
-
-        if audio is None:
-            try:
-                import smart_open
-                from torchcodec.decoders import AudioDecoder
-
-                with smart_open.open(audio_path, "rb") as f:
-                    samples = AudioDecoder(f.read()).get_all_samples()
-                audio = samples.data.numpy().squeeze()
-                sr = samples.sample_rate
-            except Exception as exc:  # noqa: BLE001
-                load_errors.append(f"torchcodec: {exc}")
-                logger.warning(f"Skipping unreadable audio: {audio_path} ({'; '.join(load_errors)})")
-                raise RuntimeError(f"All decoders failed for {audio_path}: {'; '.join(load_errors)}")
+            joined = "; ".join(load_errors)
+            logger.warning(f"Skipping unreadable audio: {audio_path} ({joined})")
+            msg = f"All decoders failed for {audio_path}: {joined}"
+            raise RuntimeError(msg)
 
         if audio.ndim > 1:
             audio = audio.mean(axis=0)
@@ -538,12 +627,14 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         audio_path = task.data[0] if task.data else entry.get("audio_filepath", "")
 
         entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
-        entry_data.update({
-            "read_error": True,
-            "corpus": corpus,
-            "audio_filepath": audio_path,
-            "original_file": audio_path,
-        })
+        entry_data.update(
+            {
+                "read_error": True,
+                "corpus": corpus,
+                "audio_filepath": audio_path,
+                "original_file": audio_path,
+            }
+        )
         if language and "source_lang" not in entry_data:
             entry_data["source_lang"] = language
         shard_total = task.reader_config.get("shard_total", 0)
@@ -562,22 +653,26 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
         try:
             audio, sr, duration = self._load_audio(
-                audio_path, hint_sr=hint_sr, hint_duration=entry.get("duration", 0.0),
+                audio_path,
+                hint_sr=hint_sr,
+                hint_duration=entry.get("duration", 0.0),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Unreadable audio, emitting read-error placeholder: {audio_path} ({exc})")
             return [self._read_error_task(task)]
 
         entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
-        entry_data.update({
-            "waveform": audio,
-            "sampling_rate": sr,
-            "sample_rate": sr,
-            "duration": duration,
-            "num_channels": 1,
-            "corpus": corpus,
-            "audio_filepath": audio_path,
-        })
+        entry_data.update(
+            {
+                "waveform": audio,
+                "sampling_rate": sr,
+                "sample_rate": sr,
+                "duration": duration,
+                "num_channels": 1,
+                "corpus": corpus,
+                "audio_filepath": audio_path,
+            }
+        )
         if language and "source_lang" not in entry_data:
             entry_data["source_lang"] = language
 
@@ -616,6 +711,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 actual_sr = round(len(audio) / cut.duration)
                 if actual_sr != target_sr and actual_sr > 0:
                     import librosa
+
                     audio = librosa.resample(audio, orig_sr=actual_sr, target_sr=target_sr)
 
             loaded += 1
@@ -623,27 +719,31 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 logger.info(f"  [{shard_key}] loaded {loaded}")
 
             entry_data = dict(cut.custom) if cut.custom else {}
-            entry_data.update({
-                "waveform": np.asarray(audio, dtype=np.float32),
-                "sampling_rate": target_sr,
-                "sample_rate": target_sr,
-                "duration": cut.duration,
-                "num_channels": 1,
-                "corpus": corpus,
-            })
+            entry_data.update(
+                {
+                    "waveform": np.asarray(audio, dtype=np.float32),
+                    "sampling_rate": target_sr,
+                    "sample_rate": target_sr,
+                    "duration": cut.duration,
+                    "num_channels": 1,
+                    "corpus": corpus,
+                }
+            )
             if "audio_filepath" not in entry_data and cut.recording and cut.recording.sources:
                 src = cut.recording.sources[0].source
                 entry_data["audio_filepath"] = src if isinstance(src, str) else cut.id
             if language and "source_lang" not in entry_data:
                 entry_data["source_lang"] = language
 
-            results.append(AudioTask(
-                task_id=f"{shard_key}_{cut.id}",
-                dataset_name=corpus,
-                data=entry_data,
-                _metadata={**metadata, "_shard_key": shard_key},
-                _stage_perf=list(task._stage_perf),
-            ))
+            results.append(
+                AudioTask(
+                    task_id=f"{shard_key}_{cut.id}",
+                    dataset_name=corpus,
+                    data=entry_data,
+                    _metadata={**metadata, "_shard_key": shard_key},
+                    _stage_perf=list(task._stage_perf),
+                )
+            )
 
         for r in results:
             r._metadata["_shard_total"] = len(results)
@@ -675,14 +775,10 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
             n_threads = min(self.max_io_threads, len(single_entry_tasks))
             logger.info(
-                f"NeMoSpeechReader: loading {len(single_entry_tasks)} audio files "
-                f"with {n_threads} I/O threads"
+                f"NeMoSpeechReader: loading {len(single_entry_tasks)} audio files with {n_threads} I/O threads"
             )
             with ThreadPoolExecutor(max_workers=n_threads) as pool:
-                future_to_task = {
-                    pool.submit(self._process_single_entry, t): t
-                    for t in single_entry_tasks
-                }
+                future_to_task = {pool.submit(self._process_single_entry, t): t for t in single_entry_tasks}
                 for future in as_completed(future_to_task):
                     src_task = future_to_task[future]
                     try:
@@ -691,8 +787,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                         # Emit a placeholder so the shard can still complete instead of
                         # stalling forever on a deterministically-failing input.
                         logger.warning(
-                            f"Failed to load audio for task {src_task.task_id}, "
-                            f"emitting read-error placeholder: {exc}"
+                            f"Failed to load audio for task {src_task.task_id}, emitting read-error placeholder: {exc}"
                         )
                         if src_task.reader_config.get("entry") is not None:
                             results.append(self._read_error_task(src_task))
@@ -712,11 +807,17 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
     """Unified reader for NeMo audio datasets.
 
-    Reads NeMo ``input_cfg`` YAML configs and uses NeMo's lhotse
-    adapters (``LazyNeMoIterator`` / ``LazyNeMoTarredIterator``)
+    Reads NeMo ``input_cfg`` configs (from a YAML file or inline) and uses
+    NeMo's lhotse adapters (``LazyNeMoIterator`` / ``LazyNeMoTarredIterator``)
     for audio loading.
 
     Args:
+        yaml_path: Path to a NeMo ``input_cfg`` YAML file.
+        input_cfg: Inline ``input_cfg`` (a list of groups, matching the YAML
+            file structure). Takes precedence over ``yaml_path`` and may be an
+            OmegaConf list — interpolations like ``${input_manifest}`` are
+            resolved. Lets a pipeline YAML embed the data config directly
+            instead of pointing at a separate wrapper file.
         max_io_threads: Maximum concurrent threads for loading audio
             from S3/object storage. Higher values overlap more network
             latency but use more memory. Defaults to 8.
@@ -724,6 +825,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
 
     name: str = "nemo_speech_audio_reader"
     yaml_path: str = ""
+    input_cfg: Any = None
     corpus_filter: list[str] | None = None
     language_filter: list[str] | None = None
     output_dir: str | None = None
@@ -732,12 +834,13 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
 
     def __post_init__(self) -> None:
         super().__init__()
-        if not self.yaml_path:
-            msg = "yaml_path is required for NeMoSpeechAudioReader"
+        if not self.yaml_path and self.input_cfg is None:
+            msg = "Either input_cfg or yaml_path is required for NeMoSpeechAudioReader"
             raise ValueError(msg)
         self._stages: list[ProcessingStage] = [
             NeMoSpeechDiscoveryStage(
                 yaml_path=self.yaml_path,
+                input_cfg=self.input_cfg,
                 corpus_filter=self.corpus_filter,
                 language_filter=self.language_filter,
                 output_dir=self.output_dir,
