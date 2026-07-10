@@ -4,12 +4,23 @@ The metadata extraction pipeline offers native in-process acceleration without
 changing its output schema or calling an NVIDIA Riva/Triton service. TensorRT
 engines are built from the exact checkpoints used by the Curator stages.
 
+The existing Curator invocation and defaults remain unchanged: Sortformer uses
+PyTorch with inference batch size 1, Silero uses Torch, the Sortformer stage
+window is 2, reader concurrency is 2, and writer concurrency is 1. TensorRT is
+an explicit opt-in acceleration path. Existing pipelines therefore do not need
+new runtime options unless they choose to enable it.
+
 ## TensorRT engine preparation
 
-Build engines on the target GPU and with the same TensorRT version used for
+Build engines on the deployment GPU and with the same TensorRT version used for
 inference. The production defaults use FP32: this preserves threshold-sensitive
 diarization and recurrent VAD behavior while TensorRT batching supplies the
 throughput gain.
+
+TensorRT plans are not portable across arbitrary GPU architectures or TensorRT
+versions. The source and builders support any compatible NVIDIA GPU, but each
+deployment must generate its own plans. CPU or unsupported-GPU deployments keep
+using the unchanged Torch path.
 
 ```bash
 python scripts/audio/build_sortformer_tensorrt_engine.py \

@@ -97,8 +97,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     vad.add_argument(
         "--vad_backend",
         choices=["torch", "onnx", "tensorrt"],
-        default="onnx",
-        help="Silero runtime. ONNX Runtime is recommended on CPU; TensorRT requires a GPU engine.",
+        default="torch",
+        help="Silero runtime. Torch preserves the original Curator behavior; TensorRT requires a GPU engine.",
     )
     vad.add_argument(
         "--vad_tensorrt_engine",
@@ -115,7 +115,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     vad.add_argument(
         "--vad_stage_batch_size",
         type=int,
-        default=32,
+        default=1,
         help="Recordings advanced together by the recurrent TensorRT VAD scheduler.",
     )
 
@@ -157,7 +157,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="GPUs per Sortformer actor (e.g. 1.0 for one full GPU). Overrides sortformer_gpu_memory_gb.",
     )
-    diar.add_argument("--sortformer_batch_size", type=int, default=8, help="Sortformer inference batch size.")
+    diar.add_argument("--sortformer_batch_size", type=int, default=1, help="Sortformer inference batch size.")
     diar.add_argument(
         "--sortformer_backend",
         choices=["pytorch", "tensorrt"],
@@ -176,7 +176,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     diar.add_argument(
         "--sortformer_stage_batch_size",
         type=int,
-        default=32,
+        default=2,
         help="Duration-bucketing window delivered to each Sortformer actor call.",
     )
     diar.add_argument(
@@ -202,14 +202,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     io.add_argument(
         "--read_concurrency",
         type=int,
-        default=4,
-        help="Max parallel Ray reader tasks (default: 4). Increase to overlap more S3/AIS reads.",
+        default=2,
+        help="Max parallel Ray reader tasks (default: 2). Increase to overlap more S3/AIS reads.",
     )
     io.add_argument(
         "--writer_concurrency",
         type=int,
-        default=4,
-        help="Parallel Ray writer actors for opus + manifest output (default: 4).",
+        default=1,
+        help="Parallel Ray writer actors for opus + manifest output (default: 1).",
     )
 
     out = ap.add_argument_group("Output")

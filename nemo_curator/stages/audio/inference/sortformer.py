@@ -170,7 +170,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     fifo_len: int = 40
     spkcache_update_period: int = 300
     spkcache_len: int = 188
-    inference_batch_size: int = 8
+    inference_batch_size: int = 1
     bucket_by_duration: bool = True
     backend: Literal["pytorch", "tensorrt"] = "pytorch"
     tensorrt_engine_path: str | None = None

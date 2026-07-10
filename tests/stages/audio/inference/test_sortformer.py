@@ -210,7 +210,7 @@ class TestWriteRttm:
         assert result.task_id.endswith("_sortformer")
         mock_model.diarize.assert_called_once_with(
             audio=["/test/audio1.wav"],
-            batch_size=8,
+            batch_size=1,
         )
 
     def test_process_batch_buckets_by_duration_and_restores_task_order(self) -> None:
