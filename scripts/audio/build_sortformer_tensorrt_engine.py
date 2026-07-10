@@ -265,7 +265,8 @@ def _build_engine(
                 )
             )
         minimum, optimum, maximum = shapes
-        if not profile.set_shape(tensor.name, minimum, optimum, maximum):
+        shape_status = profile.set_shape(tensor.name, minimum, optimum, maximum)
+        if shape_status is False:
             message = f"Could not set profile for {tensor.name}: {minimum}/{optimum}/{maximum}"
             raise RuntimeError(message)
         profile_rows.append({"name": tensor.name, "min": minimum, "opt": optimum, "max": maximum})

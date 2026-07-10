@@ -160,7 +160,8 @@ class TensorRTSession:
 
         with torch.cuda.stream(self.stream):
             for name, tensor in prepared.items():
-                if not self.context.set_input_shape(name, tuple(tensor.shape)):
+                shape_status = self.context.set_input_shape(name, tuple(tensor.shape))
+                if shape_status is False:
                     message = f"Input shape {tuple(tensor.shape)} is outside the profile for {name!r}"
                     raise RuntimeError(message)
                 self.context.set_tensor_address(name, tensor.data_ptr())

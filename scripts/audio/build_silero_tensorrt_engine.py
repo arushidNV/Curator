@@ -139,7 +139,8 @@ def build_engine(args: argparse.Namespace) -> None:  # noqa: C901
         minimum = _shape_for_batch(tensor.name, network_shape, args.min_batch, args.input_samples)
         optimum = _shape_for_batch(tensor.name, network_shape, args.opt_batch, args.input_samples)
         maximum = _shape_for_batch(tensor.name, network_shape, args.max_batch, args.input_samples)
-        if not profile.set_shape(tensor.name, minimum, optimum, maximum):
+        shape_status = profile.set_shape(tensor.name, minimum, optimum, maximum)
+        if shape_status is False:
             message = f"Could not set TensorRT profile for {tensor.name}: {minimum}/{optimum}/{maximum}"
             raise RuntimeError(message)
         dynamic_inputs.append((tensor.name, minimum, optimum, maximum))
