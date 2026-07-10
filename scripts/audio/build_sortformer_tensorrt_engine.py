@@ -79,9 +79,88 @@ def _export_onnx(model_path: Path, onnx_path: Path) -> None:
     )
     model.eval()
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
+
+    class StreamingGraph(torch.nn.Module):
+        """Exportable neural graph without NeMo's list-based concat_embs()."""
+
+        def __init__(self, sortformer: SortformerEncLabelModel) -> None:
+            super().__init__()
+            self.sortformer = sortformer
+
+        @staticmethod
+        def _gather_frames(source: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+            safe_positions = positions.clamp(min=0, max=source.shape[1] - 1)
+            gather_index = safe_positions.unsqueeze(-1).expand(-1, -1, source.shape[2])
+            return torch.gather(source, dim=1, index=gather_index)
+
+        def _compact_states(  # noqa: PLR0913
+            self,
+            spkcache: torch.Tensor,
+            spkcache_lengths: torch.Tensor,
+            fifo: torch.Tensor,
+            fifo_lengths: torch.Tensor,
+            chunk: torch.Tensor,
+            chunk_lengths: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            capacity = spkcache.shape[1] + fifo.shape[1] + chunk.shape[1]
+            positions = torch.arange(capacity, dtype=torch.int64, device=chunk.device)
+            positions = positions.unsqueeze(0).expand(chunk.shape[0], -1)
+
+            spk_end = spkcache_lengths.unsqueeze(1)
+            fifo_end = spk_end + fifo_lengths.unsqueeze(1)
+            chunk_end = fifo_end + chunk_lengths.unsqueeze(1)
+
+            spk_values = self._gather_frames(spkcache, positions)
+            fifo_values = self._gather_frames(fifo, positions - spk_end)
+            chunk_values = self._gather_frames(chunk, positions - fifo_end)
+            zeros = torch.zeros_like(spk_values)
+
+            compact = torch.where(
+                (positions < spk_end).unsqueeze(-1),
+                spk_values,
+                torch.where(
+                    (positions < fifo_end).unsqueeze(-1),
+                    fifo_values,
+                    torch.where((positions < chunk_end).unsqueeze(-1), chunk_values, zeros),
+                ),
+            )
+            return compact, chunk_end.squeeze(1)
+
+        def forward(  # noqa: PLR0913
+            self,
+            chunk: torch.Tensor,
+            chunk_lengths: torch.Tensor,
+            spkcache: torch.Tensor,
+            spkcache_lengths: torch.Tensor,
+            fifo: torch.Tensor,
+            fifo_lengths: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            chunk_embs, chunk_emb_lengths = self.sortformer.encoder.pre_encode(
+                x=chunk,
+                lengths=chunk_lengths,
+            )
+            combined, combined_lengths = self._compact_states(
+                spkcache,
+                spkcache_lengths,
+                fifo,
+                fifo_lengths,
+                chunk_embs,
+                chunk_emb_lengths,
+            )
+            encoded, encoded_lengths = self.sortformer.frontend_encoder(
+                processed_signal=combined,
+                processed_signal_length=combined_lengths,
+                bypass_pre_encode=True,
+            )
+            predictions = self.sortformer.forward_infer(
+                emb_seq=encoded,
+                emb_seq_length=encoded_lengths,
+            )
+            return predictions, encoded_lengths, chunk_embs, chunk_emb_lengths
+
     # NeMo 2.7.2 hard-codes 80 mel bins in streaming_input_examples(), while
-    # diar_streaming_sortformer_4spk-v2 uses 128. Construct the example from
-    # the restored checkpoint so export and runtime preprocessing cannot drift.
+    # diar_streaming_sortformer_4spk-v2 uses 128. Build the example from the
+    # restored checkpoint and export a vectorized replacement for concat_embs.
     modules = model.sortformer_modules
     feature_dim = int(model.cfg.preprocessor.features)
     batch_size = 4
@@ -96,10 +175,38 @@ def _export_onnx(model_path: Path, onnx_path: Path) -> None:
         torch.randn((batch_size, fifo_frames, modules.fc_d_model), device=model.device),
         torch.full((batch_size,), fifo_frames, dtype=torch.int64, device=model.device),
     )
-    model.export(str(onnx_path), input_example=input_example)
+    graph = StreamingGraph(model).eval()
+    torch.onnx.export(
+        graph,
+        input_example,
+        str(onnx_path),
+        input_names=["chunk", "chunk_lengths", "spkcache", "spkcache_lengths", "fifo", "fifo_lengths"],
+        output_names=["predictions", "pred_lengths", "chunk_embs", "chunk_emb_lengths"],
+        dynamic_axes={
+            "chunk": {0: "batch_size", 1: "chunk_frames"},
+            "chunk_lengths": {0: "batch_size"},
+            "spkcache": {0: "batch_size", 1: "spkcache_frames"},
+            "spkcache_lengths": {0: "batch_size"},
+            "fifo": {0: "batch_size", 1: "fifo_frames"},
+            "fifo_lengths": {0: "batch_size"},
+            "predictions": {0: "batch_size", 1: "output_frames"},
+            "pred_lengths": {0: "batch_size"},
+            "chunk_embs": {0: "batch_size", 1: "chunk_embedding_frames"},
+            "chunk_emb_lengths": {0: "batch_size"},
+        },
+        opset_version=17,
+        do_constant_folding=True,
+        dynamo=False,
+    )
     if not onnx_path.is_file():
         message = f"NeMo did not create the expected ONNX graph: {onnx_path}"
         raise RuntimeError(message)
+
+    import onnx
+
+    exported = onnx.load(str(onnx_path))
+    onnx.checker.check_model(exported)
+    print(f"SORTFORMER_ONNX_EXPORT_PASSED path={onnx_path}")
 
 
 def _build_engine(
