@@ -112,6 +112,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="GPUs per VAD actor. Set above zero for the TensorRT backend.",
     )
+    vad.add_argument(
+        "--vad_stage_batch_size",
+        type=int,
+        default=32,
+        help="Recordings advanced together by the recurrent TensorRT VAD scheduler.",
+    )
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
     sed.add_argument("--sed_checkpoint", type=str, default=None, help="Path to PANNs CNN14 checkpoint. Enables SED.")
@@ -170,8 +176,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     diar.add_argument(
         "--sortformer_stage_batch_size",
         type=int,
-        default=8,
-        help="Number of recordings delivered to each Sortformer actor call.",
+        default=32,
+        help="Duration-bucketing window delivered to each Sortformer actor call.",
     )
     diar.add_argument(
         "--sortformer_precision",
@@ -196,14 +202,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     io.add_argument(
         "--read_concurrency",
         type=int,
-        default=2,
-        help="Max parallel Ray reader tasks (default: 2). Increase to overlap more S3/AIS reads.",
+        default=4,
+        help="Max parallel Ray reader tasks (default: 4). Increase to overlap more S3/AIS reads.",
     )
     io.add_argument(
         "--writer_concurrency",
         type=int,
-        default=1,
-        help="Parallel Ray writer actors for opus + manifest output (default: 1).",
+        default=4,
+        help="Parallel Ray writer actors for opus + manifest output (default: 4).",
     )
 
     out = ap.add_argument_group("Output")
@@ -258,6 +264,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             speech_pad_ms=args.speech_pad_ms,
             backend=args.vad_backend,
             tensorrt_engine_path=args.vad_tensorrt_engine,
+            batch_size=args.vad_stage_batch_size,
             nested=False,
             resources=Resources(cpus=1.0, gpus=args.vad_gpus),
         )

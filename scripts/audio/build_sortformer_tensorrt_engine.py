@@ -65,7 +65,7 @@ def _profile_shape(  # noqa: PLR0913
     return tuple(dimensions)
 
 
-def _export_onnx(model_path: Path, onnx_path: Path) -> None:
+def _export_onnx(model_path: Path, onnx_path: Path):  # noqa: ANN202
     import torch
     from nemo.collections.asr.models import SortformerEncLabelModel
 
@@ -207,9 +207,49 @@ def _export_onnx(model_path: Path, onnx_path: Path) -> None:
     exported = onnx.load(str(onnx_path))
     onnx.checker.check_model(exported)
     print(f"SORTFORMER_ONNX_EXPORT_PASSED path={onnx_path}")
+    return graph, input_example
 
 
-def _build_engine(
+def _validate_tensorrt_engine(engine_path: Path, graph, input_example, *, precision: str) -> None:  # noqa: ANN001
+    """Execute the built engine and compare all neural graph outputs."""
+    import torch
+
+    from nemo_curator.utils.tensorrt_session import TensorRTSession
+
+    names = ["chunk", "chunk_lengths", "spkcache", "spkcache_lengths", "fifo", "fifo_lengths"]
+    output_names = ["predictions", "pred_lengths", "chunk_embs", "chunk_emb_lengths"]
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        # Match the builder's true-FP32 configuration. PyTorch leaves cuDNN
+        # TF32 enabled independently of matmul precision on H100.
+        torch.backends.cudnn.allow_tf32 = precision != "fp32"
+        with torch.inference_mode():
+            expected = graph(*input_example)
+    finally:
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+    session = TensorRTSession(engine_path)
+    try:
+        actual = session.infer(dict(zip(names, input_example, strict=True)))
+        if precision == "fp32":
+            rtol, atol = 2e-3, 2e-4
+        else:
+            rtol, atol = 5e-2, 1e-2
+        for name, expected_tensor in zip(output_names, expected, strict=True):
+            if expected_tensor.dtype.is_floating_point:
+                difference = (actual[name] - expected_tensor).abs()
+                print(
+                    f"SORTFORMER_TENSORRT_PARITY name={name} "
+                    f"max_abs={difference.max().item():.8g} mean_abs={difference.mean().item():.8g}"
+                )
+                torch.testing.assert_close(actual[name], expected_tensor, rtol=rtol, atol=atol)
+            else:
+                torch.testing.assert_close(actual[name], expected_tensor)
+    finally:
+        session.close()
+    print(f"SORTFORMER_TENSORRT_PREFLIGHT_PASSED precision={precision} batch=4")
+
+
+def _build_engine(  # noqa: C901
     onnx_path: Path,
     engine_path: Path,
     args: argparse.Namespace,
@@ -237,7 +277,12 @@ def _build_engine(
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, args.workspace_gb * (1 << 30))
-    if args.precision == "fp16":
+    if args.precision == "fp32":
+        # TensorRT enables TF32 by default on H100. Diarization predictions are
+        # thresholded downstream, so the production FP32 engine must not
+        # silently use reduced-mantissa matmuls.
+        config.clear_flag(trt.BuilderFlag.TF32)
+    elif args.precision == "fp16":
         config.set_flag(trt.BuilderFlag.FP16)
     elif args.precision == "bf16":
         config.set_flag(trt.BuilderFlag.BF16)
@@ -289,12 +334,21 @@ def build(args: argparse.Namespace) -> None:
         message = f"Sortformer checkpoint not found: {model_path}"
         raise FileNotFoundError(message)
     if not args.skip_export:
-        _export_onnx(model_path, onnx_path)
+        graph_and_inputs = _export_onnx(model_path, onnx_path)
     elif not onnx_path.is_file():
         message = f"--skip-export was set but ONNX graph does not exist: {onnx_path}"
         raise FileNotFoundError(message)
+    else:
+        graph_and_inputs = None
 
     trt_version, profiles = _build_engine(onnx_path, engine_path, args)
+    if graph_and_inputs is not None:
+        _validate_tensorrt_engine(
+            engine_path,
+            graph_and_inputs[0],
+            graph_and_inputs[1],
+            precision=args.precision,
+        )
     metadata = {
         "model_path": str(model_path.resolve()),
         "model_sha256": _sha256(model_path),

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import time
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -198,6 +199,10 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             raise ValueError(msg)
         self._tensorrt_runner = None
 
+    def num_workers(self) -> int | None:
+        """Use one persistent TRT context; batching supplies GPU concurrency."""
+        return 1 if self.backend == "tensorrt" else None
+
     def setup_on_node(
         self, _node_info: NodeInfo | None = None, _worker_metadata: WorkerMetadata | None = None
     ) -> None:
@@ -264,6 +269,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
                 validate_metadata=self.validate_tensorrt_metadata,
             )
             self.diar_model.forward_streaming = self._tensorrt_runner.forward_streaming
+            self._install_diarize_forward_without_cache_flush()
             logger.info(f"Sortformer TensorRT backend loaded from {self.tensorrt_engine_path}")
             return
 
@@ -271,17 +277,21 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
 
-        if self.avoid_cuda_cache_flush and hasattr(self.diar_model, "_diarize_forward"):
-            model = self.diar_model
+        if self.avoid_cuda_cache_flush:
+            self._install_diarize_forward_without_cache_flush()
 
-            def _diarize_forward_without_cache_flush(batch: Sequence[torch.Tensor]) -> torch.Tensor:
-                # Keep allocator blocks reusable across both NeMo's forward path
-                # and this wrapper. Curator stage actors execute inference serially.
-                with torch.inference_mode(), self._cuda_cache_context():
-                    predictions = model.forward(audio_signal=batch[0], audio_signal_length=batch[1])
-                    return predictions.to("cpu")
+    def _install_diarize_forward_without_cache_flush(self) -> None:
+        """Retain TensorRT/PyTorch allocations across NeMo diarize microbatches."""
+        model = self.diar_model
+        if not hasattr(model, "_diarize_forward"):
+            return
 
-            model._diarize_forward = _diarize_forward_without_cache_flush
+        def _diarize_forward_without_cache_flush(batch: Sequence[torch.Tensor]) -> torch.Tensor:
+            with torch.inference_mode(), self._cuda_cache_context():
+                predictions = model.forward(audio_signal=batch[0], audio_signal_length=batch[1])
+                return predictions.to("cpu")
+
+        model._diarize_forward = _diarize_forward_without_cache_flush
 
     def _autocast_context(self) -> AbstractContextManager[Any]:
         if self.backend == "tensorrt" or self.precision == "fp32" or not torch.cuda.is_available():
@@ -295,7 +305,8 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     @contextmanager
     def _cuda_cache_context(self) -> Iterator[None]:
         """Optionally suppress NeMo's unconditional per-forward cache flush."""
-        if not self.avoid_cuda_cache_flush or not torch.cuda.is_available():
+        retain_cache = self.avoid_cuda_cache_flush or self.backend == "tensorrt"
+        if not retain_cache or not torch.cuda.is_available():
             yield
             return
 
@@ -382,7 +393,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         task.task_id = f"{task.task_id}_sortformer"
         return task
 
-    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:  # noqa: C901
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:  # noqa: C901, PLR0912
         """Run length-bucketed speaker diarization across multiple tasks.
 
         NeMo's ``diarize`` API performs its own micro-batching.  Sorting the
@@ -424,6 +435,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             groups.setdefault(("filepath", None), []).append((task, filepath, duration))
 
         results_by_task: dict[int, list[dict[str, Any]]] = {}
+        inference_start = time.perf_counter()
         for (mode, sample_rate), group in groups.items():
             ordered_group = sorted(group, key=lambda item: item[2]) if self.bucket_by_duration else group
             model_inputs = [item[1] for item in ordered_group]
@@ -433,6 +445,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             )
             for (task, _model_input, _duration), segments in zip(ordered_group, all_segments, strict=True):
                 results_by_task[id(task)] = segments
+        inference_seconds = time.perf_counter() - inference_start
 
         for task in to_process:
             self._apply_results(task, results_by_task[id(task)])
@@ -445,5 +458,12 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         for task in to_process:
             task.task_id = f"{task.task_id}_sortformer"
 
+        if self._tensorrt_runner is not None:
+            peak_memory_mib = torch.cuda.max_memory_allocated() / (1 << 20)
+            logger.info(
+                f"SORTFORMER_TRT_EXECUTED recordings={len(to_process)} "
+                f"calls={self._tensorrt_runner.inference_count} inference_seconds={inference_seconds:.3f} "
+                f"peak_cuda_memory_mib={peak_memory_mib:.1f}"
+            )
         logger.info(f"Sortformer: diarized {len(to_process)} samples")
         return tasks

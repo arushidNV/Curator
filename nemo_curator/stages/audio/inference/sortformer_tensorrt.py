@@ -175,3 +175,8 @@ class TensorRTSortformerRunner:
 
     def close(self) -> None:
         self.session.close()
+
+    @property
+    def inference_count(self) -> int:
+        """Number of TensorRT enqueues completed by this runner."""
+        return self.session.inference_count

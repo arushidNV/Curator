@@ -112,6 +112,10 @@ class TestWriteRttm:
         with pytest.raises(ValueError, match="tensorrt_engine_path is required"):
             InferenceSortformerStage(backend="tensorrt")
 
+    def test_tensorrt_backend_uses_one_persistent_worker(self) -> None:
+        stage = InferenceSortformerStage(backend="tensorrt", tensorrt_engine_path="sortformer.plan")
+        assert stage.num_workers() == 1
+
     @patch("nemo_curator.stages.audio.inference.sortformer_tensorrt.TensorRTSortformerRunner")
     def test_tensorrt_backend_replaces_only_streaming_forward(self, mock_runner_cls: MagicMock) -> None:
         mock_model = MagicMock()

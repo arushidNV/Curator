@@ -112,6 +112,7 @@ class TensorRTSession:
         self.max_cached_shapes_per_output = max_cached_shapes_per_output
         self._output_cache: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor] = {}
         self._shape_lru: defaultdict[str, deque[tuple[str, tuple[int, ...], torch.dtype]]] = defaultdict(deque)
+        self.inference_count = 0
 
     def _validate_input(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         if name not in self.input_names:
@@ -177,6 +178,7 @@ class TensorRTSession:
             if not self.context.execute_async_v3(self.stream.cuda_stream):
                 message = "TensorRT execute_async_v3 failed"
                 raise RuntimeError(message)
+            self.inference_count += 1
             for output in outputs.values():
                 output.record_stream(self.stream)
 
