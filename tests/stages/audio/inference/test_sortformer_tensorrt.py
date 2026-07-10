@@ -69,6 +69,8 @@ def test_forward_streaming_uses_engine_and_nemo_state_update() -> None:
     expected = torch.ones((batch_size, 2, 4))
     modules.streaming_update.return_value = (state, expected)
     modules.n_spk = 4
+    modules.chunk_len = 340
+    modules.subsampling_factor = 8
 
     model = SimpleNamespace(
         sortformer_modules=modules,

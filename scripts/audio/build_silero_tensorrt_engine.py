@@ -18,11 +18,65 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+
+def _specialize_16khz_model(model_bytes: bytes) -> bytes:
+    """Inline the official model's ``sr == 16000`` branch.
+
+    Riva's TensorRT Silero engine is fixed at 16 kHz and therefore has only
+    ``input`` and ``state`` inputs. Removing the top-level ONNX ``If`` avoids
+    TensorRT control-flow parsing and eliminates a scalar host input per call.
+    """
+    import onnx
+    from onnx import helper
+
+    model = onnx.load_model_from_string(model_bytes)
+    if_nodes = [node for node in model.graph.node if node.op_type == "If"]
+    input_names = {value.name for value in model.graph.input}
+    if len(if_nodes) != 1 or "sr" not in input_names:
+        message = "Expected the official Silero graph with one sample-rate If node"
+        raise ValueError(message)
+
+    branch = next(attribute.g for attribute in if_nodes[0].attribute if attribute.name == "then_branch")
+    outputs = list(model.graph.output)
+    if len(branch.output) != len(outputs):
+        message = "Silero 16 kHz branch output count does not match the wrapper graph"
+        raise ValueError(message)
+
+    nodes = [copy.deepcopy(node) for node in branch.node]
+    for branch_output, graph_output in zip(branch.output, outputs, strict=True):
+        nodes.append(
+            helper.make_node(
+                "Identity",
+                inputs=[branch_output.name],
+                outputs=[graph_output.name],
+                name=f"Expose_{graph_output.name}",
+            )
+        )
+
+    graph = helper.make_graph(
+        nodes,
+        "silero_vad_16khz_tensorrt",
+        [copy.deepcopy(value) for value in model.graph.input if value.name != "sr"],
+        [copy.deepcopy(value) for value in outputs],
+        initializer=[copy.deepcopy(value) for value in branch.initializer],
+        value_info=[copy.deepcopy(value) for value in branch.value_info],
+    )
+    specialized = helper.make_model(
+        graph,
+        opset_imports=[copy.deepcopy(value) for value in model.opset_import],
+        producer_name="nemo-curator-silero-tensorrt",
+    )
+    specialized.ir_version = model.ir_version
+    onnx.checker.check_model(specialized)
+    print("SILERO_16KHZ_SPECIALIZATION_PASSED inputs=input,state")
+    return specialized.SerializeToString()
 
 
 def _shape_for_batch(
@@ -61,7 +115,8 @@ def build_engine(args: argparse.Namespace) -> None:  # noqa: C901
     builder = trt.Builder(logger)
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     parser = trt.OnnxParser(network, logger)
-    if not parser.parse(onnx_path.read_bytes()):
+    specialized_model = _specialize_16khz_model(onnx_path.read_bytes())
+    if not parser.parse(specialized_model):
         errors = "\n".join(str(parser.get_error(index)) for index in range(parser.num_errors))
         message = f"Failed to parse {onnx_path}:\n{errors}"
         raise RuntimeError(message)

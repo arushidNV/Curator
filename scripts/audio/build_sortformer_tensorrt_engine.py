@@ -321,7 +321,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-batch", type=int, default=1)
     parser.add_argument("--opt-batch", type=int, default=8)
     parser.add_argument("--max-batch", type=int, default=16)
-    parser.add_argument("--min-chunk-frames", type=int, default=64)
+    parser.add_argument("--min-chunk-frames", type=int, default=1)
     parser.add_argument("--opt-chunk-frames", type=int, default=3048)
     parser.add_argument("--max-chunk-frames", type=int, default=4096)
     parser.add_argument("--opt-spkcache-frames", type=int, default=188)

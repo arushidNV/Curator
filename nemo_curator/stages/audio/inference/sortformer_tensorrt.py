@@ -120,7 +120,13 @@ class TensorRTSortformerRunner:
         )
         processed_signal_offset = torch.zeros((batch_size,), dtype=torch.long, device=self.model.device)
         subsampling_factor = self.model.encoder.subsampling_factor
-        max_prediction_frames = math.ceil(processed_signal.shape[2] / subsampling_factor)
+        expected_prediction_frames = math.ceil(processed_signal.shape[2] / subsampling_factor)
+        chunk_input_frames = modules.chunk_len * modules.subsampling_factor
+        num_chunks = math.ceil(processed_signal.shape[2] / chunk_input_frames)
+        # Convolutional subsampling and left/right context can add a rounding
+        # frame at chunk boundaries. Reserve a small deterministic cushion and
+        # return only frames actually written.
+        max_prediction_frames = expected_prediction_frames + 2 * num_chunks
         num_speakers = getattr(modules, "n_spk", 4)
         total_predictions = torch.empty(
             (batch_size, max_prediction_frames, num_speakers),
