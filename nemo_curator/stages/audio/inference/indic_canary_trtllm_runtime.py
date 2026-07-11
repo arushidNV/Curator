@@ -53,14 +53,29 @@ from string import punctuation
 from typing import Any
 
 import numpy as np
-import tensorrt as trt
-import tensorrt_llm
 import torch
 import torch.nn.functional as F  # noqa: N812
-from tensorrt_llm._utils import str_dtype_to_torch, trt_dtype_to_torch
-from tensorrt_llm.bindings import KVCacheType
-from tensorrt_llm.runtime import ModelRunnerCpp
-from tensorrt_llm.runtime.session import Session, TensorInfo
+
+try:
+    import tensorrt as trt
+    import tensorrt_llm
+    from tensorrt_llm._utils import str_dtype_to_torch, trt_dtype_to_torch
+    from tensorrt_llm.bindings import KVCacheType
+    from tensorrt_llm.runtime import ModelRunnerCpp
+    from tensorrt_llm.runtime.session import Session, TensorInfo
+except ImportError as exc:  # pragma: no cover - runtime-only optional dependency
+    # tensorrt_llm is intentionally NOT in Curator's uv.lock: its
+    # cuda-python>=13 / transformers<4.52 / fsspec<=2024.9.0 pins conflict with
+    # the audio_cuda12 stack (cudf-cu12, nemo_toolkit), so it cannot be
+    # co-resolved. Install it on top of the synced venv instead.
+    _msg = (
+        "tensorrt_llm is required for the Indic Canary ASR runtime but is not "
+        "installed. Install it into the Curator venv (Linux x86_64 only), on top "
+        "of `uv sync --extra audio_cuda12`:\n"
+        "    uv pip install --index-strategy unsafe-best-match \\\n"
+        "        --extra-index-url https://pypi.nvidia.com tensorrt_llm==1.2.1"
+    )
+    raise ImportError(_msg) from exc
 
 CONSTANT = 1e-5
 SAMPLE_RATE = 16000

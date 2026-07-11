@@ -115,6 +115,8 @@ audio_cuda12 = [
     "nvidia-cudnn-cu12",
     "onnxruntime-gpu>=1.20.1,<1.24; platform_machine == 'x86_64'",
     "torchcodec",
+    "torchlibrosa",  # SED (PANNs CNN14) mel front end
+    "speechbrain",   # VoxLingua107 language-ID backend
 ]
 
 image_cpu = [
