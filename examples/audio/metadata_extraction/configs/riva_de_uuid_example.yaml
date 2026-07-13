@@ -1,9 +1,0 @@
-# Tarred metadata extraction when S3 uses a UUID dataset id (unknown corpus folder).
-# shard_key_prefix layout: <catalog-name>/<locale>/<dataset-id>
-- input_cfg:
-  - corpus: riva_de_batch
-    language: de
-    shard_key_prefix: riva_de_batch/de-DE/78e842f6-eac6-11ee-a616-03e701f9bfe1
-    manifest_filepath: s3://asr/datasets/final/de-DE/78e842f6-eac6-11ee-a616-03e701f9bfe1/sharded_manifests/manifest__OP_0..255_CL_.json
-    tarred_audio_filepaths: s3://asr/datasets/final/de-DE/78e842f6-eac6-11ee-a616-03e701f9bfe1/audio__OP_0..255_CL_.tar
-    type: nemo_tarred

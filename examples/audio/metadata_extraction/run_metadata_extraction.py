@@ -26,8 +26,7 @@ with a NeMo-compatible JSONL manifest (16kHz mono).
 - ``shard_key_prefix``: optional; sets output/checkpoint layout when ``corpus``
   is a catalog label or when the same dataset folder appears under multiple
   locales. Preferred layout: ``<catalog>/<locale>/<dataset-id>/...``. See
-  ``nemo_curator.stages.audio.io.shard_key`` and
-  ``examples/audio/metadata_extraction/configs/`` for examples.
+  ``nemo_curator.stages.audio.io.shard_key`` module docstring for examples.
 
 Pipeline:
     NeMoSpeechAudioReader (reads full audio from input_cfg)
