@@ -1,0 +1,8 @@
+# Spanish yt_harvested (tarred). shard_key_prefix: <catalog>/<locale>/.../<dataset-id>
+- input_cfg:
+  - corpus: yt_harvested
+    language: es
+    shard_key_prefix: yt_harvested/es/youtube/v1.1_wer10_whisper/yt_mixed_2024_12_18_083625
+    manifest_filepath: s3://asr/datasets/final/es/youtube/v1.1_wer10_whisper/yt_mixed_2024_12_18_083625/bucket_OP_1..8_CL_/sharded_manifests/manifest__OP_0..4095_CL_.json
+    tarred_audio_filepaths: s3://asr/datasets/final/es/youtube/v1.1_wer10_whisper/yt_mixed_2024_12_18_083625/bucket_OP_1..8_CL_/audio__OP_0..4095_CL_.tar
+    type: nemo_tarred

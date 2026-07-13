@@ -276,7 +276,15 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             source_duration = task.data.get("duration_sec") or task.data.get("duration")
             if source_duration is not None:
                 manifest_entry["source_duration"] = round(float(source_duration), 4)
-            for key in ("language", "language_confidence", "sed_events", "num_speakers", "corpus", "shard_id"):
+            for key in (
+                "language",
+                "language_confidence",
+                "sed_events",
+                "num_speakers",
+                "rttm_filepath",
+                "corpus",
+                "shard_id",
+            ):
                 if key in task.data:
                     manifest_entry[key] = task.data[key]
             return self._emit_manifest_only(task, manifest_entry, shard_subdir, input_id, shard_total)
@@ -351,6 +359,8 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             manifest_entry["sed_events"] = task.data["sed_events"]
         if "num_speakers" in task.data:
             manifest_entry["num_speakers"] = task.data["num_speakers"]
+        if "rttm_filepath" in task.data:
+            manifest_entry["rttm_filepath"] = task.data["rttm_filepath"]
 
         # Forward all remaining text/metadata fields from upstream stages.
         # Recording-level / internal keys are excluded so per-segment rows stay small
@@ -360,7 +370,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             self.waveform_key, self.sample_rate_key,
             "waveform", "sampling_rate", "sample_rate", "num_channels",
             "original_file", "audio_filepath", "start_ms", "end_ms",
-            "language", "language_confidence", "sed_events", "num_speakers",
+            "language", "language_confidence", "sed_events", "num_speakers", "rttm_filepath",
             "duration", "duration_sec", "original_sampling_rate", "original_channels",
             "corpus", "shard_id",
             "diar_segments", "session_name", "segment_num", "vad_empty", "read_error",

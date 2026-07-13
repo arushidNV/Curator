@@ -19,6 +19,16 @@ speaker diarization (Sortformer) on the full audio, segments with Silero VAD,
 runs SED and language ID on each segment, then writes output as opus files
 with a NeMo-compatible JSONL manifest (16kHz mono).
 
+``input_cfg`` YAML notes
+------------------------
+- Tarred data: use ``tarred_audio_filepaths`` (not ``audio_filepaths``) with
+  ``type: nemo_tarred``.
+- ``shard_key_prefix``: optional; sets output/checkpoint layout when ``corpus``
+  is a catalog label or when the same dataset folder appears under multiple
+  locales. Preferred layout: ``<catalog>/<locale>/<dataset-id>/...``. See
+  ``nemo_curator.stages.audio.io.shard_key`` and
+  ``examples/audio/metadata_extraction/configs/`` for examples.
+
 Pipeline:
     NeMoSpeechAudioReader (reads full audio from input_cfg)
         -> MonoDownsampleStage (mono + resample, stores original SR/channels)
