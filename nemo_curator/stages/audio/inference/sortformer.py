@@ -147,6 +147,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     spkcache_update_period: int = 300
     spkcache_len: int = 188
     inference_batch_size: int = 1
+    xenna_num_workers: int | None = None
     name: str = "Sortformer_inference"
     batch_size: int = 8
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0, gpu_memory_gb=8.0))
@@ -211,7 +212,12 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             out.append(self.diar_segments_key)
         return ["data"], out
 
-    def _diarize(self, audio: list[np.ndarray] | list[str], sample_rate: int | None = None) -> list[list[dict[str, Any]]]:
+    def num_workers(self) -> int:
+        return self.xenna_num_workers
+
+    def _diarize(
+        self, audio: list[np.ndarray] | list[str], sample_rate: int | None = None
+    ) -> list[list[dict[str, Any]]]:
         """Run Sortformer diarization on a list of audio inputs.
 
         Accepts either file paths or numpy arrays (with sample_rate).
@@ -257,7 +263,9 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         else:
             filepath = task.data.get(self.filepath_key)
             if filepath is None:
-                msg = f"Sortformer: neither '{self.waveform_key}' nor '{self.filepath_key}' found in task {task.task_id}"
+                msg = (
+                    f"Sortformer: neither '{self.waveform_key}' nor '{self.filepath_key}' found in task {task.task_id}"
+                )
                 raise ValueError(msg)
             segments = self._diarize([filepath])[0]
 

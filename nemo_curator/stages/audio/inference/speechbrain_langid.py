@@ -21,6 +21,8 @@ See: https://huggingface.co/speechbrain/lang-id-voxlingua107-ecapa
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -51,7 +53,10 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
 
     name: str = "SpeechBrainLangID"
     source: str = "speechbrain/lang-id-voxlingua107-ecapa"
-    savedir: str = "/tmp/speechbrain_langid"
+    # Model cache root; a per-actor subdir is appended in setup(). Derived from the
+    # system temp dir (not a hardcoded /tmp literal) so ruff S108 stays clean.
+    savedir: str = field(default_factory=lambda: os.path.join(tempfile.gettempdir(), "speechbrain_langid"))
+    batch_size: int = 32
 
     _classifier: Any = field(default=None, init=False, repr=False)
 
@@ -60,17 +65,30 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
         _node_info: NodeInfo | None = None,
         _worker_metadata: WorkerMetadata | None = None,
     ) -> None:
-        pass
+        # Pre-fetch the model once per node so the per-actor setup() below is a HF
+        # cache hit instead of N concurrent downloads. Best-effort: if it fails
+        # (e.g. offline / non-HF source), actors still fetch individually in setup().
+        try:
+            from huggingface_hub import snapshot_download
+
+            snapshot_download(repo_id=self.source)
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"SpeechBrainLangID: could not pre-cache {self.source} on node ({exc})")
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         if self._classifier is not None:
             return
         from speechbrain.inference.classifiers import EncoderClassifier
 
-        logger.info(f"SpeechBrainLangID: loading model from {self.source}")
+        # Isolate savedir per actor. SpeechBrain's fetch into a shared savedir is NOT
+        # concurrency-safe: co-located actors race on the same symlinks and one reads a
+        # half-populated dir -> FileNotFoundError: <savedir>/hyperparams.yaml. A per-PID
+        # savedir removes the race; the node-level pre-fetch keeps each copy a cache hit.
+        savedir = os.path.join(self.savedir, f"actor_{os.getpid()}")
+        logger.info(f"SpeechBrainLangID: loading model from {self.source} (savedir={savedir})")
         self._classifier = EncoderClassifier.from_hparams(
             source=self.source,
-            savedir=self.savedir,
+            savedir=savedir,
             run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
         )
         logger.info("SpeechBrainLangID: model ready")
@@ -108,7 +126,13 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
             batch_tensor[j, : len(sig)] = sig
         wav_lens = torch.tensor([length / max_len for length in audio_lengths])
 
-        _out_prob, score, _index, label = self._classifier.classify_batch(batch_tensor, wav_lens)
+        # inference_mode is essential here: from_hparams only sets .eval() (dropout/BN),
+        # which does NOT stop autograd. Without this, SpeechBrain's classify_batch builds
+        # a full graph and keeps every activation alive for the whole ECAPA-TDNN forward,
+        # inflating peak GPU memory ~2-3x — the usual cause of OOM on long (up to 40s) VAD
+        # segments, especially with multiple actors packed per GPU.
+        with torch.inference_mode():
+            _out_prob, score, _index, label = self._classifier.classify_batch(batch_tensor, wav_lens)
 
         # The model's final layer is Softmax(apply_log=True), so `score` is a log-probability
         # (<= 0). Exponentiate to a linear 0-1 confidence.
