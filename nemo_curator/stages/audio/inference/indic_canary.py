@@ -58,13 +58,15 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
 _TARGET_SR = 16000
-# Encoder engines are built for a 30-second window; clip anything longer.
-_MAX_SAMPLES = 30 * _TARGET_SR
-_MIN_SAMPLES = 3 * _TARGET_SR
+# Encoder engines are built for a 40-second window; clip anything longer. Both
+# bounds are configurable (see IndicCanaryTRTLLMASR / InferenceIndicCanaryStage);
+# these are just the defaults.
+_DEFAULT_MAX_DURATION_SEC = 40.0
+_DEFAULT_MIN_DURATION_SEC = 3.0
 # `per_feature` normalization computes std over the valid frames; a single mel
 # frame makes torch.std() return NaN and raises inside the preprocessor. Floor the
 # reported valid duration so degenerate/near-empty clips (< ~10 ms) still yield
-# several frames. The buffer is already zero-padded to _MIN_SAMPLES, so this only
+# several frames. The buffer is already zero-padded to min_samples, so this only
 # spans padding and produces an empty transcription instead of crashing the batch.
 _MIN_DURATION_SAMPLES = 400  # 25 ms @ 16 kHz -> ~3 mel frames
 
@@ -84,11 +86,17 @@ class IndicCanaryTRTLLMASR(ModelInterface):
         num_beams: int = 4,
         max_new_tokens: int = 246,
         pnc: bool = False,
+        max_duration_sec: float = _DEFAULT_MAX_DURATION_SEC,
+        min_duration_sec: float = _DEFAULT_MIN_DURATION_SEC,
     ):
         self.engine_dir = engine_dir
         self.num_beams = num_beams
         self.max_new_tokens = max_new_tokens
         self.pnc = pnc
+        # Window bounds in samples. max clips overly long clips to the encoder's
+        # build-time window; min sets the floor the batch is zero-padded up to.
+        self.max_samples = int(max_duration_sec * _TARGET_SR)
+        self.min_samples = int(min_duration_sec * _TARGET_SR)
         self._model: Any = None
 
     @property
@@ -181,7 +189,7 @@ class IndicCanaryTRTLLMASR(ModelInterface):
             wav = wav.reshape(-1)
             if int(sr) != _TARGET_SR:
                 wav = AF.resample(wav, orig_freq=int(sr), new_freq=_TARGET_SR)
-            wav = wav[:_MAX_SAMPLES]
+            wav = wav[: self.max_samples]
             prepared.append(wav)
             lengths.append(int(wav.shape[0]))
             langs_norm.append(self._normalize_lang(lang) or lang)
@@ -193,7 +201,7 @@ class IndicCanaryTRTLLMASR(ModelInterface):
             end = start + max_bs
             chunk = prepared[start:end]
             chunk_lengths = lengths[start:end]
-            pad_len = min(max(*chunk_lengths, _MIN_SAMPLES), _MAX_SAMPLES)
+            pad_len = min(max(*chunk_lengths, self.min_samples), self.max_samples)
             padded = [pad_or_trim(w, pad_len) for w in chunk]
             durations = [min(max(length, _MIN_DURATION_SAMPLES), pad_len) for length in chunk_lengths]
             prompts_cfg = [self._prompt_cfg(langs_norm[i]) for i in range(start, end) if i < len(langs_norm)]
@@ -225,6 +233,10 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
         num_beams: Decoder beam width (build engine with matching ``max_beam_width``).
         max_new_tokens: Max generated tokens (clamped to the engine's seq budget).
         pnc: Request punctuation & capitalization in the Canary control prompt.
+        max_duration_sec: Upper bound of the audio window in seconds; longer clips
+            are clipped. Should not exceed the encoder engine's build-time window.
+        min_duration_sec: Lower bound in seconds; shorter clips are zero-padded up
+            to this length before inference.
         source_lang_key: Task key holding the per-sample ISO language code.
         keep_waveform: When True the waveform is left on the task for a later stage.
     """
@@ -234,6 +246,8 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
     num_beams: int = 4
     max_new_tokens: int = 246
     pnc: bool = False
+    max_duration_sec: float = _DEFAULT_MAX_DURATION_SEC
+    min_duration_sec: float = _DEFAULT_MIN_DURATION_SEC
     source_lang_key: str = "source_lang"
     waveform_key: str = "waveform"
     sample_rate_key: str = "sampling_rate"
@@ -261,6 +275,8 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
             num_beams=self.num_beams,
             max_new_tokens=self.max_new_tokens,
             pnc=self.pnc,
+            max_duration_sec=self.max_duration_sec,
+            min_duration_sec=self.min_duration_sec,
         )
 
     def setup_on_node(
