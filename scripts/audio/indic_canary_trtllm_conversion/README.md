@@ -103,8 +103,8 @@ python build_engine.py \
   --dtype bfloat16 \
   --max_batch_size 8 \
   --max_beam_width 4 \
-  --max_feat_len 3001 \
-  --max_output_tokens 246 \
+  --max_feat_len 4001 \
+  --max_output_tokens 374 \
   --max_prompt_tokens 10
 ```
 
@@ -125,10 +125,10 @@ everything the runtime needs. On success it prints
 
 Two values are derived automatically so they stay consistent:
 
-- `max_seq_len = max_prompt_tokens + max_output_tokens` (default `256`, the
-  recommended capacity for ~30s audio — a 128-token engine truncates long Hindi).
+- `max_seq_len = max_prompt_tokens + max_output_tokens` (default `384`, the
+  recommended capacity for ~40s audio — a 128-token engine truncates long Hindi).
 - `max_encoder_input_len = 1 + max_feat_len / 8` (8 = Conformer subsampling), i.e.
-  `376` for the default `max_feat_len`.
+  `501` for the default `max_feat_len` (`4001` ~= 40s).
 
 ## Output layout
 
@@ -154,8 +154,8 @@ engine_dir/
 | `--dtype` | `bfloat16` | Engine precision (`float16` or `bfloat16`). |
 | `--max_batch_size` | `8` | Engine max batch size. |
 | `--max_beam_width` | `4` | Decoder beam width; must be **>=** inference `--num_beams`. |
-| `--max_feat_len` | `3001` | Max audio duration(ms)/10ms window shift (~30s). |
-| `--max_output_tokens` | `246` | Max generated tokens. |
+| `--max_feat_len` | `4001` | Max audio duration(ms)/10ms window shift (~40s). |
+| `--max_output_tokens` | `374` | Max generated tokens (`374` + `10` prompt = `384` seq len, ~40s). |
 | `--max_prompt_tokens` | `10` | Canary2 control-prompt length. |
 
 ## Using the engine in Curator
@@ -165,8 +165,9 @@ from nemo_curator.stages.audio.inference.indic_canary import InferenceIndicCanar
 
 stage = InferenceIndicCanaryStage(
     engine_dir="/models/indic_canary/engine_bfloat16",
-    num_beams=4,          # must be <= --max_beam_width used at build time
-    max_new_tokens=246,
+    num_beams=4,             # must be <= --max_beam_width used at build time
+    max_new_tokens=374,      # must be <= --max_output_tokens used at build time
+    max_duration_sec=40.0,   # match the encoder window the engine was built for (--max_feat_len 4001)
 )
 ```
 

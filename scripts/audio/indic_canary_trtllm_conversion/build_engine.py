@@ -275,14 +275,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max_feat_len",
         type=int,
-        default=3001,
-        help="Max audio duration(ms)/10ms window shift. Default 3001 ~= 30s.",
+        default=4001,
+        help="Max audio duration(ms)/10ms window shift. Default 4001 ~= 40s.",
     )
     parser.add_argument(
         "--max_output_tokens",
         type=int,
-        default=246,
-        help="Max generated tokens. 246 + 10 prompt = 256 seq len (recommended for ~30s audio).",
+        default=374,
+        help="Max generated tokens. 374 + 10 prompt = 384 seq len (recommended for ~40s audio).",
     )
     parser.add_argument(
         "--max_prompt_tokens",
