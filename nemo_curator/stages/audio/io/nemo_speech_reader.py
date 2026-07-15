@@ -390,6 +390,12 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         max_io_threads: Maximum number of concurrent I/O threads for
             loading audio files in ``process_batch``. Only applies to
             single-entry (non-tarred) tasks. Defaults to 8.
+        resampled_output_dir: If set, write resampled 16 kHz mono WAV files
+            to this directory. The output filename matches the input stem
+            with a ``.wav`` extension.
+        keep_waveform: Whether to pass the waveform array to the next stage
+            in the task data. Defaults to True. Set to False when downstream
+            stages only need the resampled file path.
     """
 
     name: str = "nemo_speech_reader"
@@ -398,12 +404,41 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     # Max shards read in parallel. Caps in-flight waveforms so the object store
     # doesn't overflow (without it, Ray launches up to one reader task per CPU).
     read_concurrency: int = 2
+    resampled_output_dir: str | None = None
+    keep_waveform: bool = True
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], ["waveform", "sampling_rate", "corpus", "num_channels"]
+        cols = ["sampling_rate", "corpus", "num_channels", "resampled_audio_filepath"]
+        if self.keep_waveform:
+            cols.insert(0, "waveform")
+        return ["data"], cols
+
+    def setup_on_node(
+        self,
+        _node_info: Any = None,  # noqa: ANN401
+        _worker_metadata: Any = None,  # noqa: ANN401
+    ) -> None:
+        """Create the resampled output directory once per node."""
+        if self.resampled_output_dir:
+            os.makedirs(self.resampled_output_dir, exist_ok=True)
+
+    def _write_resampled_wav(self, audio: np.ndarray, sr: int, source_path: str) -> str:
+        """Resample to _TARGET_SR if needed and write a mono WAV file. Returns the output path."""
+        import soundfile as sf
+
+        if sr != _TARGET_SR:
+            import librosa
+
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=_TARGET_SR)
+            sr = _TARGET_SR
+
+        stem = os.path.splitext(os.path.basename(source_path))[0]
+        out_path = os.path.join(self.resampled_output_dir, f"{stem}.wav")
+        sf.write(out_path, audio, sr, subtype="PCM_16")
+        return out_path
 
     def ray_stage_spec(self) -> dict[str, Any]:
         # Fan out AudioTask outputs into 1-row blocks for parallel downstream GPU
@@ -664,7 +699,6 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
         entry_data.update(
             {
-                "waveform": audio,
                 "sampling_rate": sr,
                 "sample_rate": sr,
                 "duration": duration,
@@ -673,12 +707,69 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 "audio_filepath": audio_path,
             }
         )
+
+        if self.resampled_output_dir:
+            resampled_path = self._write_resampled_wav(audio, sr, audio_path)
+            entry_data["resampled_audio_filepath"] = resampled_path
+            entry_data["sampling_rate"] = _TARGET_SR
+            entry_data["sample_rate"] = _TARGET_SR
+
+        if self.keep_waveform:
+            entry_data["waveform"] = audio
+
         if language and "source_lang" not in entry_data:
             entry_data["source_lang"] = language
 
         shard_total = task.reader_config.get("shard_total", 0)
         metadata = {**task._metadata, "_shard_key": shard_key, "_shard_total": shard_total}
         return [AudioTask(task_id=task.task_id, dataset_name=corpus, data=entry_data, _metadata=metadata)]
+
+    def _build_cut_entry(self, cut: Any, corpus: str, language: str) -> dict[str, Any]:  # noqa: ANN401
+        """Decode a single cut and return an entry_data dict (or raise on failure)."""
+        audio = cut.load_audio().squeeze()
+        if audio.ndim > 1:
+            audio = audio.mean(axis=0)
+
+        target_sr = cut.recording.sampling_rate
+        if cut.duration > 0:
+            actual_sr = round(len(audio) / cut.duration)
+            if actual_sr != target_sr and actual_sr > 0:
+                import librosa
+
+                audio = librosa.resample(audio, orig_sr=actual_sr, target_sr=target_sr)
+
+        audio = np.asarray(audio, dtype=np.float32)
+        entry_data = dict(cut.custom) if cut.custom else {}
+        entry_data.update(
+            {
+                "sampling_rate": target_sr,
+                "sample_rate": target_sr,
+                "duration": cut.duration,
+                "num_channels": 1,
+                "corpus": corpus,
+            }
+        )
+
+        audio_filepath = ""
+        if cut.recording and cut.recording.sources:
+            src = cut.recording.sources[0].source
+            audio_filepath = src if isinstance(src, str) else cut.id
+
+        if self.resampled_output_dir:
+            source_name = audio_filepath or cut.id
+            resampled_path = self._write_resampled_wav(audio, target_sr, source_name)
+            entry_data["resampled_audio_filepath"] = resampled_path
+            entry_data["sampling_rate"] = _TARGET_SR
+            entry_data["sample_rate"] = _TARGET_SR
+
+        if self.keep_waveform:
+            entry_data["waveform"] = audio
+        if "audio_filepath" not in entry_data:
+            entry_data["audio_filepath"] = audio_filepath or cut.id
+        if language and "source_lang" not in entry_data:
+            entry_data["source_lang"] = language
+
+        return entry_data
 
     def _process_cutset(self, task: FileGroupTask) -> list[AudioTask]:
         """Load all cuts from a manifest/tar shard and return AudioTasks."""
@@ -698,42 +789,14 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         loaded = 0
         for cut in cutset:
             try:
-                audio = cut.load_audio().squeeze()
+                entry_data = self._build_cut_entry(cut, corpus, language)
             except Exception:  # noqa: BLE001
                 logger.warning(f"Skipping unreadable audio: {cut.id}")
                 continue
 
-            if audio.ndim > 1:
-                audio = audio.mean(axis=0)
-
-            target_sr = cut.recording.sampling_rate
-            if cut.duration > 0:
-                actual_sr = round(len(audio) / cut.duration)
-                if actual_sr != target_sr and actual_sr > 0:
-                    import librosa
-
-                    audio = librosa.resample(audio, orig_sr=actual_sr, target_sr=target_sr)
-
             loaded += 1
             if loaded % 100 == 0 or loaded == 1:
                 logger.info(f"  [{shard_key}] loaded {loaded}")
-
-            entry_data = dict(cut.custom) if cut.custom else {}
-            entry_data.update(
-                {
-                    "waveform": np.asarray(audio, dtype=np.float32),
-                    "sampling_rate": target_sr,
-                    "sample_rate": target_sr,
-                    "duration": cut.duration,
-                    "num_channels": 1,
-                    "corpus": corpus,
-                }
-            )
-            if "audio_filepath" not in entry_data and cut.recording and cut.recording.sources:
-                src = cut.recording.sources[0].source
-                entry_data["audio_filepath"] = src if isinstance(src, str) else cut.id
-            if language and "source_lang" not in entry_data:
-                entry_data["source_lang"] = language
 
             results.append(
                 AudioTask(
@@ -821,6 +884,12 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
         max_io_threads: Maximum concurrent threads for loading audio
             from S3/object storage. Higher values overlap more network
             latency but use more memory. Defaults to 8.
+        resampled_output_dir: If set, write resampled 16 kHz mono WAV files
+            to this directory. The output filename matches the input stem
+            with a ``.wav`` extension.
+        keep_waveform: Whether to pass the waveform array to the next stage
+            in the task data. Defaults to True. Set to False when downstream
+            stages only need the resampled file path on disk.
     """
 
     name: str = "nemo_speech_audio_reader"
@@ -831,6 +900,8 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
     output_dir: str | None = None
     max_io_threads: int = 8
     read_concurrency: int = 2
+    resampled_output_dir: str | None = None
+    keep_waveform: bool = True
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -845,7 +916,12 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
                 language_filter=self.language_filter,
                 output_dir=self.output_dir,
             ),
-            NeMoSpeechReaderStage(max_io_threads=self.max_io_threads, read_concurrency=self.read_concurrency),
+            NeMoSpeechReaderStage(
+                max_io_threads=self.max_io_threads,
+                read_concurrency=self.read_concurrency,
+                resampled_output_dir=self.resampled_output_dir,
+                keep_waveform=self.keep_waveform,
+            ),
         ]
 
     def inputs(self) -> tuple[list[str], list[str]]:

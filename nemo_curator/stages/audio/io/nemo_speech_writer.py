@@ -149,6 +149,9 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         target_sample_rate: Expected sample rate (default 16000).
         waveform_key: Task data key for audio waveform.
         sample_rate_key: Task data key for sample rate.
+        save_audio: If True (default), encode and save opus audio files to
+            the output directory. Set to False to write only the JSONL manifest
+            without producing audio files.
     """
 
     name: str = "nemo_speech_writer"
@@ -157,6 +160,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
     writer_concurrency: int = 1
+    save_audio: bool = True
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     _total_written: int = field(default=0, init=False, repr=False)
@@ -299,10 +303,13 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         waveform = task.data.get(self.waveform_key)
         sr = task.data.get(self.sample_rate_key, self.target_sample_rate)
 
-        if waveform is None or (hasattr(waveform, "__len__") and len(waveform) == 0):
+        has_waveform = waveform is not None and not (hasattr(waveform, "__len__") and len(waveform) == 0)
+
+        if not has_waveform and self.save_audio:
             return FileGroupTask(task_id=task.task_id, dataset_name=task.dataset_name, data=[])
 
-        waveform = self._ensure_numpy(waveform)
+        if has_waveform:
+            waveform = self._ensure_numpy(waveform)
 
         # Derive filename from the original audio path, preserving directory structure
         # so distinct recordings that share a basename across dirs don't collide.
@@ -317,13 +324,13 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         segment_dir = os.path.join(self.output_dir, shard_subdir)
         os.makedirs(segment_dir, exist_ok=True)
 
-        # Write opus (already at target SR from upstream ResampleStage), then manifest.
-        opus_bytes = self._encode_opus(waveform, sr)
         out_path = os.path.join(segment_dir, filename)
-        _write_opus_atomic(out_path, opus_bytes)
+        if self.save_audio and has_waveform:
+            opus_bytes = self._encode_opus(waveform, sr)
+            _write_opus_atomic(out_path, opus_bytes)
 
         # Build manifest entry
-        duration = task.data.get("duration_sec") or (len(waveform) / sr if sr > 0 else 0)
+        duration = task.data.get("duration_sec") or (len(waveform) / sr if has_waveform and sr > 0 else 0)
         original_sr = task.data.get("original_sampling_rate", sr)
         original_channels = task.data.get("original_channels", 1)
         rel_path = os.path.join(shard_subdir, filename) if shard_subdir else filename
@@ -357,13 +364,31 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         # and accurate: e.g. diar_segments is the whole recording's diarization and
         # must NOT be copied into every clip row (O(N*M) bloat + misleading metadata).
         _INTERNAL_KEYS = {
-            self.waveform_key, self.sample_rate_key,
-            "waveform", "sampling_rate", "sample_rate", "num_channels",
-            "original_file", "audio_filepath", "start_ms", "end_ms",
-            "language", "language_confidence", "sed_events", "num_speakers",
-            "duration", "duration_sec", "original_sampling_rate", "original_channels",
-            "corpus", "shard_id",
-            "diar_segments", "session_name", "segment_num", "vad_empty", "read_error",
+            self.waveform_key,
+            self.sample_rate_key,
+            "waveform",
+            "sampling_rate",
+            "sample_rate",
+            "num_channels",
+            "original_file",
+            "audio_filepath",
+            "start_ms",
+            "end_ms",
+            "language",
+            "language_confidence",
+            "sed_events",
+            "num_speakers",
+            "duration",
+            "duration_sec",
+            "original_sampling_rate",
+            "original_channels",
+            "corpus",
+            "shard_id",
+            "diar_segments",
+            "session_name",
+            "segment_num",
+            "vad_empty",
+            "read_error",
         }
         for key, value in task.data.items():
             if key not in _INTERNAL_KEYS and key not in manifest_entry:

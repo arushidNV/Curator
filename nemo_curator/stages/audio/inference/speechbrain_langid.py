@@ -53,8 +53,6 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
 
     name: str = "SpeechBrainLangID"
     source: str = "speechbrain/lang-id-voxlingua107-ecapa"
-    # Model cache root; a per-actor subdir is appended in setup(). Derived from the
-    # system temp dir (not a hardcoded /tmp literal) so ruff S108 stays clean.
     savedir: str = field(default_factory=lambda: os.path.join(tempfile.gettempdir(), "speechbrain_langid"))
     batch_size: int = 32
 
