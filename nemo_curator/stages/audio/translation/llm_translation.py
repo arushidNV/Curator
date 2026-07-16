@@ -270,7 +270,7 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             kv_cache_dtype=self.kv_cache_dtype,
             enforce_eager=enforce_eager,
             gdn_prefill_backend="triton",
-            enable_expert_parallel=True,
+            enable_expert_parallel=False,
             seed=self.seed,
             **async_kwargs,
         )
