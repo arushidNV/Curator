@@ -108,7 +108,7 @@ class DirectionalShardedWriterStage(ProcessingStage[AudioTask, AudioTask]):
     # Group rows per (shard, direction) handle and do one open+append+close per
     # group instead of one per row, lifting the per-row fsync ceiling on
     # networked/parallel filesystems (e.g. Lustre).
-    batch_size: int = 256
+    batch_size: int = 256*16
 
     # Rows written per "{shard_key}_{src}-{tgt}" handle key.
     _seen_counts: dict[str, int] = field(default_factory=dict, init=False, repr=False)

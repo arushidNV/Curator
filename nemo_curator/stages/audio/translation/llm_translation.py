@@ -269,6 +269,8 @@ class LLMTranslationStage(ProcessingStage[AudioTask, AudioTask]):
             prefix_caching_hash_algo="xxhash",
             kv_cache_dtype=self.kv_cache_dtype,
             enforce_eager=enforce_eager,
+            gdn_prefill_backend="triton",
+            enable_expert_parallel=True,
             seed=self.seed,
             **async_kwargs,
         )
