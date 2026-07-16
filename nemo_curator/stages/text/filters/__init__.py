@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .bitext import BitextFilter, BitextScoreFilter, LengthRatioFilter
 from .doc_filter import DocumentFilter
+from .qe import COMETQEModel, PyMarianQEModel, QEModel, QualityEstimationFilter
 from .score_filter import Filter, Score, ScoreFilter
 
 __all__ = [
+    "BitextFilter",
+    "BitextScoreFilter",
+    "COMETQEModel",
     "DocumentFilter",
     "Filter",
+    "LengthRatioFilter",
+    "PyMarianQEModel",
+    "QEModel",
+    "QualityEstimationFilter",
     "Score",
     "ScoreFilter",
 ]

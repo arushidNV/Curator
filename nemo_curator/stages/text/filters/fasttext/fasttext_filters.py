@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import os
 
-import fasttext
 import numpy as np
 
 from nemo_curator.stages.text.filters.doc_filter import DocumentFilter
@@ -37,6 +37,8 @@ class FastTextQualityFilter(DocumentFilter):
             raise FileNotFoundError(msg)
 
     def load_model(self) -> None:
+        import fasttext
+
         self._fasttext_quality_filter_model = fasttext.load_model(self._model_path)
 
     def score_document(self, text: str) -> float:
@@ -56,12 +58,17 @@ class FastTextQualityFilter(DocumentFilter):
 
 
 class FastTextLangId(DocumentFilter):
-    def __init__(self, model_path: str | None = None, min_langid_score: float = 0.3):
+    def __init__(
+        self,
+        model_path: str | None = None,
+        min_langid_score: float = 0.3,
+        expected_lang: str | None = None,
+    ):
         if model_path is None:
             msg = "Must provide a valid path to a FastText model to identify languages with this filter"
             raise ValueError(msg)
         self._model_path = model_path
-        self._lang_code = None
+        self._lang_code = expected_lang.lower() if expected_lang is not None else None
         self._cutoff = min_langid_score
         self._name = "lang_id"
 
@@ -71,22 +78,26 @@ class FastTextLangId(DocumentFilter):
             raise FileNotFoundError(msg)
 
     def load_model(self) -> None:
+        import fasttext
+
         self._fasttext_langid_model = fasttext.load_model(self._model_path)
 
-    def score_document(self, text: str) -> list[float | str]:
+    def score_document(self, text: str) -> str:
         # See setup() function in modules/filter.py
         model = self._fasttext_langid_model
 
         pp = text.strip().replace("\n", " ")
         label, score = model.predict([pp], k=1)
         score = score[0][0].item()
-        lang_code = label[0][0][-2:].upper()
+        lang_code = label[0][0].removeprefix("__label__").lower()
 
         # Need to convert it to a string to allow backend conversions
         return str([score, lang_code])
 
-    def keep_document(self, score: float | str) -> bool:
+    def keep_document(self, score: list[float | str] | str) -> bool:
         if isinstance(score, str):
-            score = eval(score)  # noqa: S307
+            score = ast.literal_eval(score)
 
-        return score[0] >= self._cutoff
+        score_value = float(score[0])
+        lang_code = str(score[1]).lower()
+        return score_value >= self._cutoff and (self._lang_code is None or lang_code == self._lang_code)
