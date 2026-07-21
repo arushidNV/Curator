@@ -27,7 +27,7 @@ from nemo_curator.tasks import AudioTask
 
 
 class _Tokenizer:
-    token_id_offset: ClassVar[dict[str, int]] = {"hi": 0}
+    token_id_offset: ClassVar[dict[str, int]] = {"hi": 0, "ta": 0}
 
     def ids_to_text(self, ids: list[int]) -> str:
         table = {0: "a", 1: "b", 2: "c"}
@@ -64,8 +64,13 @@ class _CtcModel:
 
 
 class _RnntDecoder:
+    blank_idx = 3
+
     def __init__(self) -> None:
         self.batch_sizes: list[int] = []
+
+    def initialize_state(self, y: torch.Tensor) -> list[torch.Tensor]:
+        return [torch.zeros((1, y.shape[0], 1))]
 
     def predict(
         self,
@@ -80,10 +85,20 @@ class _RnntDecoder:
         self.batch_sizes.append(batch)
         return torch.zeros((batch, 1, 1)), [torch.zeros((1, batch, 1))]
 
+    @classmethod
+    def batch_replace_states_mask(
+        cls,
+        src_states: list[torch.Tensor],
+        dst_states: list[torch.Tensor],
+        mask: torch.Tensor,
+    ) -> None:
+        torch.where(mask.view(1, -1, 1), src_states[0], dst_states[0], out=dst_states[0])
+
 
 class _RnntJoint:
     def __init__(self) -> None:
         self.counts: dict[int, int] = {}
+        self.language_ids: list[list[str]] = []
 
     def enc(self, x: torch.Tensor) -> torch.Tensor:
         return x
@@ -98,7 +113,8 @@ class _RnntJoint:
         *,
         language_ids: list[str],
     ) -> torch.Tensor:
-        _ = (g, language_ids)
+        _ = g
+        self.language_ids.append(list(language_ids))
         batch = f.shape[0]
         log_probs = torch.full((batch, 1, 1, 3), -100.0)
         for idx in range(batch):
@@ -157,10 +173,11 @@ def test_rnnt_generate_decodes_active_rows_as_batches() -> None:
     asr = _asr(model, decode_mode="rnnt", batch_size=2)
     waveforms = [np.zeros(8, dtype=np.float32), np.zeros(8, dtype=np.float32)]
 
-    texts, _ = asr.generate(waveforms, [_TARGET_SR, _TARGET_SR], ["hi", "hi"])
+    texts, _ = asr.generate(waveforms, [_TARGET_SR, _TARGET_SR], ["hi", "ta"])
 
     assert [call["shape"][0] for call in model.calls] == [2]
-    assert 2 in model.decoder.batch_sizes
+    assert set(model.decoder.batch_sizes) == {2}
+    assert all(language_ids == ["hi", "ta"] for language_ids in model.joint.language_ids)
     assert texts == ["a", "b"]
 
 

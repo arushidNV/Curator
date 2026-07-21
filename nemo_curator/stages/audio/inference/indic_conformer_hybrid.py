@@ -697,99 +697,69 @@ class IndicConformerHybridASR(ModelInterface):
         return self._ids_to_text(hyp, lang)
 
     def _decode_rnnt_batch(self, encoded: Any, encoded_len: Any, lang_codes: list[str]) -> list[str]:
-        batch_size = len(lang_codes)
-        if batch_size == 0:
-            return []
-        joint = self._model.joint
-        decoder = self._model.decoder
-        blank = self._per_lang_classes
-        x = encoded.transpose(1, 2)  # [B, T, D_enc]
-        f_enc = joint.enc(x)  # [B, T, H]
-        enc_lens = [int(length.item()) for length in encoded_len]
-        max_time = max(enc_lens, default=0)
+        import torch
 
-        hyps: list[list[int]] = [[] for _ in range(batch_size)]
-        last_tokens: list[int | None] = [None] * batch_size
-        states: list[Any | None] = [None] * batch_size
+        with torch.inference_mode():
+            batch_size = len(lang_codes)
+            if batch_size == 0:
+                return []
+            joint = self._model.joint
+            decoder = self._model.decoder
+            blank = self._per_lang_classes
+            x = encoded.transpose(1, 2)  # [B, T, D_enc]
+            f_enc = joint.enc(x)  # [B, T, H]
+            max_time = int(encoded_len.max().item()) if encoded_len.numel() else 0
 
-        for t in range(max_time):
-            emitting = [idx for idx, enc_len in enumerate(enc_lens) if t < enc_len]
-            symbols = 0
-            while emitting and symbols < self.max_symbols_per_step:
-                next_emitting: list[int] = []
-                no_state = [idx for idx in emitting if last_tokens[idx] is None and states[idx] is None]
-                with_state = [idx for idx in emitting if idx not in no_state]
+            # The shared predictor uses the aggregate blank as its zero-valued SOS/padding token.
+            last_tokens = torch.full(
+                (batch_size, 1),
+                fill_value=decoder.blank_idx,
+                dtype=torch.long,
+                device=self._device,
+            )
+            state = decoder.initialize_state(f_enc)
+            emitted_tokens: list[Any] = []
+            emitted_masks: list[Any] = []
 
-                if no_state:
-                    g, new_state = decoder.predict(None, state=None, add_sos=False, batch_size=len(no_state))
-                    g = joint.pred(g)
-                    logp = joint.joint_after_projection(
-                        f_enc[no_state, t : t + 1, :],
-                        g,
-                        language_ids=[lang_codes[idx] for idx in no_state],
-                    )[:, 0, 0, :]
-                    pred_ids = logp.argmax(dim=-1).tolist()
-                    split_state = self._split_decoder_state(new_state, len(no_state))
-                    for idx, pred_id, state_i in zip(no_state, pred_ids, split_state, strict=True):
-                        token = int(pred_id)
-                        if token != blank:
-                            hyps[idx].append(token)
-                            last_tokens[idx] = token
-                            states[idx] = state_i
-                            next_emitting.append(idx)
-
-                if with_state:
-                    labels = torch.tensor(
-                        [[int(last_tokens[idx])] for idx in with_state],
-                        dtype=torch.long,
-                        device=self._device,
-                    )
-                    packed_state = self._pack_decoder_states([states[idx] for idx in with_state])
-                    g, new_state = decoder.predict(
-                        labels,
-                        state=packed_state,
+            for t in range(max_time):
+                finished = t >= encoded_len
+                symbols = 0
+                while symbols < self.max_symbols_per_step:
+                    g, next_state = decoder.predict(
+                        last_tokens,
+                        state=state,
                         add_sos=False,
-                        batch_size=len(with_state),
+                        batch_size=batch_size,
                     )
-                    g = joint.pred(g)
                     logp = joint.joint_after_projection(
-                        f_enc[with_state, t : t + 1, :],
-                        g,
-                        language_ids=[lang_codes[idx] for idx in with_state],
+                        f_enc[:, t : t + 1, :],
+                        joint.pred(g),
+                        language_ids=lang_codes,
                     )[:, 0, 0, :]
-                    pred_ids = logp.argmax(dim=-1).tolist()
-                    split_state = self._split_decoder_state(new_state, len(with_state))
-                    for idx, pred_id, state_i in zip(with_state, pred_ids, split_state, strict=True):
-                        token = int(pred_id)
-                        if token != blank:
-                            hyps[idx].append(token)
-                            last_tokens[idx] = token
-                            states[idx] = state_i
-                            next_emitting.append(idx)
+                    pred_ids = logp.argmax(dim=-1)
+                    emit = ~finished & pred_ids.ne(blank)
+                    if not emit.any():
+                        break
 
-                emitting = next_emitting
-                symbols += 1
+                    decoder.batch_replace_states_mask(
+                        src_states=state,
+                        dst_states=next_state,
+                        mask=~emit,
+                    )
+                    last_tokens = torch.where(emit.unsqueeze(1), pred_ids.unsqueeze(1), last_tokens)
+                    state = next_state
+                    emitted_tokens.append(pred_ids)
+                    emitted_masks.append(emit)
+                    finished = ~emit
+                    symbols += 1
 
-        return [self._ids_to_text(hyp, lang) for hyp, lang in zip(hyps, lang_codes, strict=True)]
-
-    @staticmethod
-    def _pack_decoder_states(states: list[Any | None]) -> Any:
-        first_state = next((state for state in states if state is not None), None)
-        if first_state is None:
-            return None
-        return [
-            torch.cat([state[layer_idx] for state in states], dim=1).contiguous()
-            for layer_idx in range(len(first_state))
-        ]
-
-    @staticmethod
-    def _split_decoder_state(state: Any, batch_size: int) -> list[Any | None]:
-        if state is None:
-            return [None] * batch_size
-        return [
-            [state_part[:, idx : idx + 1, :].contiguous() for state_part in state]
-            for idx in range(batch_size)
-        ]
+            hyps: list[list[int]] = [[] for _ in range(batch_size)]
+            if emitted_tokens:
+                tokens = torch.stack(emitted_tokens).cpu()
+                masks = torch.stack(emitted_masks).cpu()
+                for idx in range(batch_size):
+                    hyps[idx] = tokens[:, idx][masks[:, idx]].tolist()
+            return [self._ids_to_text(hyp, lang) for hyp, lang in zip(hyps, lang_codes, strict=True)]
 
 
 @dataclass
