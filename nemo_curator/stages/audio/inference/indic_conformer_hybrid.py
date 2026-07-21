@@ -288,12 +288,17 @@ class IndicConformerHybridASR(ModelInterface):
         max_symbols_per_step: int = 10,
         inference_batch_size: int = 128,
         tensorrt_engine_dir: str | None = None,
+        rnnt_precision: Literal["fp32", "fp16"] = "fp32",
     ):
+        if rnnt_precision not in {"fp32", "fp16"}:
+            msg = f"Unsupported IndicConformer RNNT precision: {rnnt_precision!r}"
+            raise ValueError(msg)
         self.model_id = model_id
         self.decode_mode = decode_mode
         self.max_symbols_per_step = max_symbols_per_step
         self.inference_batch_size = max(1, int(inference_batch_size))
         self.tensorrt_engine_dir = tensorrt_engine_dir
+        self.rnnt_precision = rnnt_precision
         self._model: Any = None
         self._device: Any = None
         self._num_langs: int = 0
@@ -396,6 +401,12 @@ class IndicConformerHybridASR(ModelInterface):
         self._model.to(self._device)
         self._model.eval()
         self._chunk_duration_sec = model_chunk_duration(self._model)
+        if self.rnnt_precision == "fp16":
+            if self._device.type != "cuda":
+                msg = "IndicConformer FP16 RNNT inference requires CUDA"
+                raise RuntimeError(msg)
+            self._model.decoder.to(dtype=torch.float16)
+            self._model.joint.to(dtype=torch.float16)
 
         if self._trt_metadata is not None:
             self._enable_tensorrt_encoder(engine_path)
@@ -668,7 +679,7 @@ class IndicConformerHybridASR(ModelInterface):
         joint = self._model.joint
         decoder = self._model.decoder
         blank = self._per_lang_classes
-        x = encoded.transpose(1, 2)  # [B, T, D_enc]
+        x = encoded.transpose(1, 2).to(dtype=next(joint.parameters()).dtype)  # [B, T, D_enc]
         f_enc = joint.enc(x)  # project encoder once: [B, T, H]
 
         last_token: int | None = None
@@ -706,7 +717,7 @@ class IndicConformerHybridASR(ModelInterface):
             joint = self._model.joint
             decoder = self._model.decoder
             blank = self._per_lang_classes
-            x = encoded.transpose(1, 2)  # [B, T, D_enc]
+            x = encoded.transpose(1, 2).to(dtype=next(joint.parameters()).dtype)  # [B, T, D_enc]
             f_enc = joint.enc(x)  # [B, T, H]
             max_time = int(encoded_len.max().item()) if encoded_len.numel() else 0
 
@@ -778,6 +789,8 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
             for batched inference through an optimized encoder bundle.
         tensorrt_engine_dir: Directory containing ``encoder.plan``, ``model.nemo``,
             and ``metadata.json``. Required when ``backend="tensorrt"``.
+        rnnt_precision: Precision for the RNNT prediction and joint networks.
+            Defaults to ``"fp32"``; ``"fp16"`` requires CUDA.
         inference_batch_size: Maximum NeMo inference batch size. When unset, uses
             ``batch_size``. TensorRT remains capped by the engine profile.
         source_lang_key: Task key holding the per-sample ISO language code.
@@ -789,6 +802,7 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
     decode_mode: Literal["ctc", "rnnt"] = "rnnt"
     backend: Literal["nemo", "tensorrt"] = "nemo"
     tensorrt_engine_dir: str | None = None
+    rnnt_precision: Literal["fp32", "fp16"] = "fp32"
     source_lang_key: str = "source_lang"
     waveform_key: str = "waveform"
     sample_rate_key: str = "sampling_rate"
@@ -805,6 +819,9 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
     def __post_init__(self) -> None:
         if self.backend not in {"nemo", "tensorrt"}:
             msg = f"Unsupported IndicConformer inference backend: {self.backend!r}"
+            raise ValueError(msg)
+        if self.rnnt_precision not in {"fp32", "fp16"}:
+            msg = f"Unsupported IndicConformer RNNT precision: {self.rnnt_precision!r}"
             raise ValueError(msg)
         if self.backend == "tensorrt" and not self.tensorrt_engine_dir:
             msg = "tensorrt_engine_dir is required when backend='tensorrt'"
@@ -824,6 +841,7 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
             model_id=self.model_id,
             decode_mode=self.decode_mode,
             tensorrt_engine_dir=self.tensorrt_engine_dir if self.backend == "tensorrt" else None,
+            rnnt_precision=self.rnnt_precision,
             inference_batch_size=(
                 self.batch_size if self.inference_batch_size is None else self.inference_batch_size
             ),

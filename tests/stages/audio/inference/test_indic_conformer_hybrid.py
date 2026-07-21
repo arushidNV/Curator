@@ -95,8 +95,10 @@ class _RnntDecoder:
         torch.where(mask.view(1, -1, 1), src_states[0], dst_states[0], out=dst_states[0])
 
 
-class _RnntJoint:
+class _RnntJoint(torch.nn.Module):
     def __init__(self) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(1, 1)
         self.counts: dict[int, int] = {}
         self.language_ids: list[list[str]] = []
 
@@ -194,6 +196,14 @@ def test_stage_passes_inference_batch_size_to_model_wrapper() -> None:
 
     assert default_model.inference_batch_size == 8
     assert model.inference_batch_size == 4
+
+
+def test_stage_passes_rnnt_precision_to_model_wrapper() -> None:
+    stage = InferenceIndicConformerHybridStage(model_id="dummy.nemo", rnnt_precision="fp16")
+
+    model = stage._create_model()
+
+    assert model.rnnt_precision == "fp16"
 
 
 def test_stage_process_batch_calls_generate_once_for_eligible_batch() -> None:

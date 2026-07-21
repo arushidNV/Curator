@@ -73,6 +73,12 @@ def test_stage_preserves_nemo_default() -> None:
     model = stage._create_model()
     assert stage.backend == "nemo"
     assert model.tensorrt_engine_dir is None
+    assert model.rnnt_precision == "fp32"
+
+
+def test_stage_rejects_unknown_rnnt_precision() -> None:
+    with pytest.raises(ValueError, match="RNNT precision"):
+        InferenceIndicConformerHybridStage(rnnt_precision="bf16")
 
 
 def test_stage_requires_engine_directory() -> None:
