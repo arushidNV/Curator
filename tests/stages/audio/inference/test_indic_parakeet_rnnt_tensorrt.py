@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -122,7 +123,8 @@ def test_tensorrt_wrapper_replaces_only_encoder(tmp_path: Path) -> None:
         cfg=OmegaConf.create(
             {
                 "encoder": {"feat_in": 80},
-                "preprocessor": {"sample_rate": 16000},
+                "preprocessor": {"sample_rate": 16000, "window_stride": 0.01},
+                "train_ds": {"max_duration": 20},
                 "joint": {"num_classes": 958},
                 "decoding": {"strategy": "greedy", "greedy": {}},
             }
@@ -135,6 +137,7 @@ def test_tensorrt_wrapper_replaces_only_encoder(tmp_path: Path) -> None:
     )
     wrapper.asr_model = model
     optimized_encoder = MagicMock()
+    optimized_encoder.max_input_shape.return_value = (16, 80, 3000)
 
     with (
         patch.object(NemoASRModel, "setup"),
@@ -153,6 +156,24 @@ def test_tensorrt_wrapper_replaces_only_encoder(tmp_path: Path) -> None:
     assert model.joint._vocab_size == 958
     model.to.assert_called_once_with(dtype=torch.float16)
     model.change_decoding_strategy.assert_called_once()
+    assert wrapper._chunk_duration_sec == 20.0
+
+
+def test_tensorrt_wrapper_chunks_long_audio_without_overlap(tmp_path: Path) -> None:
+    wrapper = TensorRTParakeetRNNTModel(_engine_bundle(tmp_path))
+    wrapper._chunk_duration_sec = 20.0
+    transcribe = MagicMock(return_value=["first", "second", "third"])
+    wrapper.asr_model = SimpleNamespace(transcribe=transcribe)
+    waveform = np.zeros(45 * 16000, dtype=np.float32)
+
+    texts = wrapper.transcribe_waveforms(
+        [waveform, np.array([], dtype=np.float32)],
+        [16000, 16000],
+    )
+
+    prepared = transcribe.call_args.args[0]
+    assert [chunk.shape[0] for chunk in prepared] == [20 * 16000, 20 * 16000, 5 * 16000]
+    assert texts == ["first second third", ""]
 
 
 def test_parakeet_stage_preserves_nemo_default() -> None:

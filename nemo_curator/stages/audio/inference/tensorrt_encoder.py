@@ -141,6 +141,14 @@ class TensorRTEncoderSession:
         self._engine = None
         self._runtime = None
 
+    def max_input_shape(self, name: str, profile_index: int = 0) -> tuple[int, ...]:
+        """Return an input tensor's maximum shape from the serialized engine profile."""
+        if name not in self.input_names:
+            msg = f"TensorRT encoder input not found: {name!r}"
+            raise KeyError(msg)
+        profile_shapes = self._engine.get_tensor_profile_shape(name, profile_index)
+        return tuple(int(dimension) for dimension in profile_shapes[2])
+
 
 class TensorRTEncoder(torch.nn.Module):
     """NeMo Conformer encoder adapter backed by a TensorRT session."""
@@ -179,3 +187,6 @@ class TensorRTEncoder(torch.nn.Module):
 
     def close(self) -> None:
         self.session.close()
+
+    def max_input_shape(self, name: str) -> tuple[int, ...]:
+        return self.session.max_input_shape(name)

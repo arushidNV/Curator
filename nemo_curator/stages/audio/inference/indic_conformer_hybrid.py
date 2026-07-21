@@ -69,6 +69,11 @@ from nemo.collections.asr.parts.mixins.mixins import ASRBPEMixin
 
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.models.base import ModelInterface
+from nemo_curator.stages.audio.inference.audio_chunking import (
+    merge_chunk_texts,
+    model_chunk_duration,
+    split_waveforms,
+)
 from nemo_curator.stages.audio.pipeline_utils import set_note
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
@@ -295,6 +300,7 @@ class IndicConformerHybridASR(ModelInterface):
         self._per_lang_classes: int = 0  # V / num_langs (blank index within a head)
         self._trt_encoder: Any = None
         self._trt_metadata: dict[str, Any] | None = None
+        self._chunk_duration_sec: float | None = None
 
     @property
     def model_id_names(self) -> list[str]:
@@ -389,6 +395,7 @@ class IndicConformerHybridASR(ModelInterface):
         self._model = nemo_asr.models.ASRModel.restore_from(nemo_path, map_location=self._device)
         self._model.to(self._device)
         self._model.eval()
+        self._chunk_duration_sec = model_chunk_duration(self._model)
 
         if self._trt_metadata is not None:
             self._enable_tensorrt_encoder(engine_path)
@@ -442,6 +449,8 @@ class IndicConformerHybridASR(ModelInterface):
             engine_path,
             subsampling_factor=int(metadata["subsampling_factor"]),
         )
+        max_feature_frames = self._trt_encoder.max_input_shape("audio_signal")[2]
+        self._chunk_duration_sec = model_chunk_duration(self._model, max_feature_frames)
         self._model.encoder = self._trt_encoder
         del encoder
         gc.collect()
@@ -458,6 +467,7 @@ class IndicConformerHybridASR(ModelInterface):
         self._model = None
         self._device = None
         self._trt_metadata = None
+        self._chunk_duration_sec = None
         gc.collect()
         try:
             torch.cuda.empty_cache()
@@ -478,6 +488,36 @@ class IndicConformerHybridASR(ModelInterface):
             msg = "Model not initialized. Call setup() first."
             raise RuntimeError(msg)
         mode = (decode_mode or self.decode_mode).lower()
+        if self._chunk_duration_sec is None:
+            msg = "IndicConformer chunk duration was not initialized from the model"
+            raise RuntimeError(msg)
+        if len(lang_codes) != len(waveforms):
+            msg = "waveforms and lang_codes must have the same length"
+            raise ValueError(msg)
+
+        chunks, chunk_sample_rates, owners = split_waveforms(
+            waveforms,
+            sample_rates,
+            self._chunk_duration_sec,
+        )
+        if not chunks:
+            return [""] * len(waveforms), list(lang_codes)
+        chunk_langs = [lang_codes[owner] for owner in owners]
+        chunk_texts, _ = self._generate_chunks(
+            chunks,
+            chunk_sample_rates,
+            chunk_langs,
+            mode,
+        )
+        return merge_chunk_texts(chunk_texts, owners, len(waveforms)), list(lang_codes)
+
+    def _generate_chunks(
+        self,
+        waveforms: list[np.ndarray],
+        sample_rates: list[int],
+        lang_codes: list[str],
+        mode: str,
+    ) -> tuple[list[str], list[str]]:
         if self._trt_encoder is not None:
             return self._generate_tensorrt(waveforms, sample_rates, lang_codes, mode)
 

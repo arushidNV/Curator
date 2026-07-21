@@ -19,13 +19,21 @@ from __future__ import annotations
 import gc
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from loguru import logger
 
 from nemo_curator.stages.audio.inference.asr_nemo import NemoASRModel
+from nemo_curator.stages.audio.inference.audio_chunking import (
+    merge_chunk_texts,
+    model_chunk_duration,
+    split_waveforms,
+)
 from nemo_curator.stages.audio.inference.tensorrt_encoder import TensorRTEncoder, TensorRTEncoderSession
+
+if TYPE_CHECKING:
+    import numpy as np
 
 _ENGINE_FILENAME = "encoder.plan"
 _METADATA_FILENAME = "metadata.json"
@@ -110,6 +118,7 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
         super().__init__(model_name=str(model_path), inference_batch_size=inference_batch_size)
         self._engine_path = engine_path
         self._trt_encoder: TensorRTParakeetEncoder | None = None
+        self._chunk_duration_sec: float | None = None
 
     def _disable_cuda_graphs(self) -> None:
         # This backend deliberately uses NeMo's batched CUDA-graph RNN-T decoder.
@@ -138,6 +147,8 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
             self._engine_path,
             subsampling_factor=int(self.metadata["subsampling_factor"]),
         )
+        max_feature_frames = self._trt_encoder.max_input_shape("audio_signal")[2]
+        self._chunk_duration_sec = model_chunk_duration(self.asr_model, max_feature_frames)
         self.asr_model.encoder = self._trt_encoder
         del original_encoder
         gc.collect()
@@ -209,8 +220,33 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
             model.cfg.decoding.greedy.use_cuda_graph_decoder = True
         model.change_decoding_strategy(model.cfg.decoding)
 
+    def transcribe_waveforms(
+        self,
+        waveforms: list[np.ndarray],
+        sample_rates: list[int],
+    ) -> list[str]:
+        if self.asr_model is None:
+            msg = "NeMo ASR model not loaded; call setup() first."
+            raise RuntimeError(msg)
+        if not waveforms:
+            return []
+        if self._chunk_duration_sec is None:
+            msg = "Indic Parakeet chunk duration was not initialized from the model"
+            raise RuntimeError(msg)
+
+        chunks, chunk_sample_rates, owners = split_waveforms(
+            waveforms,
+            sample_rates,
+            self._chunk_duration_sec,
+        )
+        if not chunks:
+            return [""] * len(waveforms)
+        chunk_texts = super().transcribe_waveforms(chunks, chunk_sample_rates)
+        return merge_chunk_texts(chunk_texts, owners, len(waveforms))
+
     def teardown(self) -> None:
         if self._trt_encoder is not None:
             self._trt_encoder.close()
             self._trt_encoder = None
+        self._chunk_duration_sec = None
         super().teardown()

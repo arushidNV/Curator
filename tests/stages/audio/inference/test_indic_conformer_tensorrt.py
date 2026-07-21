@@ -94,6 +94,7 @@ def test_tensorrt_path_batches_encoder_and_preserves_order() -> None:
     model._device = torch.device("cpu")
     model._trt_encoder = object()
     model._trt_metadata = _metadata()
+    model._chunk_duration_sec = 30.0
     encoder_batch_sizes: list[int] = []
 
     def preprocessor(*, input_signal: torch.Tensor, length: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -120,3 +121,22 @@ def test_tensorrt_path_batches_encoder_and_preserves_order() -> None:
     assert encoder_batch_sizes == [2, 1]
     assert texts == ["text-hi", "text-ta", "", "text-mr"]
     assert languages == ["hi", "ta", "bn", "mr"]
+
+
+def test_indic_conformer_chunks_and_merges_before_inference() -> None:
+    model = IndicConformerHybridASR("unused.nemo", decode_mode="ctc")
+    model._model = object()
+    model._chunk_duration_sec = 2.0
+    waveform = np.zeros(5, dtype=np.float32)
+
+    with patch.object(
+        model,
+        "_generate_chunks",
+        return_value=(["first", "second", "third"], ["hi", "hi", "hi"]),
+    ) as generate_chunks:
+        texts, languages = model.generate([waveform], [1], ["hi"])
+
+    chunks = generate_chunks.call_args.args[0]
+    assert [chunk.shape[0] for chunk in chunks] == [2, 2, 1]
+    assert texts == ["first second third"]
+    assert languages == ["hi"]
