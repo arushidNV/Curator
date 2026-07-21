@@ -321,6 +321,17 @@ class TestGenerateWaveformPrep:
         assert call["durations"][0] == _MAX_SAMPLES
         assert int(call["padded"][0].shape[0]) == _MAX_SAMPLES
 
+    def test_long_clip_warns_before_trimming(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        eng = _engine_for_generate()
+        warning = MagicMock()
+        monkeypatch.setattr(indic_canary_mod.logger, "warning", warning)
+        wav = np.zeros(40 * _TARGET_SR, dtype=np.float32)  # 40 s > 30 s window
+
+        eng.generate([wav], [_TARGET_SR], ["hi"])
+
+        warning.assert_called_once()
+        assert "truncating" in warning.call_args.args[0].lower()
+
     def test_resample_changes_sample_count(self) -> None:
         eng = _engine_for_generate()
         # 8 kHz, 1 s -> resampled to 16 kHz should roughly double the samples.

@@ -191,6 +191,12 @@ class IndicCanaryTRTLLMASR(ModelInterface):
             wav = wav.reshape(-1)
             if int(sr) != _TARGET_SR:
                 wav = AF.resample(wav, orig_freq=int(sr), new_freq=_TARGET_SR)
+            if wav.shape[0] > self.max_samples:
+                logger.warning(
+                    f"Audio clip is {wav.shape[0] / _TARGET_SR:.2f}s, longer than the "
+                    f"{self.max_samples / _TARGET_SR:.2f}s encoder window; truncating the remainder. "
+                    "Split long input with VAD before Indic Canary inference."
+                )
             wav = wav[: self.max_samples]
             prepared.append(wav)
             lengths.append(int(wav.shape[0]))
@@ -259,7 +265,7 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
     keep_waveform: bool = False
     num_workers_override: int | None = None
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
-    batch_size: int = 8
+    batch_size: int = 64
     _model: IndicCanaryTRTLLMASR | None = field(default=None, init=False, repr=False)
 
     def num_workers(self) -> int | None:

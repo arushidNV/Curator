@@ -101,10 +101,9 @@ python build_engine.py \
   --nemo_repo_path /path/to/NeMo \
   --engine_dir /models/indic_canary/engine_bfloat16 \
   --dtype bfloat16 \
-  --max_batch_size 8 \
+  --max_batch_size 64 \
   --max_beam_width 4 \
-  --max_feat_len 4001 \
-  --max_output_tokens 374 \
+  --max_audio_seconds 40 \
   --max_prompt_tokens 10
 ```
 
@@ -123,12 +122,17 @@ everything the runtime needs. On success it prints
 2. `conformer_onnx_trt.py --max_BS <bs> --max_feat_len <feat> <checkpoint_dir> <engine_dir>`
 3. `trtllm-build --checkpoint_dir <checkpoint_dir>/decoder --output_dir <engine_dir>/decoder ...`
 
-Two values are derived automatically so they stay consistent:
+Everything below is derived from the single `--max_audio_seconds` knob so the
+encoder and decoder budgets stay consistent:
 
-- `max_seq_len = max_prompt_tokens + max_output_tokens` (default `384`, the
-  recommended capacity for ~40s audio — a 128-token engine truncates long Hindi).
+- `max_feat_len = round(seconds * 100) + 1` (10 ms window shift → 100 frames/s),
+  i.e. `4001` for the default `40`s (`3001` for `30`s).
+- `max_output_tokens`: `~8 tokens/s + prompt`, rounded up to the next multiple of
+  `128`, minus the prompt. This reproduces the shipped engines — `30`s → `246`,
+  `40`s → `374` — and avoids the truncation a 128-token engine causes on long Hindi.
+- `max_seq_len = max_prompt_tokens + max_output_tokens` (default `384` at `40`s).
 - `max_encoder_input_len = 1 + max_feat_len / 8` (8 = Conformer subsampling), i.e.
-  `501` for the default `max_feat_len` (`4001` ~= 40s).
+  `501` at `40`s.
 
 ## Output layout
 
@@ -152,10 +156,9 @@ engine_dir/
 | `--model_name` | `nvidia/canary-1b-flash` | HF id, used when `--nemo_model_path` is omitted. |
 | `--nemo_repo_path` | – | Indic Canary NeMo fork checkout (prepended to `PYTHONPATH`). |
 | `--dtype` | `bfloat16` | Engine precision (`float16` or `bfloat16`). |
-| `--max_batch_size` | `8` | Engine max batch size. |
+| `--max_batch_size` | `64` | Engine max batch size. |
 | `--max_beam_width` | `4` | Decoder beam width; must be **>=** inference `--num_beams`. |
-| `--max_feat_len` | `4001` | Max audio duration(ms)/10ms window shift (~40s). |
-| `--max_output_tokens` | `374` | Max generated tokens (`374` + `10` prompt = `384` seq len, ~40s). |
+| `--max_audio_seconds` | `40` | Longest audio window (s); `max_feat_len` and `max_output_tokens` are derived from it. |
 | `--max_prompt_tokens` | `10` | Canary2 control-prompt length. |
 
 ## Using the engine in Curator
