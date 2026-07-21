@@ -19,12 +19,56 @@ import pytest
 import torch
 
 from nemo_curator.backends.utils import RayStageSpecKeys
+from nemo_curator.stages.audio.segmentation.silero_tensorrt import TensorRTSileroModel
 from nemo_curator.stages.audio.segmentation.vad_segmentation import VADSegmentationStage
+from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
 
 
 @pytest.mark.gpu
 class TestVADSegmentationStage:
+    @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.load_silero_vad")
+    def test_onnx_backend_loads_official_silero_model(self, mock_load_vad: MagicMock) -> None:
+        mock_model = MagicMock()
+        mock_load_vad.return_value = mock_model
+
+        stage = VADSegmentationStage(backend="onnx")
+        stage.setup()
+
+        mock_load_vad.assert_called_once_with(onnx=True, opset_version=16)
+        assert stage._device == torch.device("cpu")
+        mock_model.to.assert_not_called()
+
+    def test_rejects_unknown_backend(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported Silero backend"):
+            VADSegmentationStage(backend="openvino")  # type: ignore[arg-type]
+
+    def test_tensorrt_backend_requires_engine_path(self) -> None:
+        with pytest.raises(ValueError, match="tensorrt_engine_path is required"):
+            VADSegmentationStage(backend="tensorrt")
+
+    @patch("nemo_curator.stages.audio.segmentation.silero_tensorrt.TensorRTSileroModel")
+    @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.torch.cuda.is_available", return_value=True)
+    def test_tensorrt_backend_loads_persistent_gpu_model(
+        self,
+        mock_cuda: MagicMock,
+        mock_trt_model: MagicMock,
+    ) -> None:
+        assert mock_cuda.return_value is True
+        model = MagicMock()
+        mock_trt_model.return_value = model
+        stage = VADSegmentationStage(
+            backend="tensorrt",
+            tensorrt_engine_path="/models/silero.plan",
+            resources=Resources(cpus=1, gpus=1),
+        )
+
+        stage.setup()
+
+        mock_trt_model.assert_called_once_with("/models/silero.plan")
+        assert stage._vad_model is model
+        assert stage._device == torch.device("cuda")
+
     @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.get_speech_timestamps")
     @patch("nemo_curator.stages.audio.segmentation.vad_segmentation.load_silero_vad")
     def test_process_returns_segments(self, mock_load_vad: MagicMock, mock_get_ts: MagicMock) -> None:
@@ -277,9 +321,73 @@ class TestVADSegmentationStage:
         assert spec[RayStageSpecKeys.IS_FANOUT_STAGE] is True
 
     def test_pickling(self) -> None:
-        stage = VADSegmentationStage(min_duration_sec=2.0, threshold=0.6)
+        stage = VADSegmentationStage(min_duration_sec=2.0, threshold=0.6, backend="onnx")
         pickled = pickle.dumps(stage)
         restored = pickle.loads(pickled)  # noqa: S301
         assert restored.min_duration_sec == 2.0
         assert restored.threshold == 0.6
+        assert restored.backend == "onnx"
         assert restored._vad_model is None
+
+
+class _FakeSession:
+    device = torch.device("cpu")
+
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
+    def infer(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        state = inputs["state"]
+        self.batch_sizes.append(state.shape[0])
+        return {"output": state[:, 0, :1] + 0.25, "stateN": state + 1}
+
+
+def test_tensorrt_scheduler_compacts_finished_recordings() -> None:
+    model = TensorRTSileroModel.__new__(TensorRTSileroModel)
+    model.session = _FakeSession()
+
+    probabilities = model.infer_probabilities([torch.zeros(512), torch.zeros(1024), torch.zeros(1536)])
+
+    assert model.session.batch_sizes == [3, 2, 1]
+    torch.testing.assert_close(probabilities[0], torch.tensor([0.25]))
+    torch.testing.assert_close(probabilities[1], torch.tensor([0.25, 1.25]))
+    torch.testing.assert_close(probabilities[2], torch.tensor([0.25, 1.25, 2.25]))
+
+
+class _FakeBatchedModel:
+    def infer_probabilities(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [torch.tensor([0.0, 0.9, 0.9, 0.0]) for _ in waveforms]
+
+
+def test_tensorrt_stage_batches_recordings_and_preserves_order() -> None:
+    stage = VADSegmentationStage(
+        backend="tensorrt",
+        tensorrt_engine_path="silero.plan",
+        min_duration_sec=0.01,
+        min_interval_ms=1,
+        speech_pad_ms=0,
+        nested=True,
+        resources=Resources(cpus=1, gpus=1),
+    )
+    stage._vad_model = _FakeBatchedModel()
+    stage._device = torch.device("cpu")
+    tasks = [
+        AudioTask(
+            data={"waveform": torch.zeros(1, 4 * 512), "sample_rate": 16000},
+            task_id=f"task-{index}",
+            dataset_name="test",
+        )
+        for index in range(3)
+    ]
+
+    results = stage.process_batch(tasks)
+
+    assert [task.task_id for task in results] == ["task-0", "task-1", "task-2"]
+    assert all(len(task.data["segments"]) == 1 for task in results)
+
+
+def test_vad_backend_defaults_are_preserved() -> None:
+    stage = VADSegmentationStage()
+    assert stage.backend == "torch"
+    assert stage.batch_size == 8
+    assert stage.resources.gpu_memory_gb == 4.0

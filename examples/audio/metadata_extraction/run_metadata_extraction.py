@@ -137,8 +137,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=500,
         help="Minimum silence gap (ms) between speech segments — higher values merge more, reducing short segments.",
     )
-    vad.add_argument("--vad_gpu_memory_gb", type=float, default=4.0, help="GPU memory for VAD stage.")
-    vad.add_argument("--vad_batch_size", type=int, default=8, help="VAD GPU batch size.")
+    vad.add_argument(
+        "--vad_backend",
+        choices=["torch", "onnx", "tensorrt"],
+        default="torch",
+        help="Silero inference backend.",
+    )
+    vad.add_argument(
+        "--vad_tensorrt_engine",
+        type=str,
+        default=None,
+        help="TensorRT engine path; required when --vad_backend=tensorrt.",
+    )
+    vad.add_argument("--vad_batch_size", type=int, default=1, help="VAD stage batch size.")
+    vad.add_argument("--vad_gpus", type=float, default=0.0, help="GPUs allocated to each VAD worker.")
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
     sed.add_argument("--sed_checkpoint", type=str, default=None, help="Path to PANNs CNN14 checkpoint. Enables SED.")
@@ -277,10 +289,12 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             min_duration_sec=args.min_duration_sec,
             max_duration_sec=args.max_duration_sec,
             speech_pad_ms=args.speech_pad_ms,
+            backend=args.vad_backend,
+            tensorrt_engine_path=args.vad_tensorrt_engine,
+            batch_size=args.vad_batch_size,
             nested=False,
             filepath_key="resampled_audio_filepath" if args.resampled_output_dir else "audio_filepath",
-            resources=Resources(gpu_memory_gb=args.vad_gpu_memory_gb),
-            batch_size=args.vad_batch_size,
+            resources=Resources(cpus=1.0, gpus=args.vad_gpus),
         )
     )
     stages.append(SqueezeWaveformStage())
@@ -391,7 +405,8 @@ def main() -> None:
         )
         logger.info(f"  Sortformer: {args.sortformer_model} ({sf_desc}, on full audio before VAD)")
     logger.info(
-        f"  VAD: threshold={args.vad_threshold}, min_interval_ms={args.min_interval_ms}, "
+        f"  VAD: backend={args.vad_backend}, threshold={args.vad_threshold}, "
+        f"min_interval_ms={args.min_interval_ms}, "
         f"speech_pad_ms={args.speech_pad_ms}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s"
     )
     if args.sed_checkpoint:
