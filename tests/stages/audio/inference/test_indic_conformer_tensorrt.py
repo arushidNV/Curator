@@ -115,10 +115,15 @@ def test_tensorrt_path_batches_encoder_and_preserves_order() -> None:
         np.array([], dtype=np.float32),
         np.ones(120, dtype=np.float32),
     ]
-    with patch.object(model, "_decode_ctc", side_effect=lambda _encoded, _length, lang: f"text-{lang}"):
+    with patch.object(
+        model,
+        "_decode_ctc_batch",
+        side_effect=lambda _encoded, _length, langs: [f"text-{lang}" for lang in langs],
+    ) as decode_batch:
         texts, languages = model.generate(waveforms, [16000] * 4, ["hi", "ta", "bn", "mr"])
 
     assert encoder_batch_sizes == [2, 1]
+    assert [call.args[2] for call in decode_batch.call_args_list] == [["hi", "ta"], ["mr"]]
     assert texts == ["text-hi", "text-ta", "", "text-mr"]
     assert languages == ["hi", "ta", "bn", "mr"]
 

@@ -130,6 +130,7 @@ def _asr(model: object, *, decode_mode: str, batch_size: int) -> IndicConformerH
     asr._model = model
     asr._device = torch.device("cpu")
     asr._per_lang_classes = 3 if decode_mode == "ctc" else 2
+    asr._chunk_duration_sec = 30.0
     return asr
 
 

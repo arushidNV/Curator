@@ -460,6 +460,8 @@ class IndicConformerHybridASR(ModelInterface):
         logger.info(f"IndicConformer TensorRT encoder loaded: {engine_path}")
 
     def teardown(self) -> None:
+        import torch
+
         if self._trt_encoder is not None:
             self._trt_encoder.close()
             self._trt_encoder = None
@@ -612,17 +614,12 @@ class IndicConformerHybridASR(ModelInterface):
                     length=feature_lengths,
                 )
                 encoded = encoded.float()
-                for batch_index, (output_index, _, lang) in enumerate(group):
-                    sample_encoded = encoded[batch_index : batch_index + 1]
-                    sample_length = encoded_lengths[batch_index : batch_index + 1]
-                    if mode == "ctc":
-                        text = self._decode_ctc(sample_encoded, sample_length, lang)
-                    else:
-                        text = self._decode_rnnt(
-                            sample_encoded,
-                            int(sample_length[0].item()),
-                            lang,
-                        )
+                group_langs = [lang for _, _, lang in group]
+                if mode == "ctc":
+                    batch_texts = self._decode_ctc_batch(encoded, encoded_lengths, group_langs)
+                else:
+                    batch_texts = self._decode_rnnt_batch(encoded, encoded_lengths, group_langs)
+                for (output_index, _, _), text in zip(group, batch_texts, strict=True):
                     texts[output_index] = text
         return texts, langs_out
 
