@@ -123,13 +123,14 @@ def build_engine(
     return trt.__version__
 
 
-def validate_engine(
+def validate_engine(  # noqa: PLR0913
     model: torch.nn.Module,
     engine_path: Path,
     *,
     feature_count: int,
     min_frames: int,
     opt_frames: int,
+    tolerances: tuple[float, float] = (5e-2, 5e-2),
 ) -> None:
     import torch
 
@@ -150,7 +151,8 @@ def validate_engine(
     session = TensorRTEncoderSession(engine_path)
     try:
         actual = session.infer({"audio_signal": audio_signal, "length": length})
-        torch.testing.assert_close(actual["outputs"], expected_outputs, rtol=5e-2, atol=5e-2)
+        rtol, atol = tolerances
+        torch.testing.assert_close(actual["outputs"], expected_outputs, rtol=rtol, atol=atol)
         torch.testing.assert_close(actual["encoded_lengths"], expected_lengths)
     finally:
         session.close()

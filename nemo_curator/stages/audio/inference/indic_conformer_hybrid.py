@@ -55,7 +55,8 @@ from __future__ import annotations
 import gc
 import os
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
 
 import nemo.collections.asr as nemo_asr
 import numpy as np
@@ -281,15 +282,19 @@ class IndicConformerHybridASR(ModelInterface):
         *,
         max_symbols_per_step: int = 10,
         inference_batch_size: int = 128,
+        tensorrt_engine_dir: str | None = None,
     ):
         self.model_id = model_id
         self.decode_mode = decode_mode
         self.max_symbols_per_step = max_symbols_per_step
         self.inference_batch_size = max(1, int(inference_batch_size))
+        self.tensorrt_engine_dir = tensorrt_engine_dir
         self._model: Any = None
         self._device: Any = None
         self._num_langs: int = 0
         self._per_lang_classes: int = 0  # V / num_langs (blank index within a head)
+        self._trt_encoder: Any = None
+        self._trt_metadata: dict[str, Any] | None = None
 
     @property
     def model_id_names(self) -> list[str]:
@@ -357,12 +362,36 @@ class IndicConformerHybridASR(ModelInterface):
     def setup(self) -> None:
         _apply_multisoftmax_patches()
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        nemo_path = self._resolve_nemo_path(self.model_id)
+        if self.tensorrt_engine_dir is None:
+            nemo_path = self._resolve_nemo_path(self.model_id)
+        else:
+            from nemo_curator.stages.audio.inference.indic_conformer_tensorrt import (
+                ENGINE_FILENAME,
+                MODEL_FILENAME,
+                load_engine_metadata,
+            )
+
+            if self._device.type != "cuda":
+                msg = "IndicConformer TensorRT inference requires CUDA"
+                raise RuntimeError(msg)
+            engine_dir = Path(self.tensorrt_engine_dir)
+            self._trt_metadata = load_engine_metadata(engine_dir)
+            nemo_path = str(engine_dir / MODEL_FILENAME)
+            engine_path = engine_dir / ENGINE_FILENAME
+            if not Path(nemo_path).is_file():
+                msg = f"Bundled NeMo model not found: {nemo_path}"
+                raise FileNotFoundError(msg)
+            if not engine_path.is_file():
+                msg = f"TensorRT encoder engine not found: {engine_path}"
+                raise FileNotFoundError(msg)
         logger.info(f"Loading IndicConformer hybrid model={nemo_path} device={self._device}")
 
         self._model = nemo_asr.models.ASRModel.restore_from(nemo_path, map_location=self._device)
         self._model.to(self._device)
         self._model.eval()
+
+        if self._trt_metadata is not None:
+            self._enable_tensorrt_encoder(engine_path)
 
         tok = self._model.tokenizer
         if not hasattr(tok, "langs_by_token_id"):
@@ -383,10 +412,52 @@ class IndicConformerHybridASR(ModelInterface):
             f"IndicConformer hybrid ready: {self._num_langs} langs, {self._per_lang_classes} tokens/lang"
         )
 
+    def _enable_tensorrt_encoder(self, engine_path: Path) -> None:
+        from nemo_curator.stages.audio.inference.tensorrt_encoder import TensorRTEncoder
+
+        metadata = self._trt_metadata
+        if metadata is None:
+            msg = "TensorRT metadata is not loaded"
+            raise RuntimeError(msg)
+        encoder = self._model.encoder
+        actual_feature_count = int(getattr(encoder, "_feat_in", self._model.cfg.encoder.feat_in))
+        actual_subsampling = int(encoder.subsampling_factor)
+        actual_sample_rate = int(self._model.cfg.preprocessor.sample_rate)
+        actual_encoder_dim = int(self._model.cfg.encoder.d_model)
+        expected = (
+            ("feature_count", actual_feature_count),
+            ("subsampling_factor", actual_subsampling),
+            ("sample_rate", actual_sample_rate),
+            ("encoder_dim", actual_encoder_dim),
+        )
+        for key, actual in expected:
+            if actual != int(metadata[key]):
+                msg = (
+                    "Bundled NeMo model does not match the TensorRT engine: "
+                    f"{key}={actual}, expected={metadata[key]}"
+                )
+                raise ValueError(msg)
+
+        self._trt_encoder = TensorRTEncoder(
+            engine_path,
+            subsampling_factor=int(metadata["subsampling_factor"]),
+        )
+        self._model.encoder = self._trt_encoder
+        del encoder
+        gc.collect()
+        import torch
+
+        torch.cuda.empty_cache()
+        logger.info(f"IndicConformer TensorRT encoder loaded: {engine_path}")
+
     def teardown(self) -> None:
+        if self._trt_encoder is not None:
+            self._trt_encoder.close()
+            self._trt_encoder = None
         del self._model
         self._model = None
         self._device = None
+        self._trt_metadata = None
         gc.collect()
         try:
             torch.cuda.empty_cache()
@@ -407,6 +478,8 @@ class IndicConformerHybridASR(ModelInterface):
             msg = "Model not initialized. Call setup() first."
             raise RuntimeError(msg)
         mode = (decode_mode or self.decode_mode).lower()
+        if self._trt_encoder is not None:
+            return self._generate_tensorrt(waveforms, sample_rates, lang_codes, mode)
 
         texts: list[str] = [""] * len(waveforms)
         langs_out: list[str] = [str(lang).strip().lower() for lang in lang_codes]
@@ -446,6 +519,71 @@ class IndicConformerHybridASR(ModelInterface):
                     batch_texts = self._decode_rnnt_batch(encoded, encoded_len, chunk_langs)
                 for original_idx, text in zip(chunk_indices, batch_texts, strict=True):
                     texts[original_idx] = text
+        return texts, langs_out
+
+    def _generate_tensorrt(
+        self,
+        waveforms: list[np.ndarray],
+        sample_rates: list[int],
+        lang_codes: list[str],
+        mode: str,
+    ) -> tuple[list[str], list[str]]:
+        import torch
+        import torch.nn.functional as torch_functional
+        import torchaudio.functional as audio_functional
+
+        metadata = self._trt_metadata
+        if metadata is None:
+            msg = "TensorRT metadata is not loaded"
+            raise RuntimeError(msg)
+        texts = [""] * len(waveforms)
+        langs_out = list(lang_codes)
+        prepared: list[tuple[int, torch.Tensor, str]] = []
+        for index, (waveform, sample_rate, lang) in enumerate(
+            zip(waveforms, sample_rates, lang_codes, strict=True)
+        ):
+            if waveform is None or np.asarray(waveform).size == 0:
+                continue
+            wav = torch.from_numpy(np.ascontiguousarray(waveform, dtype=np.float32)).to(self._device)
+            if wav.ndim > 1:
+                wav = wav.mean(dim=-1)
+            if int(sample_rate) != _TARGET_SR:
+                wav = audio_functional.resample(wav, orig_freq=int(sample_rate), new_freq=_TARGET_SR)
+            prepared.append((index, wav, lang))
+
+        max_batch = int(metadata["profile"]["max"]["batch"])
+        min_frames = int(metadata["profile"]["min"]["feature_frames"])
+        with torch.inference_mode():
+            for start in range(0, len(prepared), max_batch):
+                group = prepared[start : start + max_batch]
+                lengths = torch.tensor([wav.shape[0] for _, wav, _ in group], device=self._device)
+                signals = torch.nn.utils.rnn.pad_sequence(
+                    [wav for _, wav, _ in group],
+                    batch_first=True,
+                )
+                features, feature_lengths = self._model.preprocessor(
+                    input_signal=signals,
+                    length=lengths,
+                )
+                if features.shape[-1] < min_frames:
+                    features = torch_functional.pad(features, (0, min_frames - features.shape[-1]))
+                encoded, encoded_lengths = self._model.encoder(
+                    audio_signal=features.to(dtype=torch.float16),
+                    length=feature_lengths,
+                )
+                encoded = encoded.float()
+                for batch_index, (output_index, _, lang) in enumerate(group):
+                    sample_encoded = encoded[batch_index : batch_index + 1]
+                    sample_length = encoded_lengths[batch_index : batch_index + 1]
+                    if mode == "ctc":
+                        text = self._decode_ctc(sample_encoded, sample_length, lang)
+                    else:
+                        text = self._decode_rnnt(
+                            sample_encoded,
+                            int(sample_length[0].item()),
+                            lang,
+                        )
+                    texts[output_index] = text
         return texts, langs_out
 
     def _ids_to_text(self, local_ids: list[int], lang: str) -> str:
@@ -621,6 +759,10 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         model_id: Local ``.nemo`` path or HuggingFace repo id (gated; set ``HF_TOKEN``),
             e.g. ``ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large``.
         decode_mode: ``"ctc"`` or ``"rnnt"`` (model card recommends rnnt).
+        backend: ``"nemo"`` for the existing implementation or ``"tensorrt"``
+            for batched inference through an optimized encoder bundle.
+        tensorrt_engine_dir: Directory containing ``encoder.plan``, ``model.nemo``,
+            and ``metadata.json``. Required when ``backend="tensorrt"``.
         source_lang_key: Task key holding the per-sample ISO language code.
         keep_waveform: When True the waveform is left on the task for a later stage.
     """
@@ -628,6 +770,8 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
     name: str = "IndicConformerHybrid_inference"
     model_id: str = "ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large"
     decode_mode: Literal["ctc", "rnnt"] = "rnnt"
+    backend: Literal["nemo", "tensorrt"] = "nemo"
+    tensorrt_engine_dir: str | None = None
     source_lang_key: str = "source_lang"
     waveform_key: str = "waveform"
     sample_rate_key: str = "sampling_rate"
@@ -639,6 +783,14 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 128
     _model: IndicConformerHybridASR | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.backend not in {"nemo", "tensorrt"}:
+            msg = f"Unsupported IndicConformer inference backend: {self.backend!r}"
+            raise ValueError(msg)
+        if self.backend == "tensorrt" and not self.tensorrt_engine_dir:
+            msg = "tensorrt_engine_dir is required when backend='tensorrt'"
+            raise ValueError(msg)
 
     def num_workers(self) -> int | None:
         return self.num_workers_override
@@ -654,6 +806,7 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
             model_id=self.model_id,
             decode_mode=self.decode_mode,
             inference_batch_size=self.batch_size,
+            tensorrt_engine_dir=self.tensorrt_engine_dir if self.backend == "tensorrt" else None,
         )
 
     def setup_on_node(
@@ -661,10 +814,17 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         _node_info: NodeInfo | None = None,
         _worker_metadata: WorkerMetadata | None = None,
     ) -> None:
-        # Download the checkpoint into the shared HF cache exactly ONCE per node
-        # (online). Per-worker setup() then resolves it from cache without each
-        # re-downloading. No-op for a local path or when HF_HUB_OFFLINE=1.
-        IndicConformerHybridASR.download_to_cache(self.model_id)
+        if self.backend == "tensorrt":
+            from nemo_curator.stages.audio.inference.indic_conformer_tensorrt import load_engine_metadata
+
+            engine_dir = self.tensorrt_engine_dir
+            if engine_dir is None:
+                msg = "tensorrt_engine_dir is required when backend='tensorrt'"
+                raise ValueError(msg)
+            load_engine_metadata(engine_dir)
+        else:
+            # Download the checkpoint into the shared HF cache exactly once per node.
+            IndicConformerHybridASR.download_to_cache(self.model_id)
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         if self._model is None:

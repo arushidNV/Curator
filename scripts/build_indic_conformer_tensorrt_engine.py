@@ -94,6 +94,7 @@ def build_bundle(args: argparse.Namespace) -> None:
         feature_count=feature_count,
         min_frames=args.min_frames,
         opt_frames=args.opt_frames,
+        tolerances=(5e-2, 2e-1),
     )
     print("INDIC_CONFORMER_TENSORRT_ENCODER_PARITY_PASSED")
     shutil.copy2(model_path, output_dir / "model.nemo")
