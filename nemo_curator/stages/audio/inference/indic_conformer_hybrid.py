@@ -546,6 +546,12 @@ class IndicConformerHybridASR(ModelInterface):
                 prepared_langs.append(lang)
                 original_indices.append(idx)
 
+            duration_order = sorted(range(len(prepared)), key=lengths.__getitem__)
+            prepared = [prepared[idx] for idx in duration_order]
+            lengths = [lengths[idx] for idx in duration_order]
+            prepared_langs = [prepared_langs[idx] for idx in duration_order]
+            original_indices = [original_indices[idx] for idx in duration_order]
+
             for start in range(0, len(prepared), self.inference_batch_size):
                 end = start + self.inference_batch_size
                 chunk = prepared[start:end]
@@ -592,6 +598,8 @@ class IndicConformerHybridASR(ModelInterface):
             if int(sample_rate) != _TARGET_SR:
                 wav = audio_functional.resample(wav, orig_freq=int(sample_rate), new_freq=_TARGET_SR)
             prepared.append((index, wav, lang))
+
+        prepared.sort(key=lambda item: item[1].shape[0])
 
         max_batch = int(metadata["profile"]["max"]["batch"])
         min_frames = int(metadata["profile"]["min"]["feature_frames"])
@@ -800,6 +808,8 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
             for batched inference through an optimized encoder bundle.
         tensorrt_engine_dir: Directory containing ``encoder.plan``, ``model.nemo``,
             and ``metadata.json``. Required when ``backend="tensorrt"``.
+        inference_batch_size: Maximum NeMo inference batch size. When unset, uses
+            ``batch_size``. TensorRT remains capped by the engine profile.
         source_lang_key: Task key holding the per-sample ISO language code.
         keep_waveform: When True the waveform is left on the task for a later stage.
     """
@@ -819,6 +829,7 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
     num_workers_override: int | None = None
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 128
+    inference_batch_size: int | None = None
     _model: IndicConformerHybridASR | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -842,8 +853,10 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         return IndicConformerHybridASR(
             model_id=self.model_id,
             decode_mode=self.decode_mode,
-            inference_batch_size=self.batch_size,
             tensorrt_engine_dir=self.tensorrt_engine_dir if self.backend == "tensorrt" else None,
+            inference_batch_size=(
+                self.batch_size if self.inference_batch_size is None else self.inference_batch_size
+            ),
         )
 
     def setup_on_node(

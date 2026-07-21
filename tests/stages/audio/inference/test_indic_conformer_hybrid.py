@@ -147,8 +147,8 @@ def test_ctc_generate_batches_encoder_calls_and_preserves_order() -> None:
     texts, langs = asr.generate(waveforms, [_TARGET_SR] * 4, ["hi"] * 4)
 
     assert [call["shape"][0] for call in model.calls] == [2, 1]
-    assert [call["lengths"] for call in model.calls] == [[10, 15], [7]]
-    assert texts == ["ab", "c", "", "ab"]
+    assert [call["lengths"] for call in model.calls] == [[7, 10], [15]]
+    assert texts == ["c", "ab", "", "ab"]
     assert langs == ["hi", "hi", "hi", "hi"]
 
 
@@ -164,11 +164,18 @@ def test_rnnt_generate_decodes_active_rows_as_batches() -> None:
     assert texts == ["a", "b"]
 
 
-def test_stage_passes_batch_size_to_model_wrapper() -> None:
-    stage = InferenceIndicConformerHybridStage(model_id="dummy.nemo", batch_size=4)
+def test_stage_passes_inference_batch_size_to_model_wrapper() -> None:
+    default_stage = InferenceIndicConformerHybridStage(model_id="dummy.nemo", batch_size=8)
+    stage = InferenceIndicConformerHybridStage(
+        model_id="dummy.nemo",
+        batch_size=8,
+        inference_batch_size=4,
+    )
 
+    default_model = default_stage._create_model()
     model = stage._create_model()
 
+    assert default_model.inference_batch_size == 8
     assert model.inference_batch_size == 4
 
 

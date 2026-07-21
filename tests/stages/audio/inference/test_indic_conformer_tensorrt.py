@@ -123,7 +123,7 @@ def test_tensorrt_path_batches_encoder_and_preserves_order() -> None:
         texts, languages = model.generate(waveforms, [16000] * 4, ["hi", "ta", "bn", "mr"])
 
     assert encoder_batch_sizes == [2, 1]
-    assert [call.args[2] for call in decode_batch.call_args_list] == [["hi", "ta"], ["mr"]]
+    assert [call.args[2] for call in decode_batch.call_args_list] == [["ta", "mr"], ["hi"]]
     assert texts == ["text-hi", "text-ta", "", "text-mr"]
     assert languages == ["hi", "ta", "bn", "mr"]
 
