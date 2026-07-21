@@ -58,11 +58,13 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
 _TARGET_SR = 16000
-# Encoder engines are built for a 40-second window; clip anything longer. Both
+# Encoder engines are built for a 30-second window; clip anything longer. Both
 # bounds are configurable (see IndicCanaryTRTLLMASR / InferenceIndicCanaryStage);
 # these are just the defaults.
-_DEFAULT_MAX_DURATION_SEC = 40.0
+_DEFAULT_MAX_DURATION_SEC = 30.0
 _DEFAULT_MIN_DURATION_SEC = 3.0
+_MAX_SAMPLES = int(_DEFAULT_MAX_DURATION_SEC * _TARGET_SR)
+_MIN_SAMPLES = int(_DEFAULT_MIN_DURATION_SEC * _TARGET_SR)
 # `per_feature` normalization computes std over the valid frames; a single mel
 # frame makes torch.std() return NaN and raises inside the preprocessor. Floor the
 # reported valid duration so degenerate/near-empty clips (< ~10 ms) still yield
@@ -79,7 +81,7 @@ class IndicCanaryTRTLLMASR(ModelInterface):
     (below) adapts it to ``AudioTask`` / Ray.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         engine_dir: str,
         *,
@@ -175,7 +177,7 @@ class IndicCanaryTRTLLMASR(ModelInterface):
 
         from nemo_curator.stages.audio.inference.indic_canary_trtllm_runtime import pad_or_trim
 
-        # Resample to 16 kHz mono float32 and clip to the 30s engine window.
+        # Resample to 16 kHz mono float32 and clip to the engine window.
         prepared: list[Any] = []
         lengths: list[int] = []
         langs_norm: list[str] = []

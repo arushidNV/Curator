@@ -80,6 +80,15 @@ def _dedup_entries_by_stem(entries: list[dict], shard_key: str) -> list[dict]:
         if not path:
             continue
         key = os.path.splitext(path)[0]  # directory-preserving stem
+        # Segment-level input (e.g. Granary ASR reading metadata_extraction output)
+        # points many rows at the same source recording, distinguished only by
+        # offset/duration. Fold those into the key so distinct segments are kept;
+        # true same-recording/different-format duplicates still share offset/duration
+        # and collapse as before.
+        offset = entry.get("offset")
+        duration = entry.get("duration")
+        if offset is not None or duration is not None:
+            key = f"{key}|{offset}|{duration}"
         rank = _FORMAT_PRIORITY.get(os.path.splitext(path)[1].lower(), 99)
         if key not in best:
             best[key] = (rank, i)
@@ -695,6 +704,21 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Unreadable audio, emitting read-error placeholder: {audio_path} ({exc})")
             return [self._read_error_task(task)]
+
+        # When the manifest entry describes a sub-segment of the source recording
+        # (segment-level input, e.g. Granary ASR reading metadata_extraction output),
+        # emit only that slice so downstream ASR receives a short clip instead of the
+        # full-length recording (which otherwise blows up attention memory).
+        seg_offset = float(entry.get("offset") or 0.0)
+        seg_duration = float(entry.get("duration") or 0.0)
+        wants_segment = seg_offset > 0.0 or (0.0 < seg_duration < duration - 0.05)
+        if sr > 0 and wants_segment:
+            start = max(0, int(round(seg_offset * sr)))
+            end = int(round((seg_offset + seg_duration) * sr)) if seg_duration > 0.0 else len(audio)
+            start = min(start, len(audio))
+            end = max(start, min(end, len(audio)))
+            audio = audio[start:end]
+            duration = len(audio) / sr
 
         entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
         entry_data.update(

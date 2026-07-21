@@ -22,6 +22,15 @@ from upstream downsampling), plus a per-shard JSONL manifest with metadata:
             <basename>_<offset_ms>ms.opus
         <shard_key>.jsonl
         <shard_key>.jsonl.done          (written when all inputs in shard are processed)
+
+When ``split_manifest_by_language=True``, manifests instead use:
+
+    output_dir/
+        <language>/
+            <shard_key>.jsonl
+
+Shard completion markers remain at ``<shard_key>.jsonl.done`` so resume
+tracking stays recording/shard based rather than language based.
 """
 
 from __future__ import annotations
@@ -113,15 +122,27 @@ def _append_manifest_line(manifest_path: str, line: str) -> None:
 
 
 def _source_output_stem(original_file: str) -> str:
-    """Directory-preserving output stem for a source path.
+    """Bounded, collision-safe output stem for a source path.
 
-    Strips the URI scheme and leading slashes but keeps intermediate directories, so
-    distinct recordings that share a basename across directories (e.g.
-    ``set_a/utt_001`` vs ``set_b/utt_001``) map to distinct output files instead of
-    silently overwriting each other.
+    For URI (``scheme://bucket/...``) and relative sources, keeps the
+    directory-preserving stem so distinct recordings that share a basename across
+    directories (e.g. ``set_a/utt_001`` vs ``set_b/utt_001``) map to distinct output
+    files instead of silently overwriting each other.
+
+    For *absolute local* sources the leading directories are machine/run specific
+    (e.g. a temp download dir) and are shared across the whole shard, so preserving
+    them only bloats the manifest ``audio_filepath`` (and, when ``save_audio`` is on,
+    the physical opus path) without aiding disambiguation. Those collapse to the
+    basename stem.
     """
-    path = original_file.split("://", 1)[-1].lstrip("/")
-    return os.path.splitext(path)[0]
+    if "://" in original_file:
+        # URI source: keep the bucket-relative directory-preserving stem.
+        path = original_file.split("://", 1)[-1].lstrip("/")
+        return os.path.splitext(path)[0]
+    if os.path.isabs(original_file):
+        return os.path.splitext(os.path.basename(original_file))[0] or "audio"
+    # Relative local source: keep directory-preserving stem.
+    return os.path.splitext(original_file.lstrip("/"))[0]
 
 
 def _write_opus_atomic(out_path: str, opus_bytes: bytes) -> None:
@@ -149,6 +170,11 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         target_sample_rate: Expected sample rate (default 16000).
         waveform_key: Task data key for audio waveform.
         sample_rate_key: Task data key for sample rate.
+        language_key: Task data key containing the predicted language.
+        split_manifest_by_language: If True, write each row to
+            ``<output_dir>/<language>/<shard_key>.jsonl``. Language labels such
+            as ``"hi: Hindi"`` are normalized to ``"hi"``; missing labels use
+            ``"und"``. Defaults to False for backward compatibility.
         save_audio: If True (default), encode and save opus audio files to
             the output directory. Set to False to write only the JSONL manifest
             without producing audio files.
@@ -159,6 +185,8 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
     target_sample_rate: int = _TARGET_SR
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
+    language_key: str = "language"
+    split_manifest_by_language: bool = False
     writer_concurrency: int = 1
     save_audio: bool = True
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
@@ -234,8 +262,15 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         sf.write(buf, waveform, sr, format="OGG", subtype="OPUS")
         return buf.getvalue()
 
-    def _shard_manifest_path(self, shard_subdir: str) -> str:
+    def _language_subdir(self, data: dict[str, Any]) -> str:
+        language = str(data.get(self.language_key, "") or "")
+        language = language.split(":", maxsplit=1)[0].strip()
+        return language.replace("/", "_").replace("\\", "_") or "und"
+
+    def _shard_manifest_path(self, shard_subdir: str, data: dict[str, Any]) -> str:
         name = f"{shard_subdir}.jsonl" if shard_subdir else "manifest.jsonl"
+        if self.split_manifest_by_language:
+            name = os.path.join(self._language_subdir(data), name)
         return os.path.join(self.output_dir, name)
 
     def _emit_manifest_only(
@@ -247,7 +282,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         shard_total: int,
     ) -> FileGroupTask:
         """Write a manifest-only row (no opus) for placeholder tasks and record shard progress."""
-        manifest_path = self._shard_manifest_path(shard_subdir)
+        manifest_path = self._shard_manifest_path(shard_subdir, manifest_entry)
         os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
         _append_manifest_line(manifest_path, json.dumps(manifest_entry))
         _record_shard_input(self.output_dir, shard_subdir, input_id, shard_total)
@@ -395,7 +430,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
                 manifest_entry[key] = value
 
         # Write to per-shard manifest
-        shard_manifest_path = self._shard_manifest_path(shard_subdir)
+        shard_manifest_path = self._shard_manifest_path(shard_subdir, manifest_entry)
         os.makedirs(os.path.dirname(shard_manifest_path), exist_ok=True)
         _append_manifest_line(shard_manifest_path, json.dumps(manifest_entry))
 

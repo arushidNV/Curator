@@ -234,6 +234,23 @@ def _stub_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     mod.pad_or_trim = pad_or_trim
     monkeypatch.setitem(sys.modules, mod.__name__, mod)
 
+    torchaudio_mod = types.ModuleType("torchaudio")
+    functional_mod = types.ModuleType("torchaudio.functional")
+
+    def resample(waveform: torch.Tensor, *, orig_freq: int, new_freq: int) -> torch.Tensor:
+        target_len = max(1, round(int(waveform.shape[-1]) * int(new_freq) / int(orig_freq)))
+        return torch.nn.functional.interpolate(
+            waveform.reshape(1, 1, -1),
+            size=target_len,
+            mode="linear",
+            align_corners=False,
+        ).reshape(-1)
+
+    functional_mod.resample = resample
+    torchaudio_mod.functional = functional_mod
+    monkeypatch.setitem(sys.modules, "torchaudio", torchaudio_mod)
+    monkeypatch.setitem(sys.modules, "torchaudio.functional", functional_mod)
+
 
 def _engine_for_generate(max_batch_size: int = 8) -> IndicCanaryTRTLLMASR:
     eng = IndicCanaryTRTLLMASR(engine_dir="canary_engine")
