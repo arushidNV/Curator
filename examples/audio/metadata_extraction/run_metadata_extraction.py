@@ -47,7 +47,15 @@ from nemo_curator.stages.audio.io.nemo_speech_writer import NeMoSpeechWriterStag
 from nemo_curator.stages.audio.postprocessing.sed_postprocessing import SEDPostprocessingStage
 from nemo_curator.stages.audio.preprocessing import MonoDownsampleStage, SqueezeWaveformStage
 from nemo_curator.stages.audio.segmentation import VADSegmentationStage
+from nemo_curator.stages.audio.text_filtering.select_best_lid_prediction import SelectBestLIDPredictionStage
 from nemo_curator.stages.resources import Resources
+
+# Intermediate keys used during two-pass Indic LID; final result lands in the
+# default "language" / "language_confidence" keys that downstream stages expect.
+_SB_LANG_KEY = "speechbrain_language"
+_SB_CONF_KEY = "speechbrain_language_confidence"
+_IC_LANG_KEY = "indic_canary_language"
+_IC_CONF_KEY = "indic_canary_language_confidence"
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -61,6 +69,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Filter to specific language(s) in the YAML (comma-separated, e.g. 'en,de').",
+    )
+    ap.add_argument(
+        "--indic",
+        action="store_true",
+        default=False,
+        help="Enable two-pass Indic LID: primary LID + Indic Canary secondary + best-prediction selection.",
+    )
+    ap.add_argument(
+        "--indic_canary_engine_dir",
+        type=str,
+        default=None,
+        help="Path to prebuilt Indic Canary TRT-LLM engine directory. Required when --indic is set.",
     )
 
     vad = ap.add_argument_group("VAD (Silero)")
@@ -207,18 +227,53 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             from nemo_curator.stages.audio.inference.speechbrain_langid import SpeechBrainLangIDStage
 
             langid_source = args.langid_model or "speechbrain/lang-id-voxlingua107-ecapa"
+            # In two-pass Indic mode write to intermediate key; otherwise use the
+            # default "language" key that downstream stages (writer) expect.
+            primary_out_key = _SB_LANG_KEY if args.indic else "language"
+            primary_conf_key = _SB_CONF_KEY if args.indic else "language_confidence"
             stages.append(
                 SpeechBrainLangIDStage(
                     source=langid_source,
+                    output_key=primary_out_key,
+                    confidence_key=primary_conf_key,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
         else:
             langid_model = args.langid_model or "langid_ambernet"
+            primary_out_key = _SB_LANG_KEY if args.indic else "language"
+            primary_conf_key = _SB_CONF_KEY if args.indic else "language_confidence"
             stages.append(
                 AmberNetLangIDStage(
                     model_name=langid_model,
+                    output_key=primary_out_key,
+                    confidence_key=primary_conf_key,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
+                )
+            )
+
+        if args.indic:
+            from nemo_curator.stages.audio.inference.indic_canary_lid import IndicCanaryLangIDStage
+
+            if not args.indic_canary_engine_dir:
+                msg = "--indic_canary_engine_dir is required when --indic is set"
+                raise ValueError(msg)
+            stages.append(
+                IndicCanaryLangIDStage(
+                    engine_dir=args.indic_canary_engine_dir,
+                    output_key=_IC_LANG_KEY,
+                    confidence_key=_IC_CONF_KEY,
+                    resources=Resources(gpus=1.0),
+                )
+            )
+            stages.append(
+                SelectBestLIDPredictionStage(
+                    speechbrain_language_key=_SB_LANG_KEY,
+                    speechbrain_confidence_key=_SB_CONF_KEY,
+                    indic_canary_language_key=_IC_LANG_KEY,
+                    indic_canary_confidence_key=_IC_CONF_KEY,
+                    output_key="language",
+                    confidence_key="language_confidence",
                 )
             )
 
@@ -271,7 +326,13 @@ def main() -> None:
         langid_desc = args.langid_model or (
             "speechbrain/lang-id-voxlingua107-ecapa" if args.langid_backend == "speechbrain" else "langid_ambernet"
         )
-        logger.info(f"  LangID: {args.langid_backend} ({langid_desc})")
+        if args.indic:
+            logger.info(
+                f"  LangID: two-pass Indic mode — primary={args.langid_backend} ({langid_desc})"
+                f" + Indic Canary ({args.indic_canary_engine_dir}) -> SelectBestLIDPrediction"
+            )
+        else:
+            logger.info(f"  LangID: {args.langid_backend} ({langid_desc})")
     logger.info(f"  Target sample rate: {args.target_sample_rate}Hz, writer_concurrency={args.writer_concurrency}")
 
     t0 = time.time()
