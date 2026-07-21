@@ -116,6 +116,10 @@ audio_cuda12 = [
     "onnxruntime-gpu>=1.20.1,<1.24; platform_machine == 'x86_64'",
     "torchcodec",
 ]
+audio_tensorrt = [
+    "nemo_curator[audio_cuda12]",
+    "tensorrt==10.9.0.34; platform_machine == 'x86_64' and platform_system == 'Linux'",
+]
 
 image_cpu = [
     "Pillow",
@@ -224,7 +228,7 @@ sdg_cuda12 = [
 
 # All dependencies
 all = [
-    "nemo_curator[audio_cuda12]",
+    "nemo_curator[audio_tensorrt]",
     "nemo_curator[image_cuda12]",
     "nemo_curator[inference_server]",
     "nemo_curator[interleaved_cuda12]",

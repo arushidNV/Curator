@@ -15,7 +15,7 @@
 """
 VAD (Voice Activity Detection) segmentation stage.
 
-Segments audio into speech chunks using Silero VAD model,
+Segments audio into speech chunks using the Silero VAD Torch or ONNX model,
 filtering out silence and creating manageable segments for further processing.
 
 Supports both CPU and GPU execution. GPU is used when available and requested
@@ -39,7 +39,7 @@ Example:
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torchaudio
@@ -47,17 +47,32 @@ from loguru import logger
 from silero_vad import get_speech_timestamps, load_silero_vad
 
 from nemo_curator.backends.base import WorkerMetadata
-try:
-    from nemo_curator.backends.utils import RayStageSpecKeys
-except ImportError:
-    from nemo_curator.backends.experimental.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.common import ensure_waveform_2d, load_audio_file
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
 
+try:
+    from nemo_curator.backends.utils import RayStageSpecKeys
+except ImportError:
+    from nemo_curator.backends.experimental.utils import RayStageSpecKeys
+
 SILERO_SUPPORTED_RATES = {8000, 16000, 32000, 48000, 64000, 96000}
 SILERO_TARGET_RATE = 16000
+
+
+class _PrecomputedProbabilityModel:
+    def __init__(self, probabilities: torch.Tensor) -> None:
+        self.probabilities = probabilities
+        self.index = 0
+
+    def reset_states(self) -> None:
+        self.index = 0
+
+    def __call__(self, _audio: torch.Tensor, _sampling_rate: int) -> torch.Tensor:
+        probability = self.probabilities[self.index]
+        self.index += 1
+        return probability.reshape(1, 1)
 
 
 @dataclass
@@ -67,7 +82,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
     This stage takes a single AudioTask and segments it into speech chunks based on VAD,
     filtering out silence and creating manageable segments for further processing.
-    Uses Silero VAD model loaded via torch.hub.
+    Uses the model bundled by the official ``silero-vad`` package.
 
     Returns a list[AudioTask] with one AudioTask per detected speech segment (fan-out).
 
@@ -77,6 +92,11 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         max_duration_sec: Maximum segment duration in seconds.
         threshold: Voice activity detection threshold (0.0-1.0).
         speech_pad_ms: Padding in ms to add before/after speech segments.
+        backend: Silero inference backend. ``"torch"`` uses TorchScript,
+            ``"onnx"`` uses Silero's official ONNX Runtime wrapper, and
+            ``"tensorrt"`` uses a persistent TensorRT engine on CUDA.
+        tensorrt_engine_path: Serialized Silero TensorRT engine. Required when
+            ``backend="tensorrt"``.
         waveform_key: Key to get waveform data.
         sample_rate_key: Key to get sample rate.
 
@@ -90,6 +110,8 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
     max_duration_sec: float = 60.0
     threshold: float = 0.5
     speech_pad_ms: int = 300
+    backend: Literal["torch", "onnx", "tensorrt"] = "torch"
+    tensorrt_engine_path: str | None = None
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
     nested: bool = False
@@ -100,6 +122,12 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
     def __post_init__(self):
         super().__init__()
+        if self.backend not in {"torch", "onnx", "tensorrt"}:
+            msg = f"Unsupported Silero backend: {self.backend!r}. Expected 'torch', 'onnx', or 'tensorrt'."
+            raise ValueError(msg)
+        if self.backend == "tensorrt" and not self.tensorrt_engine_path:
+            msg = "tensorrt_engine_path is required for the Silero TensorRT backend"
+            raise ValueError(msg)
         self._vad_model = None
         self._device = None
 
@@ -119,6 +147,8 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
     def teardown(self) -> None:
         if self._vad_model is not None:
+            if hasattr(self._vad_model, "close"):
+                self._vad_model.close()
             del self._vad_model
             self._vad_model = None
             if torch.cuda.is_available():
@@ -137,20 +167,33 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         if self._vad_model is not None:
             return
         self._check_gpu_availability(self._resources.gpus)
+        if self.backend == "tensorrt" and self._resources.gpus <= 0:
+            msg = "The Silero TensorRT backend requires resources=Resources(gpus=X) with X > 0"
+            raise RuntimeError(msg)
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="Sampling rate is a multiple of 16000")
-                model = load_silero_vad()
+                if self.backend == "tensorrt":
+                    from nemo_curator.stages.audio.segmentation.silero_tensorrt import TensorRTSileroModel
 
-            use_gpu = self._resources.gpus > 0 and torch.cuda.is_available()
+                    model = TensorRTSileroModel(self.tensorrt_engine_path)
+                elif self.backend == "onnx":
+                    model = load_silero_vad(onnx=True, opset_version=16)
+                else:
+                    model = load_silero_vad()
 
-            if use_gpu:
+            use_gpu = self.backend in {"torch", "tensorrt"} and self._resources.gpus > 0 and torch.cuda.is_available()
+
+            if self.backend == "tensorrt":
+                self._device = torch.device("cuda")
+                logger.info(f"Silero VAD TensorRT engine loaded on GPU: {self._device}")
+            elif use_gpu:
                 self._device = torch.device("cuda")
                 model = model.to(self._device)
                 logger.info(f"Silero VAD model loaded on GPU: {self._device}")
             else:
                 self._device = torch.device("cpu")
-                logger.info("Silero VAD model loaded on CPU")
+                logger.info(f"Silero VAD model loaded on CPU ({self.backend} backend)")
 
             self._vad_model = model
         except Exception as e:
@@ -238,6 +281,53 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         task.data.pop(self.waveform_key, None)
         return task
 
+    def _emit_segments(
+        self,
+        task: AudioTask,
+        waveform: torch.Tensor,
+        sample_rate: int,
+        segments: list[dict[str, float]],
+    ) -> AudioTask | list[AudioTask]:
+        """Create fan-out tasks from timestamps shared by every inference backend."""
+        if not segments:
+            logger.warning("No speech segments detected by VAD")
+            if self.nested:
+                task.data["segments"] = []
+                return task
+            task.data["vad_empty"] = True
+            if "duration_sec" not in task.data:
+                n_samples = waveform.shape[-1] if waveform.dim() > 0 else 0
+                task.data["duration_sec"] = n_samples / sample_rate if sample_rate else 0.0
+            task.data.pop(self.waveform_key, None)
+            return [task]
+
+        original_file = task.data.get("audio_filepath", "unknown")
+        file_name = os.path.basename(original_file) if original_file != "unknown" else task.task_id
+        total_duration = sum(segment["end"] - segment["start"] for segment in segments)
+        logger.info(
+            f"[VADSegmentation] {file_name}: {len(segments)} segments extracted ({total_duration:.1f}s total speech)"
+        )
+        if self.nested:
+            task.data["segments"] = [
+                self._build_segment_item(task.data, waveform, sample_rate, segment, index)
+                for index, segment in enumerate(segments)
+            ]
+            del task.data[self.waveform_key]
+            return task
+
+        output_tasks = []
+        for index, segment in enumerate(segments):
+            segment_data = self._build_segment_item(task.data, waveform, sample_rate, segment, index)
+            segment_task = AudioTask(
+                data=segment_data,
+                task_id=f"{task.task_id}_seg_{index}",
+                dataset_name=task.dataset_name,
+            )
+            if task._metadata:
+                segment_task._metadata = dict(task._metadata)
+            output_tasks.append(segment_task)
+        return output_tasks
+
     def process(self, task: AudioTask) -> AudioTask | list[AudioTask]:
         """
         Process a single AudioTask.
@@ -248,6 +338,8 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         When ``nested=True``, returns a single ``AudioTask`` with all segment
         dicts stored in ``task.data["segments"]`` (no fan-out).
         """
+        if self.backend == "tensorrt":
+            return self.process_batch([task])
         if self._vad_model is None:
             msg = "VAD model failed to initialize. Cannot process audio."
             raise RuntimeError(msg)
@@ -264,88 +356,105 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
         try:
             segments = self._get_vad_segments(waveform, sample_rate)
-            if not segments:
-                logger.warning("No speech segments detected by VAD")
-                if self.nested:
-                    task.data["segments"] = []
-                    return task
-                task.data["vad_empty"] = True
-                if "duration_sec" not in task.data:
-                    n_samples = waveform.shape[-1] if waveform.dim() > 0 else 0
-                    task.data["duration_sec"] = n_samples / sample_rate if sample_rate else 0.0
-                # Drop the full-file waveform: nothing to segment, and forwarding an
-                # unbounded-length array into SED/LangID OOMs the shared GPU.
-                task.data.pop(self.waveform_key, None)
-                return [task]
-
-            original_file = task.data.get("audio_filepath", "unknown")
-            file_name = os.path.basename(original_file) if original_file != "unknown" else task.task_id
-            total_duration = sum((s["end"] - s["start"]) for s in segments)
-            logger.info(
-                f"[VADSegmentation] {file_name}: {len(segments)} segments extracted ({total_duration:.1f}s total speech)"
-            )
-
-            if self.nested:
-                task.data["segments"] = [
-                    self._build_segment_item(task.data, waveform, sample_rate, seg, i)
-                    for i, seg in enumerate(segments)
-                ]
-                del task.data[self.waveform_key]
-                return task
-
-            output_tasks: list[AudioTask] = []
-            for i, segment in enumerate(segments):
-                seg_data = self._build_segment_item(task.data, waveform, sample_rate, segment, i)
-                seg_task = AudioTask(
-                    data=seg_data,
-                    task_id=f"{task.task_id}_seg_{i}",
-                    dataset_name=task.dataset_name,
-                )
-                if task._metadata:
-                    seg_task._metadata = dict(task._metadata)
-                output_tasks.append(seg_task)
-
+            return self._emit_segments(task, waveform, sample_rate, segments)
         except Exception as e:  # noqa: BLE001
             # A crash here (e.g. a corrupt/degenerate waveform) must not silently drop
             # the recording — that would leave its shard one input short forever and
             # ``.jsonl.done`` would never be written. Forward a read_error placeholder.
             logger.exception(f"Error during VAD segmentation: {e}")
             return [self._as_read_error(task)]
-        else:
-            return output_tasks
 
-    def _get_vad_segments(self, waveform: torch.Tensor, sample_rate: int) -> list[dict[str, float]]:
-        """Get speech segments using VAD."""
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+        """Batch independent recordings through the recurrent TensorRT engine."""
+        if self.backend != "tensorrt":
+            return super().process_batch(tasks)
+        if self._vad_model is None:
+            msg = "VAD model failed to initialize. Cannot process audio."
+            raise RuntimeError(msg)
+
+        resolved: list[tuple[int, AudioTask, torch.Tensor, int, torch.Tensor, int]] = []
+        results_by_index: list[list[AudioTask] | None] = [None] * len(tasks)
+        for index, task in enumerate(tasks):
+            if task.data.get("read_error"):
+                results_by_index[index] = [self._as_read_error(task)]
+                continue
+            try:
+                audio_result = self._resolve_audio(task.data)
+                if audio_result is None:
+                    results_by_index[index] = []
+                    continue
+                waveform, sample_rate = audio_result
+                vad_waveform, vad_sample_rate = self._prepare_vad_waveform(waveform, sample_rate)
+                resolved.append((index, task, waveform, sample_rate, vad_waveform, vad_sample_rate))
+            except Exception as e:  # noqa: BLE001
+                logger.exception(f"Error preparing audio for VAD segmentation: {e}")
+                results_by_index[index] = [self._as_read_error(task)]
+
+        if not resolved:
+            return [result for task_results in results_by_index if task_results for result in task_results]
+        probabilities = self._vad_model.infer_probabilities([item[4] for item in resolved])
+        for (index, task, waveform, sample_rate, vad_waveform, vad_sample_rate), recording_probs in zip(
+            resolved, probabilities, strict=True
+        ):
+            try:
+                timestamps = get_speech_timestamps(
+                    vad_waveform,
+                    _PrecomputedProbabilityModel(recording_probs),
+                    sampling_rate=vad_sample_rate,
+                    threshold=self.threshold,
+                    min_speech_duration_ms=self.min_duration_sec * 1000,
+                    max_speech_duration_s=self.max_duration_sec,
+                    min_silence_duration_ms=self.min_interval_ms,
+                    speech_pad_ms=self.speech_pad_ms,
+                )
+                segments = [
+                    {"start": timestamp["start"] / vad_sample_rate, "end": timestamp["end"] / vad_sample_rate}
+                    for timestamp in timestamps
+                ]
+                result = self._emit_segments(task, waveform, sample_rate, segments)
+                results_by_index[index] = result if isinstance(result, list) else [result]
+            except Exception as e:  # noqa: BLE001, PERF203
+                logger.exception(f"Error during VAD segmentation: {e}")
+                results_by_index[index] = [self._as_read_error(task)]
+        return [result for task_results in results_by_index if task_results for result in task_results]
+
+    def _prepare_vad_waveform(self, waveform: torch.Tensor, sample_rate: int) -> tuple[torch.Tensor, int]:
+        """Convert one waveform to mono and the backend's required sample rate/device."""
         if waveform.dim() > 1:
             waveform = waveform.mean(dim=0) if waveform.shape[0] > 1 else waveform.squeeze(0)
 
-        if self._device is not None and waveform.device != self._device:
-            waveform = waveform.to(self._device)
-
-        vad_sample_rate = sample_rate
-        vad_waveform = waveform
-        if sample_rate not in SILERO_SUPPORTED_RATES:
-            logger.debug(f"Resampling audio from {sample_rate}Hz to {SILERO_TARGET_RATE}Hz for VAD")
-            device = waveform.device
+        target_rate = SILERO_TARGET_RATE
+        needs_resample = (
+            sample_rate != target_rate if self.backend == "tensorrt" else sample_rate not in SILERO_SUPPORTED_RATES
+        )
+        if needs_resample:
+            logger.debug(f"Resampling audio from {sample_rate}Hz to {target_rate}Hz for VAD")
             waveform_cpu = waveform.cpu() if waveform.device.type != "cpu" else waveform
             if waveform_cpu.dim() == 1:
                 waveform_cpu = waveform_cpu.unsqueeze(0)
-            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=SILERO_TARGET_RATE)
-            vad_waveform = resampler(waveform_cpu).squeeze(0)
-            if device.type != "cpu":
-                vad_waveform = vad_waveform.to(device)
-            vad_sample_rate = SILERO_TARGET_RATE
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_rate)
+            waveform = resampler(waveform_cpu).squeeze(0)
+            sample_rate = target_rate
 
-        speech_timestamps = get_speech_timestamps(
-            vad_waveform,
-            self._vad_model,
-            sampling_rate=vad_sample_rate,
-            threshold=self.threshold,
-            min_speech_duration_ms=self.min_duration_sec * 1000,
-            max_speech_duration_s=self.max_duration_sec,
-            min_silence_duration_ms=self.min_interval_ms,
-            speech_pad_ms=self.speech_pad_ms,
-        )
+        if self._device is not None and waveform.device != self._device:
+            waveform = waveform.to(self._device)
+        return waveform, sample_rate
+
+    def _get_vad_segments(self, waveform: torch.Tensor, sample_rate: int) -> list[dict[str, float]]:
+        """Get speech segments using VAD."""
+        vad_waveform, vad_sample_rate = self._prepare_vad_waveform(waveform, sample_rate)
+
+        with torch.inference_mode():
+            speech_timestamps = get_speech_timestamps(
+                vad_waveform,
+                self._vad_model,
+                sampling_rate=vad_sample_rate,
+                threshold=self.threshold,
+                min_speech_duration_ms=self.min_duration_sec * 1000,
+                max_speech_duration_s=self.max_duration_sec,
+                min_silence_duration_ms=self.min_interval_ms,
+                speech_pad_ms=self.speech_pad_ms,
+            )
 
         segments = []
         for ts in speech_timestamps:

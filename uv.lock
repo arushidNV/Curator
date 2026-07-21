@@ -4939,6 +4939,7 @@ all = [
     { name = "sentencepiece" },
     { name = "silero-vad" },
     { name = "soundfile" },
+    { name = "tensorrt", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "timm" },
     { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "torch", version = "2.9.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -4989,6 +4990,24 @@ audio-cuda12 = [
     { name = "scipy", version = "1.16.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "silero-vad" },
     { name = "soundfile" },
+    { name = "torchaudio", version = "2.9.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
+    { name = "torchaudio", version = "2.9.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "torchcodec" },
+]
+audio-tensorrt = [
+    { name = "gpustat" },
+    { name = "librosa" },
+    { name = "nemo-toolkit", extra = ["asr"] },
+    { name = "nvidia-cudnn-cu12" },
+    { name = "nvidia-ml-py" },
+    { name = "onnx" },
+    { name = "onnxruntime-gpu", marker = "platform_machine == 'x86_64'" },
+    { name = "pydub" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.16.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "silero-vad" },
+    { name = "soundfile" },
+    { name = "tensorrt", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torchaudio", version = "2.9.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'" },
     { name = "torchaudio", version = "2.9.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "torchcodec" },
@@ -5248,7 +5267,8 @@ requires-dist = [
     { name = "mwparserfromhell", marker = "extra == 'text-cpu'", specifier = "==0.6.5" },
     { name = "nemo-curator", extras = ["audio-common"], marker = "extra == 'audio-cpu'" },
     { name = "nemo-curator", extras = ["audio-common"], marker = "extra == 'audio-cuda12'" },
-    { name = "nemo-curator", extras = ["audio-cuda12"], marker = "extra == 'all'" },
+    { name = "nemo-curator", extras = ["audio-cuda12"], marker = "extra == 'audio-tensorrt'" },
+    { name = "nemo-curator", extras = ["audio-tensorrt"], marker = "extra == 'all'" },
     { name = "nemo-curator", extras = ["cuda12"], marker = "extra == 'audio-cuda12'" },
     { name = "nemo-curator", extras = ["cuda12"], marker = "extra == 'image-cuda12'" },
     { name = "nemo-curator", extras = ["cuda12"], marker = "extra == 'inference-server'" },
@@ -5317,6 +5337,7 @@ requires-dist = [
     { name = "sentencepiece", marker = "extra == 'text-cpu'" },
     { name = "silero-vad", marker = "extra == 'audio-common'" },
     { name = "soundfile", marker = "extra == 'audio-common'", specifier = ">=0.12.0" },
+    { name = "tensorrt", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'audio-tensorrt'", specifier = "==10.9.0.34" },
     { name = "timm", marker = "extra == 'interleaved-cpu'" },
     { name = "torch", marker = "platform_machine != 'x86_64' or sys_platform == 'darwin'", index = "https://pypi.org/simple" },
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", index = "https://download.pytorch.org/whl/cu128" },
@@ -5337,7 +5358,7 @@ requires-dist = [
     { name = "vllm", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vllm'", specifier = ">=0.14.1" },
     { name = "warcio", marker = "extra == 'text-cpu'" },
 ]
-provides-extras = ["cuda12", "vllm", "inference-server", "deduplication-cuda12", "audio-common", "audio-cpu", "audio-cuda12", "image-cpu", "image-cuda12", "text-cpu", "text-cuda12", "video-cpu", "video-cuda12", "math-cpu", "math-cuda12", "interleaved-cpu", "interleaved-cuda12", "sdg-cpu", "sdg-cuda12", "all"]
+provides-extras = ["cuda12", "vllm", "inference-server", "deduplication-cuda12", "audio-common", "audio-cpu", "audio-cuda12", "audio-tensorrt", "image-cpu", "image-cuda12", "text-cpu", "text-cuda12", "video-cpu", "video-cuda12", "math-cpu", "math-cuda12", "interleaved-cpu", "interleaved-cuda12", "sdg-cpu", "sdg-cuda12", "all"]
 
 [package.metadata.requires-dev]
 build = [
@@ -9223,6 +9244,46 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/7a/13/e503968fefabd4c6b2650af21e110aa8466fe21432cd7c43a84577a89438/tensorboard_data_server-0.7.2-py3-none-any.whl", hash = "sha256:7e0610d205889588983836ec05dc098e80f97b7e7bbff7e994ebb78f578d0ddb", size = 2356, upload-time = "2023-10-23T21:23:32.16Z" },
     { url = "https://files.pythonhosted.org/packages/b7/85/dabeaf902892922777492e1d253bb7e1264cadce3cea932f7ff599e53fea/tensorboard_data_server-0.7.2-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:9fe5d24221b29625dbc7328b0436ca7fc1c23de4acf4d272f1180856e32f9f60", size = 4823598, upload-time = "2023-10-23T21:23:33.714Z" },
     { url = "https://files.pythonhosted.org/packages/73/c6/825dab04195756cf8ff2e12698f22513b3db2f64925bdd41671bfb33aaa5/tensorboard_data_server-0.7.2-py3-none-manylinux_2_31_x86_64.whl", hash = "sha256:ef687163c24185ae9754ed5650eb5bc4d84ff257aabdc33f0cc6f74d8ba54530", size = 6590363, upload-time = "2023-10-23T21:23:35.583Z" },
+]
+
+[[package]]
+name = "tensorrt"
+version = "10.9.0.34"
+source = { registry = "https://pypi.nvidia.com/" }
+dependencies = [
+    { name = "tensorrt-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+sdist = { url = "https://pypi.nvidia.com/tensorrt/tensorrt-10.9.0.34.tar.gz", hash = "sha256:c68f6ca5ebd017bf1ebf40c8c92e3be619326882c738b8597d20720cf0376d09" }
+
+[[package]]
+name = "tensorrt-cu12"
+version = "10.9.0.34"
+source = { registry = "https://pypi.nvidia.com/" }
+dependencies = [
+    { name = "tensorrt-cu12-bindings", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "tensorrt-cu12-libs", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+sdist = { url = "https://pypi.nvidia.com/tensorrt-cu12/tensorrt_cu12-10.9.0.34.tar.gz", hash = "sha256:4b0472164c2e0f2956f3f9dd0b847d3c11ca3138bbb6f53d788da0f84a374182" }
+
+[[package]]
+name = "tensorrt-cu12-bindings"
+version = "10.9.0.34"
+source = { registry = "https://pypi.nvidia.com/" }
+wheels = [
+    { url = "https://pypi.nvidia.com/tensorrt-cu12-bindings/tensorrt_cu12_bindings-10.9.0.34-cp310-none-manylinux_2_28_x86_64.whl", hash = "sha256:7241fa4d0f9b87f20b5f8c490d9c36fdbb61313535555be46037cf7a0640a1b8" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu12-bindings/tensorrt_cu12_bindings-10.9.0.34-cp311-none-manylinux_2_28_x86_64.whl", hash = "sha256:50c78fd66dbb515b135d5f4fe28790f2eda119756950b51a6a45a77736a14b47" },
+    { url = "https://pypi.nvidia.com/tensorrt-cu12-bindings/tensorrt_cu12_bindings-10.9.0.34-cp312-none-manylinux_2_28_x86_64.whl", hash = "sha256:5bc99385f84bdab148df3776e92705c420698b40de4d74159034095a876c8a2b" },
+]
+
+[[package]]
+name = "tensorrt-cu12-libs"
+version = "10.9.0.34"
+source = { registry = "https://pypi.nvidia.com/" }
+dependencies = [
+    { name = "nvidia-cuda-runtime-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+wheels = [
+    { url = "https://pypi.nvidia.com/tensorrt-cu12-libs/tensorrt_cu12_libs-10.9.0.34-py2.py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:4a82f0bda2874596f202f6edc8dae99b86a3c4ec2fa142a9c847c4d3a57864a0" },
 ]
 
 [[package]]
