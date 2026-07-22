@@ -89,7 +89,9 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.output_key, self.confidence_key, self.source_key]
 
     def process(self, task: AudioTask) -> AudioTask:
-        sb_lang = str(task.data.get(self.speechbrain_language_key, "") or "").strip().lower()
+        sb_raw = str(task.data.get(self.speechbrain_language_key, "") or "").strip()
+        # SpeechBrain may return "ta: Tamil" — extract just the code before the colon.
+        sb_lang = sb_raw.split(":")[0].strip().lower()
         sb_confidence = float(task.data.get(self.speechbrain_confidence_key, 0.0) or 0.0)
 
         canary_lang = str(task.data.get(self.indic_canary_language_key, "") or "").strip()
