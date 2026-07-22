@@ -20,6 +20,8 @@ import math
 
 import numpy as np
 
+_MINIMUM_CHUNK_DURATION_SEC = 0.1
+
 
 def model_training_max_duration(model: object) -> float:
     """Read the training audio upper bound from a loaded NeMo model."""
@@ -78,8 +80,12 @@ def split_waveforms(
             msg = f"Audio sample rate must be positive, got {sample_rate!r}"
             raise ValueError(msg)
         chunk_samples = max(1, int(max_duration_sec * rate))
+        minimum_chunk_samples = min(chunk_samples, max(1, round(_MINIMUM_CHUNK_DURATION_SEC * rate)))
         for start in range(0, arr.shape[0], chunk_samples):
-            chunks.append(arr[start : start + chunk_samples])
+            chunk = arr[start : start + chunk_samples]
+            if chunk.shape[0] < minimum_chunk_samples:
+                chunk = np.pad(chunk, (0, minimum_chunk_samples - chunk.shape[0]))
+            chunks.append(chunk)
             chunk_sample_rates.append(rate)
             owners.append(owner)
     return chunks, chunk_sample_rates, owners

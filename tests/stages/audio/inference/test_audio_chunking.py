@@ -53,6 +53,19 @@ def test_split_waveforms_uses_consecutive_non_overlapping_windows() -> None:
     assert owners == [0, 0, 0]
 
 
+def test_split_waveforms_zero_pads_tiny_final_chunk() -> None:
+    waveform = np.arange(21, dtype=np.float32)
+
+    chunks, sample_rates, owners = split_waveforms([waveform], [100], max_duration_sec=0.2)
+
+    assert [chunk.shape[0] for chunk in chunks] == [20, 10]
+    np.testing.assert_array_equal(chunks[0], waveform[:20])
+    np.testing.assert_array_equal(chunks[1][:1], waveform[20:])
+    np.testing.assert_array_equal(chunks[1][1:], np.zeros(9, dtype=np.float32))
+    assert sample_rates == [100, 100]
+    assert owners == [0, 0]
+
+
 def test_merge_chunk_texts_preserves_input_order_and_empty_audio() -> None:
     texts = merge_chunk_texts([" first ", "", "second", "third"], [0, 0, 0, 2], 3)
     assert texts == ["first second", "", "third"]
