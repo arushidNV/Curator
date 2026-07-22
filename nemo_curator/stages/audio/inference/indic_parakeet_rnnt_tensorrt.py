@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import gc
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,69 +29,32 @@ from nemo_curator.stages.audio.inference.audio_chunking import (
     model_chunk_duration,
     split_waveforms,
 )
-from nemo_curator.stages.audio.inference.tensorrt_encoder import TensorRTEncoder, TensorRTEncoderSession
+from nemo_curator.stages.audio.inference.tensorrt_encoder import (
+    ENGINE_FILENAME,
+    MODEL_FILENAME,
+    TensorRTEncoder,
+)
+from nemo_curator.stages.audio.inference.tensorrt_encoder import (
+    load_engine_metadata as _load_engine_metadata,
+)
 
 if TYPE_CHECKING:
     import numpy as np
 
-_ENGINE_FILENAME = "encoder.plan"
-_METADATA_FILENAME = "metadata.json"
-_MODEL_FILENAME = "model.nemo"
-_INPUT_NAMES = {"audio_signal", "length"}
-_OUTPUT_NAMES = {"outputs", "encoded_lengths"}
 
-
-def load_engine_metadata(engine_dir: str | Path) -> dict[str, Any]:  # noqa: C901
+def load_engine_metadata(engine_dir: str | Path) -> dict[str, Any]:
     """Load and validate an Indic Parakeet RNN-T engine bundle manifest."""
-    path = Path(engine_dir) / _METADATA_FILENAME
-    if not path.is_file():
-        msg = f"TensorRT engine metadata not found: {path}"
-        raise FileNotFoundError(msg)
-    try:
-        metadata = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        msg = f"Could not read TensorRT engine metadata: {path}"
-        raise ValueError(msg) from error
-
-    if metadata.get("schema_version") != 1:
-        msg = f"Unsupported TensorRT engine metadata schema: {metadata.get('schema_version')!r}"
-        raise ValueError(msg)
-    if metadata.get("model_type") != "indic_parakeet_rnnt":
-        msg = f"Unsupported TensorRT engine model type: {metadata.get('model_type')!r}"
-        raise ValueError(msg)
-    if metadata.get("precision") != "fp16":
-        msg = f"Unsupported TensorRT engine precision: {metadata.get('precision')!r}"
-        raise ValueError(msg)
-    if metadata.get("engine_file") != _ENGINE_FILENAME or metadata.get("model_file") != _MODEL_FILENAME:
-        msg = "TensorRT engine metadata does not describe the expected bundle filenames"
-        raise ValueError(msg)
-    if set(metadata.get("input_names", [])) != _INPUT_NAMES:
-        msg = f"Unexpected TensorRT encoder inputs: {metadata.get('input_names')!r}"
-        raise ValueError(msg)
-    if set(metadata.get("output_names", [])) != _OUTPUT_NAMES:
-        msg = f"Unexpected TensorRT encoder outputs: {metadata.get('output_names')!r}"
-        raise ValueError(msg)
-    for key in ("sample_rate", "feature_count", "subsampling_factor", "vocabulary_size", "max_symbols_per_step"):
-        if not isinstance(metadata.get(key), int) or metadata[key] < 1:
-            msg = f"Invalid TensorRT engine metadata value for {key}: {metadata.get(key)!r}"
-            raise ValueError(msg)
-    return metadata
-
-
-class TensorRTParakeetEncoder(TensorRTEncoder):
-    """Conformer encoder adapter backed by Curator's persistent TensorRT session."""
-
-    def __init__(
-        self,
-        engine_path: str | Path,
-        *,
-        subsampling_factor: int,
-        session: TensorRTEncoderSession | None = None,
-    ) -> None:
-        super().__init__(engine_path, subsampling_factor=subsampling_factor, session=session)
-
-
-TensorRTParakeetEncoderSession = TensorRTEncoderSession
+    return _load_engine_metadata(
+        engine_dir,
+        model_type="indic_parakeet_rnnt",
+        required_positive_ints=(
+            "sample_rate",
+            "feature_count",
+            "subsampling_factor",
+            "vocabulary_size",
+            "max_symbols_per_step",
+        ),
+    )
 
 
 class TensorRTParakeetRNNTModel(NemoASRModel):
@@ -106,8 +68,8 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
     ) -> None:
         self.engine_dir = Path(engine_dir)
         self.metadata = load_engine_metadata(self.engine_dir)
-        engine_path = self.engine_dir / _ENGINE_FILENAME
-        model_path = self.engine_dir / _MODEL_FILENAME
+        engine_path = self.engine_dir / ENGINE_FILENAME
+        model_path = self.engine_dir / MODEL_FILENAME
         if not engine_path.is_file():
             msg = f"TensorRT encoder engine not found: {engine_path}"
             raise FileNotFoundError(msg)
@@ -117,7 +79,7 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
 
         super().__init__(model_name=str(model_path), inference_batch_size=inference_batch_size)
         self._engine_path = engine_path
-        self._trt_encoder: TensorRTParakeetEncoder | None = None
+        self._trt_encoder: TensorRTEncoder | None = None
         self._chunk_duration_sec: float | None = None
 
     def _disable_cuda_graphs(self) -> None:
@@ -143,16 +105,19 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
         self._enable_batched_greedy_decoder()
 
         original_encoder = self.asr_model.encoder
-        self._trt_encoder = TensorRTParakeetEncoder(
-            self._engine_path,
-            subsampling_factor=int(self.metadata["subsampling_factor"]),
-        )
-        max_feature_frames = self._trt_encoder.max_input_shape("audio_signal")[2]
-        self._chunk_duration_sec = model_chunk_duration(self.asr_model, max_feature_frames)
-        self.asr_model.encoder = self._trt_encoder
+        self.asr_model.encoder = None
         del original_encoder
         gc.collect()
         torch.cuda.empty_cache()
+        self._trt_encoder = TensorRTEncoder(
+            self._engine_path,
+            subsampling_factor=int(self.metadata["subsampling_factor"]),
+        )
+        max_input_shape = self._trt_encoder.max_input_shape("audio_signal")
+        self.inference_batch_size = min(self.inference_batch_size, max_input_shape[0])
+        max_feature_frames = max_input_shape[2]
+        self._chunk_duration_sec = model_chunk_duration(self.asr_model, max_feature_frames)
+        self.asr_model.encoder = self._trt_encoder
         logger.info(f"Indic Parakeet TensorRT encoder loaded: {self._engine_path}")
 
     def _validate_model(self) -> None:

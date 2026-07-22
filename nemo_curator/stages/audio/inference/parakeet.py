@@ -173,7 +173,7 @@ class InferenceParakeetStage(ProcessingStage[AudioTask, AudioTask]):
         msg = "InferenceParakeetStage only supports process_batch"
         raise NotImplementedError(msg)
 
-    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:  # noqa: C901, PLR0912
         if len(tasks) == 0:
             return []
         if self._wrapper is None or self._wrapper.asr_model is None:

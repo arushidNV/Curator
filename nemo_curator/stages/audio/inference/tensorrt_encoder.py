@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared TensorRT execution adapter for exported NeMo encoders."""
+"""Shared TensorRT bundle validation and execution for exported NeMo encoders."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -26,6 +27,80 @@ if TYPE_CHECKING:
 
 _INPUT_NAMES = {"audio_signal", "length"}
 _OUTPUT_NAMES = {"outputs", "encoded_lengths"}
+_ENCODER_INPUT_RANK = 3
+ENGINE_FILENAME = "encoder.plan"
+METADATA_FILENAME = "metadata.json"
+MODEL_FILENAME = "model.nemo"
+
+
+def _validate_tensor_names(metadata: dict[str, Any]) -> None:
+    for key, expected_names in (("input_names", _INPUT_NAMES), ("output_names", _OUTPUT_NAMES)):
+        names = metadata.get(key)
+        if (
+            not isinstance(names, list)
+            or any(not isinstance(name, str) for name in names)
+            or set(names) != expected_names
+        ):
+            msg = f"Unexpected TensorRT encoder {key.replace('_', ' ')}: {names!r}"
+            raise ValueError(msg)
+
+
+def _validate_profile(metadata: dict[str, Any]) -> None:
+    profile = metadata.get("profile")
+    if not isinstance(profile, dict):
+        msg = f"Invalid TensorRT engine profile: {profile!r}"
+        raise TypeError(msg)
+    points = [profile.get(point) for point in ("min", "opt", "max")]
+    if any(not isinstance(point, dict) for point in points):
+        msg = f"Invalid TensorRT engine profile points: {points!r}"
+        raise TypeError(msg)
+    for dimension in ("batch", "feature_frames"):
+        values = [point.get(dimension) for point in points]
+        if any(type(value) is not int for value in values) or not 1 <= values[0] <= values[1] <= values[2]:
+            msg = f"Invalid TensorRT engine profile {dimension}: {values!r}"
+            raise ValueError(msg)
+
+
+def load_engine_metadata(
+    engine_dir: str | Path,
+    *,
+    model_type: str,
+    required_positive_ints: tuple[str, ...],
+) -> dict[str, Any]:
+    """Load and validate a TensorRT encoder bundle manifest."""
+    path = Path(engine_dir) / METADATA_FILENAME
+    if not path.is_file():
+        msg = f"TensorRT engine metadata not found: {path}"
+        raise FileNotFoundError(msg)
+    try:
+        metadata = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        msg = f"Could not read TensorRT engine metadata: {path}"
+        raise ValueError(msg) from error
+    if not isinstance(metadata, dict):
+        msg = f"TensorRT engine metadata must be a JSON object: {path}"
+        raise TypeError(msg)
+
+    expected_values = {
+        "schema_version": 1,
+        "model_type": model_type,
+        "precision": "fp16",
+        "engine_file": ENGINE_FILENAME,
+        "model_file": MODEL_FILENAME,
+    }
+    for key, expected in expected_values.items():
+        if metadata.get(key) != expected:
+            display_key = key.replace("_", " ")
+            msg = f"Unexpected TensorRT engine metadata {display_key}: {metadata.get(key)!r}; expected {expected!r}"
+            raise ValueError(msg)
+    _validate_tensor_names(metadata)
+    for key in required_positive_ints:
+        if type(metadata.get(key)) is not int or metadata[key] < 1:
+            msg = f"Invalid TensorRT engine metadata value for {key}: {metadata.get(key)!r}"
+            raise ValueError(msg)
+
+    _validate_profile(metadata)
+    return metadata
 
 
 def _trt_dtype_to_torch(dtype: object) -> torch.dtype:
@@ -84,7 +159,10 @@ class TensorRTEncoderSession:
                 self.input_names.append(name)
             else:
                 self.output_names.append(name)
-        self._output_buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor] = {}
+        # Audio lengths can produce many distinct dynamic shapes. Retaining one
+        # allocation for every observed shape would grow worker GPU memory
+        # without bound, so keep only the current allocation for each output.
+        self._output_buffers: dict[str, torch.Tensor] = {}
 
     def _prepare_input(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.device.type != "cuda":
@@ -99,15 +177,20 @@ class TensorRTEncoderSession:
             msg = f"TensorRT did not resolve encoder output shape for {name!r}: {shape}"
             raise RuntimeError(msg)
         dtype = _trt_dtype_to_torch(self._engine.get_tensor_dtype(name))
-        key = (name, shape, dtype)
-        if key not in self._output_buffers:
-            self._output_buffers[key] = torch.empty(shape, dtype=dtype, device=self.device)
-        return self._output_buffers[key]
+        output = self._output_buffers.get(name)
+        if output is None or output.shape != shape or output.dtype != dtype:
+            output = torch.empty(shape, dtype=dtype, device=self.device)
+            self._output_buffers[name] = output
+        return output
 
     def infer(self, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         missing = set(self.input_names) - set(inputs)
         if missing:
             msg = f"Missing TensorRT encoder inputs: {sorted(missing)}"
+            raise KeyError(msg)
+        unexpected = set(inputs) - set(self.input_names)
+        if unexpected:
+            msg = f"Unexpected TensorRT encoder inputs: {sorted(unexpected)}"
             raise KeyError(msg)
         prepared = {name: self._prepare_input(name, inputs[name]) for name in self.input_names}
         current_stream = torch.cuda.current_stream(self.device)
@@ -118,13 +201,17 @@ class TensorRTEncoderSession:
                 if self._context.set_input_shape(name, tuple(tensor.shape)) is False:
                     msg = f"Input shape {tuple(tensor.shape)} is outside the TensorRT profile for {name!r}"
                     raise RuntimeError(msg)
-                self._context.set_tensor_address(name, tensor.data_ptr())
+                if self._context.set_tensor_address(name, tensor.data_ptr()) is False:
+                    msg = f"Failed to bind TensorRT input tensor {name!r}"
+                    raise RuntimeError(msg)
                 tensor.record_stream(self._stream)
 
             outputs = {}
             for name in self.output_names:
                 output = self._output_buffer(name, tuple(self._context.get_tensor_shape(name)))
-                self._context.set_tensor_address(name, output.data_ptr())
+                if self._context.set_tensor_address(name, output.data_ptr()) is False:
+                    msg = f"Failed to bind TensorRT output tensor {name!r}"
+                    raise RuntimeError(msg)
                 outputs[name] = output
             if not self._context.execute_async_v3(self._stream.cuda_stream):
                 msg = "TensorRT encoder execute_async_v3 failed"
@@ -141,13 +228,21 @@ class TensorRTEncoderSession:
         self._engine = None
         self._runtime = None
 
-    def max_input_shape(self, name: str, profile_index: int = 0) -> tuple[int, ...]:
-        """Return an input tensor's maximum shape from the serialized engine profile."""
+    def input_shape_range(
+        self,
+        name: str,
+        profile_index: int = 0,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        """Return an input tensor's minimum, optimum, and maximum profile shapes."""
         if name not in self.input_names:
             msg = f"TensorRT encoder input not found: {name!r}"
             raise KeyError(msg)
         profile_shapes = self._engine.get_tensor_profile_shape(name, profile_index)
-        return tuple(int(dimension) for dimension in profile_shapes[2])
+        return tuple(tuple(int(dimension) for dimension in shape) for shape in profile_shapes)
+
+    def max_input_shape(self, name: str, profile_index: int = 0) -> tuple[int, ...]:
+        """Return an input tensor's maximum shape from the serialized engine profile."""
+        return self.input_shape_range(name, profile_index)[2]
 
 
 class TensorRTEncoder(torch.nn.Module):
@@ -176,8 +271,36 @@ class TensorRTEncoder(torch.nn.Module):
             raise ValueError(msg)
 
     def forward(self, audio_signal: torch.Tensor, length: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if audio_signal.ndim != _ENCODER_INPUT_RANK or length.ndim != 1 or audio_signal.shape[0] != length.shape[0]:
+            msg = "TensorRT encoder expects audio_signal shaped [batch, features, frames] and length shaped [batch]"
+            raise ValueError(msg)
+
+        batch_size, feature_count, feature_frames = audio_signal.shape
+        min_shape, _, max_shape = self.session.input_shape_range("audio_signal")
+        if feature_count != min_shape[1]:
+            msg = f"TensorRT encoder expects {min_shape[1]} input features, got {feature_count}"
+            raise ValueError(msg)
+        if batch_size > max_shape[0] or feature_frames > max_shape[2]:
+            msg = f"TensorRT encoder input shape {tuple(audio_signal.shape)} exceeds profile maximum {max_shape}"
+            raise ValueError(msg)
+
+        padded_batch = max(batch_size, min_shape[0])
+        padded_frames = max(feature_frames, min_shape[2])
+        if padded_batch != batch_size or padded_frames != feature_frames:
+            audio_signal = torch.nn.functional.pad(
+                audio_signal,
+                (0, padded_frames - feature_frames, 0, 0, 0, padded_batch - batch_size),
+            )
+            length = torch.nn.functional.pad(
+                length,
+                (0, padded_batch - batch_size),
+                value=min_shape[2],
+            )
+
         outputs = self.session.infer({"audio_signal": audio_signal, "length": length})
-        return outputs["outputs"], outputs["encoded_lengths"]
+        if padded_batch == batch_size:
+            return outputs["outputs"], outputs["encoded_lengths"]
+        return outputs["outputs"][:batch_size], outputs["encoded_lengths"][:batch_size]
 
     def freeze(self) -> None:
         self.eval()

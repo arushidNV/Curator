@@ -65,6 +65,10 @@ def split_waveforms(
     max_duration_sec: float,
 ) -> tuple[list[np.ndarray], list[int], list[int]]:
     """Split time-first waveforms into consecutive chunks and return their input owners."""
+    if not math.isfinite(max_duration_sec) or max_duration_sec <= 0:
+        msg = f"Maximum chunk duration must be positive and finite, got {max_duration_sec!r}"
+        raise ValueError(msg)
+
     chunks: list[np.ndarray] = []
     chunk_sample_rates: list[int] = []
     owners: list[int] = []
@@ -72,8 +76,13 @@ def split_waveforms(
         arr = np.asarray(waveform)
         if arr.size == 0:
             continue
-        if arr.ndim == 0:
-            msg = "Audio waveform must have a time dimension"
+        if arr.ndim == 2:  # noqa: PLR2004
+            # Curator readers normally emit mono 1-D arrays. Preserve compatibility
+            # with channels-first and channels-last inputs from older stages.
+            channel_axis = 0 if arr.shape[0] <= arr.shape[1] else 1
+            arr = arr.mean(axis=channel_axis)
+        elif arr.ndim != 1:
+            msg = f"Audio waveform must be one- or two-dimensional, got shape {arr.shape}"
             raise ValueError(msg)
         rate = int(sample_rate)
         if rate <= 0:
@@ -93,8 +102,14 @@ def split_waveforms(
 
 def merge_chunk_texts(chunk_texts: list[str], owners: list[int], num_inputs: int) -> list[str]:
     """Join ordered, non-empty chunk transcripts for each original input."""
+    if num_inputs < 0:
+        msg = f"Number of inputs cannot be negative: {num_inputs}"
+        raise ValueError(msg)
     grouped: list[list[str]] = [[] for _ in range(num_inputs)]
     for text, owner in zip(chunk_texts, owners, strict=True):
+        if owner < 0 or owner >= num_inputs:
+            msg = f"Chunk owner {owner} is outside the input range [0, {num_inputs})"
+            raise ValueError(msg)
         normalized = text.strip()
         if normalized:
             grouped[owner].append(normalized)

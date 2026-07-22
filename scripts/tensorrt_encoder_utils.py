@@ -18,13 +18,19 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import shutil
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import argparse
-    from pathlib import Path
 
     import torch
+
+logger = logging.getLogger(__name__)
 
 
 def export_encoder(
@@ -128,6 +134,7 @@ def validate_engine(  # noqa: PLR0913
     engine_path: Path,
     *,
     feature_count: int,
+    min_batch: int,
     min_frames: int,
     opt_frames: int,
     tolerances: tuple[float, float] = (5e-2, 5e-2),
@@ -139,12 +146,12 @@ def validate_engine(  # noqa: PLR0913
     validation_frames = max(min_frames, min(opt_frames, 256))
     generator = torch.Generator(device="cuda").manual_seed(0)
     audio_signal = torch.randn(
-        (1, feature_count, validation_frames),
+        (min_batch, feature_count, validation_frames),
         generator=generator,
         device="cuda",
         dtype=torch.float16,
     )
-    length = torch.full((1,), validation_frames, device="cuda", dtype=torch.int64)
+    length = torch.full((min_batch,), validation_frames, device="cuda", dtype=torch.int64)
     with torch.inference_mode():
         expected_outputs, expected_lengths = model.encoder(audio_signal=audio_signal, length=length)
 
@@ -156,3 +163,78 @@ def validate_engine(  # noqa: PLR0913
         torch.testing.assert_close(actual["encoded_lengths"], expected_lengths)
     finally:
         session.close()
+
+
+def build_encoder_bundle(  # noqa: PLR0913
+    model: torch.nn.Module,
+    model_path: Path,
+    output_dir: Path,
+    *,
+    args: argparse.Namespace,
+    metadata: dict[str, object],
+    temporary_prefix: str,
+    parity_message: str,
+    tolerances: tuple[float, float] = (5e-2, 5e-2),
+) -> None:
+    """Build and validate a bundle before publishing any final artifacts."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_names = ("encoder.plan", "model.nemo", "metadata.json")
+    destinations = [output_dir / name for name in artifact_names]
+    existing = [str(path) for path in destinations if path.exists()]
+    if existing:
+        msg = f"Refusing to overwrite existing bundle artifacts: {existing}"
+        raise FileExistsError(msg)
+
+    feature_count = int(metadata["feature_count"])
+    with tempfile.TemporaryDirectory(prefix=temporary_prefix, dir=output_dir) as temporary_dir:
+        staging_dir = Path(temporary_dir)
+        onnx_path = staging_dir / "encoder.onnx"
+        engine_path = staging_dir / "encoder.plan"
+        export_encoder(
+            model,
+            onnx_path,
+            feature_count=feature_count,
+            example_frames=args.min_frames,
+        )
+        tensorrt_version = build_engine(
+            onnx_path,
+            engine_path,
+            feature_count=feature_count,
+            args=args,
+        )
+        validate_engine(
+            model,
+            engine_path,
+            feature_count=feature_count,
+            min_batch=args.min_batch,
+            min_frames=args.min_frames,
+            opt_frames=args.opt_frames,
+            tolerances=tolerances,
+        )
+
+        shutil.copy2(model_path, staging_dir / "model.nemo")
+        metadata.update(
+            {
+                "schema_version": 1,
+                "precision": "fp16",
+                "engine_file": "encoder.plan",
+                "model_file": "model.nemo",
+                "source_model": model_path.name,
+                "input_names": ["audio_signal", "length"],
+                "output_names": ["outputs", "encoded_lengths"],
+                "profile": {
+                    "min": {"batch": args.min_batch, "feature_frames": args.min_frames},
+                    "opt": {"batch": args.opt_batch, "feature_frames": args.opt_frames},
+                    "max": {"batch": args.max_batch, "feature_frames": args.max_frames},
+                },
+                "onnx_opset": 17,
+                "tensorrt_version": tensorrt_version,
+            }
+        )
+        (staging_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+
+        for name in artifact_names:
+            (staging_dir / name).replace(output_dir / name)
+
+    logger.info(parity_message)
+    logger.info("Wrote TensorRT encoder bundle to %s", output_dir)

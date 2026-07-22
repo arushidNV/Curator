@@ -74,6 +74,37 @@ asr_stage = InferenceAsrNemoStage(model_name="your_chosen_model_name")
 asr_stage.setup()
 ```
 
+## TensorRT Encoder Backends
+
+Indic Parakeet RNN-T and AI4Bharat IndicConformer stages can replace the NeMo
+encoder with an FP16 TensorRT engine while retaining the checkpoint's tokenizer
+and decoder. Install the optional backend with `nemo-curator[audio_tensorrt]`,
+then build a bundle on the same GPU architecture used for inference:
+
+```bash
+python scripts/build_indic_parakeet_rnnt_tensorrt_engine.py \
+  --model /path/to/model.nemo \
+  --output-dir /path/to/engine-bundle
+```
+
+The command validates TensorRT output parity before publishing `encoder.plan`,
+`model.nemo`, and `metadata.json`. It refuses to overwrite an existing bundle.
+
+```python
+from nemo_curator.stages.audio.inference.parakeet import InferenceParakeetStage
+
+asr_stage = InferenceParakeetStage(
+    backend="tensorrt",
+    tensorrt_engine_dir="/path/to/engine-bundle",
+    supported_langs=frozenset({"hi", "ta", "bn"}),
+)
+```
+
+Use `scripts/build_indic_conformer_tensorrt_engine.py` and
+`InferenceIndicConformerHybridStage` for an IndicConformer checkpoint. Both
+backends split inputs longer than the checkpoint's training window into
+consecutive chunks and preserve one output transcript per input.
+
 ## Resource Configuration
 
 Configure GPU and CPU resources based on your hardware:
@@ -107,4 +138,3 @@ multi_gpu_stage = InferenceAsrNemoStage(
 :::{note}
 Resource requirements vary by model. Test with your specific model to determine optimal settings.
 :::
-

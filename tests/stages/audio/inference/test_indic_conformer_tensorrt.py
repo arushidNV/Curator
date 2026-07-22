@@ -108,7 +108,7 @@ def test_tensorrt_path_batches_encoder_and_preserves_order() -> None:
         return torch.ones(batch, 80, 4), torch.full((batch,), 4, dtype=length.dtype)
 
     def encoder(*, audio_signal: torch.Tensor, length: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        assert audio_signal.shape[-1] == 8
+        assert audio_signal.shape[-1] == 4
         assert audio_signal.dtype == torch.float16
         encoder_batch_sizes.append(audio_signal.shape[0])
         batch = audio_signal.shape[0]
@@ -129,7 +129,7 @@ def test_tensorrt_path_batches_encoder_and_preserves_order() -> None:
         texts, languages = model.generate(waveforms, [16000] * 4, ["hi", "ta", "bn", "mr"])
 
     assert encoder_batch_sizes == [2, 1]
-    assert [call.args[2] for call in decode_batch.call_args_list] == [["ta", "mr"], ["hi"]]
+    assert [call.args[2] for call in decode_batch.call_args_list] == [["hi", "ta"], ["mr"]]
     assert texts == ["text-hi", "text-ta", "", "text-mr"]
     assert languages == ["hi", "ta", "bn", "mr"]
 
@@ -151,3 +151,31 @@ def test_indic_conformer_chunks_and_merges_before_inference() -> None:
     assert [chunk.shape[0] for chunk in chunks] == [2, 2, 1]
     assert texts == ["first second third"]
     assert languages == ["hi"]
+
+
+def test_tensorrt_path_respects_inference_batch_size() -> None:
+    model = IndicConformerHybridASR("unused.nemo", decode_mode="ctc", inference_batch_size=1)
+    model._device = torch.device("cpu")
+    model._trt_encoder = object()
+    model._trt_metadata = _metadata()
+    model._chunk_duration_sec = 30.0
+    encoder_batch_sizes: list[int] = []
+
+    def preprocessor(*, input_signal: torch.Tensor, length: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch = input_signal.shape[0]
+        return torch.ones(batch, 80, 8), torch.full((batch,), 8, dtype=length.dtype)
+
+    def encoder(*, audio_signal: torch.Tensor, length: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        encoder_batch_sizes.append(audio_signal.shape[0])
+        batch = audio_signal.shape[0]
+        return torch.ones(batch, 512, 2), torch.full((batch,), 2, dtype=length.dtype)
+
+    model._model = SimpleNamespace(preprocessor=preprocessor, encoder=encoder)
+    with patch.object(model, "_decode_ctc_batch", side_effect=lambda _encoded, _length, langs: langs):
+        model.generate(
+            [np.ones(80, dtype=np.float32), np.ones(100, dtype=np.float32)],
+            [16000, 16000],
+            ["hi", "ta"],
+        )
+
+    assert encoder_batch_sizes == [1, 1]

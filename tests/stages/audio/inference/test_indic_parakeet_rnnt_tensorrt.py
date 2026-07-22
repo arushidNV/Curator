@@ -24,11 +24,11 @@ from omegaconf import OmegaConf
 
 from nemo_curator.stages.audio.inference.asr_nemo import NemoASRModel
 from nemo_curator.stages.audio.inference.indic_parakeet_rnnt_tensorrt import (
-    TensorRTParakeetEncoder,
     TensorRTParakeetRNNTModel,
     load_engine_metadata,
 )
 from nemo_curator.stages.audio.inference.parakeet import InferenceParakeetStage
+from nemo_curator.stages.audio.inference.tensorrt_encoder import TensorRTEncoder
 
 
 def _metadata() -> dict[str, object]:
@@ -45,6 +45,11 @@ def _metadata() -> dict[str, object]:
         "max_symbols_per_step": 10,
         "input_names": ["audio_signal", "length"],
         "output_names": ["outputs", "encoded_lengths"],
+        "profile": {
+            "min": {"batch": 1, "feature_frames": 8},
+            "opt": {"batch": 8, "feature_frames": 800},
+            "max": {"batch": 16, "feature_frames": 3000},
+        },
     }
 
 
@@ -68,6 +73,27 @@ def test_load_engine_metadata_rejects_wrong_model_type(tmp_path: Path) -> None:
         load_engine_metadata(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("input_names", None, "input names"),
+        ("profile", {"min": None, "opt": {}, "max": {}}, "profile points"),
+    ],
+)
+def test_load_engine_metadata_rejects_malformed_fields(
+    tmp_path: Path,
+    key: str,
+    value: object,
+    message: str,
+) -> None:
+    metadata = _metadata()
+    metadata[key] = value
+    (tmp_path / "metadata.json").write_text(json.dumps(metadata))
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        load_engine_metadata(tmp_path)
+
+
 def test_tensorrt_encoder_forwards_one_batch() -> None:
     expected_outputs = torch.randn(2, 1024, 4)
     expected_lengths = torch.tensor([4, 3])
@@ -75,11 +101,12 @@ def test_tensorrt_encoder_forwards_one_batch() -> None:
         input_names=["audio_signal", "length"],
         output_names=["outputs", "encoded_lengths"],
     )
+    session.input_shape_range.return_value = ((1, 80, 8), (8, 80, 800), (16, 80, 3000))
     session.infer.return_value = {
         "outputs": expected_outputs,
         "encoded_lengths": expected_lengths,
     }
-    encoder = TensorRTParakeetEncoder("unused.plan", subsampling_factor=8, session=session)
+    encoder = TensorRTEncoder("unused.plan", subsampling_factor=8, session=session)
     audio_signal = torch.randn(2, 80, 32)
     length = torch.tensor([32, 24])
 
@@ -144,7 +171,7 @@ def test_tensorrt_wrapper_replaces_only_encoder(tmp_path: Path) -> None:
         patch("torch.cuda.is_available", return_value=True),
         patch("torch.cuda.empty_cache"),
         patch(
-            "nemo_curator.stages.audio.inference.indic_parakeet_rnnt_tensorrt.TensorRTParakeetEncoder",
+            "nemo_curator.stages.audio.inference.indic_parakeet_rnnt_tensorrt.TensorRTEncoder",
             return_value=optimized_encoder,
         ) as encoder_type,
     ):

@@ -18,13 +18,11 @@
 from __future__ import annotations
 
 import argparse
-import json
-import shutil
-import tempfile
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from tensorrt_encoder_utils import build_engine, export_encoder, validate_engine
+from tensorrt_encoder_utils import build_encoder_bundle
 
 if TYPE_CHECKING:
     import torch
@@ -54,69 +52,28 @@ def build_bundle(args: argparse.Namespace) -> None:
         msg = f"Local NeMo checkpoint not found: {model_path}"
         raise FileNotFoundError(msg)
 
-    output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    destinations = [output_dir / name for name in ("encoder.plan", "model.nemo", "metadata.json")]
-    existing = [str(path) for path in destinations if path.exists()]
-    if existing:
-        msg = f"Refusing to overwrite existing bundle artifacts: {existing}"
-        raise FileExistsError(msg)
-
     model = _load_model(model_path)
     feature_count = int(getattr(model.encoder, "_feat_in", model.cfg.encoder.feat_in))
     subsampling_factor = int(model.encoder.subsampling_factor)
     sample_rate = int(model.cfg.preprocessor.sample_rate)
     vocabulary_size = int(getattr(model.joint, "_vocab_size", model.cfg.joint.num_classes))
 
-    engine_path = output_dir / "encoder.plan"
-    with tempfile.TemporaryDirectory(prefix=".indic-parakeet-rnnt-", dir=output_dir) as temporary_dir:
-        onnx_path = Path(temporary_dir) / "encoder.onnx"
-        export_encoder(
-            model,
-            onnx_path,
-            feature_count=feature_count,
-            example_frames=args.min_frames,
-        )
-        tensorrt_version = build_engine(
-            onnx_path,
-            engine_path,
-            feature_count=feature_count,
-            args=args,
-        )
-
-    validate_engine(
+    build_encoder_bundle(
         model,
-        engine_path,
-        feature_count=feature_count,
-        min_frames=args.min_frames,
-        opt_frames=args.opt_frames,
-    )
-    print("INDIC_PARAKEET_RNNT_TENSORRT_ENCODER_PARITY_PASSED")
-    shutil.copy2(model_path, output_dir / "model.nemo")
-    metadata = {
-        "schema_version": 1,
-        "model_type": "indic_parakeet_rnnt",
-        "precision": "fp16",
-        "engine_file": "encoder.plan",
-        "model_file": "model.nemo",
-        "source_model": model_path.name,
-        "sample_rate": sample_rate,
-        "feature_count": feature_count,
-        "subsampling_factor": subsampling_factor,
-        "vocabulary_size": vocabulary_size,
-        "max_symbols_per_step": args.max_symbols_per_step,
-        "input_names": ["audio_signal", "length"],
-        "output_names": ["outputs", "encoded_lengths"],
-        "profile": {
-            "min": {"batch": args.min_batch, "feature_frames": args.min_frames},
-            "opt": {"batch": args.opt_batch, "feature_frames": args.opt_frames},
-            "max": {"batch": args.max_batch, "feature_frames": args.max_frames},
+        model_path,
+        Path(args.output_dir).resolve(),
+        args=args,
+        metadata={
+            "model_type": "indic_parakeet_rnnt",
+            "sample_rate": sample_rate,
+            "feature_count": feature_count,
+            "subsampling_factor": subsampling_factor,
+            "vocabulary_size": vocabulary_size,
+            "max_symbols_per_step": args.max_symbols_per_step,
         },
-        "onnx_opset": 17,
-        "tensorrt_version": tensorrt_version,
-    }
-    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    print(f"Wrote Indic Parakeet RNN-T TensorRT bundle to {output_dir}")
+        temporary_prefix=".indic-parakeet-rnnt-",
+        parity_message="INDIC_PARAKEET_RNNT_TENSORRT_ENCODER_PARITY_PASSED",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,4 +102,5 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     build_bundle(parse_args())

@@ -165,8 +165,8 @@ def test_ctc_generate_batches_encoder_calls_and_preserves_order() -> None:
     texts, langs = asr.generate(waveforms, [_TARGET_SR] * 4, ["hi"] * 4)
 
     assert [call["shape"][0] for call in model.calls] == [2, 1]
-    assert [call["lengths"] for call in model.calls] == [[7, 10], [15]]
-    assert texts == ["c", "ab", "", "ab"]
+    assert [call["lengths"] for call in model.calls] == [[1600, 1600], [1600]]
+    assert texts == ["ab", "c", "", "ab"]
     assert langs == ["hi", "hi", "hi", "hi"]
 
 

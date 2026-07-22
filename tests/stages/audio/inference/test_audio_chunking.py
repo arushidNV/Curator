@@ -15,6 +15,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from nemo_curator.stages.audio.inference.audio_chunking import (
     merge_chunk_texts,
@@ -66,6 +67,25 @@ def test_split_waveforms_zero_pads_tiny_final_chunk() -> None:
     assert owners == [0, 0]
 
 
+@pytest.mark.parametrize("shape", [(2, 20), (20, 2)])
+def test_split_waveforms_mixes_multichannel_inputs_to_mono(shape: tuple[int, int]) -> None:
+    waveform = np.ones(shape, dtype=np.float32)
+
+    chunks, _, _ = split_waveforms([waveform], [10], max_duration_sec=1.0)
+
+    assert [chunk.shape for chunk in chunks] == [(10,), (10,)]
+
+
+def test_split_waveforms_rejects_invalid_duration() -> None:
+    with pytest.raises(ValueError, match="positive and finite"):
+        split_waveforms([np.ones(10, dtype=np.float32)], [10], max_duration_sec=0)
+
+
 def test_merge_chunk_texts_preserves_input_order_and_empty_audio() -> None:
     texts = merge_chunk_texts([" first ", "", "second", "third"], [0, 0, 0, 2], 3)
     assert texts == ["first second", "", "third"]
+
+
+def test_merge_chunk_texts_rejects_invalid_owner() -> None:
+    with pytest.raises(ValueError, match="outside the input range"):
+        merge_chunk_texts(["text"], [1], 1)

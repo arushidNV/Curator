@@ -50,6 +50,10 @@ absent (a normal NeMo model), every patched path falls back to the original beha
 so importing this module does not change ordinary NeMo usage.
 """
 
+# The compatibility shim mirrors dynamically patched NeMo signatures, so its
+# concrete types and parameter names cannot follow Curator's normal lint rules.
+# ruff: noqa: ANN401, N806, PLR0913, PLW0603
+
 from __future__ import annotations
 
 import gc
@@ -290,14 +294,23 @@ class IndicConformerHybridASR(ModelInterface):
         tensorrt_engine_dir: str | None = None,
         rnnt_precision: Literal["fp32", "fp16"] = "fp32",
     ):
+        if decode_mode not in {"ctc", "rnnt"}:
+            msg = f"Unsupported IndicConformer decode mode: {decode_mode!r}"
+            raise ValueError(msg)
         if rnnt_precision not in {"fp32", "fp16"}:
             msg = f"Unsupported IndicConformer RNNT precision: {rnnt_precision!r}"
+            raise ValueError(msg)
+        if max_symbols_per_step < 1:
+            msg = "max_symbols_per_step must be at least 1"
+            raise ValueError(msg)
+        if inference_batch_size < 1:
+            msg = "inference_batch_size must be at least 1"
             raise ValueError(msg)
         self.model_id = model_id
         self.decode_mode = decode_mode
         self.max_symbols_per_step = max_symbols_per_step
-        self.inference_batch_size = max(1, int(inference_batch_size))
         self.tensorrt_engine_dir = tensorrt_engine_dir
+        self.inference_batch_size = int(inference_batch_size)
         self.rnnt_precision = rnnt_precision
         self._model: Any = None
         self._device: Any = None
@@ -376,11 +389,8 @@ class IndicConformerHybridASR(ModelInterface):
         if self.tensorrt_engine_dir is None:
             nemo_path = self._resolve_nemo_path(self.model_id)
         else:
-            from nemo_curator.stages.audio.inference.indic_conformer_tensorrt import (
-                ENGINE_FILENAME,
-                MODEL_FILENAME,
-                load_engine_metadata,
-            )
+            from nemo_curator.stages.audio.inference.indic_conformer_tensorrt import load_engine_metadata
+            from nemo_curator.stages.audio.inference.tensorrt_encoder import ENGINE_FILENAME, MODEL_FILENAME
 
             if self._device.type != "cuda":
                 msg = "IndicConformer TensorRT inference requires CUDA"
@@ -456,6 +466,12 @@ class IndicConformerHybridASR(ModelInterface):
                 )
                 raise ValueError(msg)
 
+        self._model.encoder = None
+        del encoder
+        gc.collect()
+        import torch
+
+        torch.cuda.empty_cache()
         self._trt_encoder = TensorRTEncoder(
             engine_path,
             subsampling_factor=int(metadata["subsampling_factor"]),
@@ -463,11 +479,6 @@ class IndicConformerHybridASR(ModelInterface):
         max_feature_frames = self._trt_encoder.max_input_shape("audio_signal")[2]
         self._chunk_duration_sec = model_chunk_duration(self._model, max_feature_frames)
         self._model.encoder = self._trt_encoder
-        del encoder
-        gc.collect()
-        import torch
-
-        torch.cuda.empty_cache()
         logger.info(f"IndicConformer TensorRT encoder loaded: {engine_path}")
 
     def teardown(self) -> None:
@@ -482,10 +493,8 @@ class IndicConformerHybridASR(ModelInterface):
         self._trt_metadata = None
         self._chunk_duration_sec = None
         gc.collect()
-        try:
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        except Exception:  # noqa: BLE001, S110
-            pass
 
     # ------------------------------------------------------------------
     # Inference
@@ -588,7 +597,6 @@ class IndicConformerHybridASR(ModelInterface):
         mode: str,
     ) -> tuple[list[str], list[str]]:
         import torch
-        import torch.nn.functional as torch_functional
         import torchaudio.functional as audio_functional
 
         metadata = self._trt_metadata
@@ -612,8 +620,7 @@ class IndicConformerHybridASR(ModelInterface):
 
         prepared.sort(key=lambda item: item[1].shape[0])
 
-        max_batch = int(metadata["profile"]["max"]["batch"])
-        min_frames = int(metadata["profile"]["min"]["feature_frames"])
+        max_batch = min(self.inference_batch_size, int(metadata["profile"]["max"]["batch"]))
         with torch.inference_mode():
             for start in range(0, len(prepared), max_batch):
                 group = prepared[start : start + max_batch]
@@ -626,8 +633,6 @@ class IndicConformerHybridASR(ModelInterface):
                     input_signal=signals,
                     length=lengths,
                 )
-                if features.shape[-1] < min_frames:
-                    features = torch_functional.pad(features, (0, min_frames - features.shape[-1]))
                 encoded, encoded_lengths = self._model.encoder(
                     audio_signal=features.to(dtype=torch.float16),
                     length=feature_lengths,
@@ -668,7 +673,7 @@ class IndicConformerHybridASR(ModelInterface):
         out: list[int] = []
         prev = None
         for p in preds:
-            if p != blank and p != prev:
+            if p != blank and p != prev:  # noqa: PLR1714
                 out.append(p)
             prev = p
         return self._ids_to_text(out, lang)
@@ -817,6 +822,9 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
     _model: IndicConformerHybridASR | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.decode_mode not in {"ctc", "rnnt"}:
+            msg = f"Unsupported IndicConformer decode mode: {self.decode_mode!r}"
+            raise ValueError(msg)
         if self.backend not in {"nemo", "tensorrt"}:
             msg = f"Unsupported IndicConformer inference backend: {self.backend!r}"
             raise ValueError(msg)
@@ -885,7 +893,7 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         msg = "InferenceIndicConformerHybridStage only supports process_batch"
         raise NotImplementedError(msg)
 
-    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:  # noqa: C901
         if len(tasks) == 0:
             return []
         if self._model is None:
