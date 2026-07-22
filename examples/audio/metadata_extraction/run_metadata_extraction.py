@@ -62,6 +62,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Filter to specific language(s) in the YAML (comma-separated, e.g. 'en,de').",
     )
+    ap.add_argument(
+        "--resampled_output_dir",
+        type=str,
+        default=None,
+        help="Directory to write resampled 16kHz mono WAV files. The output filename matches the input stem with a .wav extension.",
+    )
+    ap.add_argument(
+        "--resampled_subtype",
+        type=str,
+        default="FLOAT",
+        help="soundfile subtype for resampled WAV files. Use FLOAT (lossless) — PCM_16 "
+        "quantization changes streaming-Sortformer diarization output.",
+    )
+
 
     vad = ap.add_argument_group("VAD (Silero)")
     vad.add_argument(
@@ -153,9 +167,14 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             output_dir=args.output_dir,
             max_io_threads=args.max_io_threads,
             read_concurrency=args.read_concurrency,
+            resampled_output_dir=args.resampled_output_dir,
+            resampled_subtype=args.resampled_subtype,
+            keep_waveform=False if args.resampled_output_dir else True,
         ),
-        MonoDownsampleStage(target_sample_rate=args.target_sample_rate),
     ]
+    
+    if not args.resampled_output_dir:
+        stages.append(MonoDownsampleStage(target_sample_rate=args.target_sample_rate))
 
     if args.sortformer_model:
         model_path = args.sortformer_model if args.sortformer_model.endswith(".nemo") else None
@@ -172,6 +191,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 batch_size=2,
                 rttm_out_dir=args.rttm_out_dir,
                 resources=sortformer_resources,
+                filepath_key="resampled_audio_filepath" if args.resampled_output_dir else "audio_filepath",
             )
         )
 
@@ -183,6 +203,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             max_duration_sec=args.max_duration_sec,
             speech_pad_ms=args.speech_pad_ms,
             nested=False,
+            filepath_key="resampled_audio_filepath" if args.resampled_output_dir else "audio_filepath",
         )
     )
     stages.append(SqueezeWaveformStage())

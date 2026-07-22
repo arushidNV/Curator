@@ -414,6 +414,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     # doesn't overflow (without it, Ray launches up to one reader task per CPU).
     read_concurrency: int = 2
     resampled_output_dir: str | None = None
+    resampled_subtype: str = "FLOAT"
     keep_waveform: bool = True
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -446,7 +447,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
         stem = os.path.splitext(os.path.basename(source_path))[0]
         out_path = os.path.join(self.resampled_output_dir, f"{stem}.wav")
-        sf.write(out_path, audio, sr, subtype="PCM_16")
+        sf.write(out_path, audio, sr, subtype=self.resampled_subtype)
         return out_path
 
     def ray_stage_spec(self) -> dict[str, Any]:
@@ -925,6 +926,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
     max_io_threads: int = 8
     read_concurrency: int = 2
     resampled_output_dir: str | None = None
+    resampled_subtype: str = "FLOAT"
     keep_waveform: bool = True
 
     def __post_init__(self) -> None:
@@ -944,6 +946,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
                 max_io_threads=self.max_io_threads,
                 read_concurrency=self.read_concurrency,
                 resampled_output_dir=self.resampled_output_dir,
+                resampled_subtype=self.resampled_subtype,
                 keep_waveform=self.keep_waveform,
             ),
         ]
