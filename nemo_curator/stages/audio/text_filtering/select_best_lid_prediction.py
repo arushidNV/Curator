@@ -31,18 +31,30 @@ from nemo_curator.tasks import AudioTask
 
 # Language codes that SpeechBrain recognises as Indic and should be routed to Indic Canary.
 _DEFAULT_INDIC_LANGUAGES: frozenset[str] = frozenset({
-    "hi",  # Hindi
-    "ta",  # Tamil
-    "bn",  # Bengali
-    "ur",  # Urdu
-    "gu",  # Gujarati
-    "mr",  # Marathi
-    "ml",  # Malayalam
-    "kn",  # Kannada
-    "te",  # Telugu
-    "or",  # Odia
-    "as",  # Assamese
-    "pa",  # Punjabi
+    "hi", # Hindi
+    "ta", # Tamil
+    "bn", # Bengali
+    "ur", # Urdu
+    "gu", # Gujarati
+    "mr", # Marathi
+    "ml", # Malayalam
+    "kn", # Kannada
+    "te", # Telugu
+    "or", # Odia
+    "as", # Assamese
+    "pa", # Punjabi
+    "ne", # Nepali
+    "sa", # Sanskrit
+    "sd", # Sindhi
+    "si", # Sinhala
+    "kok", # Konkani
+    "mai", # Maithili
+    "doi", # Dogri
+    "ks", # Kashmiri
+    "mni", # Manipuri (Meitei)
+    "sat", # Santali
+    "brx", # Bodo
+    "bo", # Tibetan
 })
 
 
