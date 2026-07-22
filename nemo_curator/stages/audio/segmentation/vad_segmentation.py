@@ -15,7 +15,7 @@
 """
 VAD (Voice Activity Detection) segmentation stage.
 
-Segments audio into speech chunks using the Silero VAD Torch or ONNX model,
+Segments audio into speech chunks using the Silero VAD Torch, ONNX, or TensorRT model,
 filtering out silence and creating manageable segments for further processing.
 
 Supports both CPU and GPU execution. GPU is used when available and requested
@@ -29,10 +29,13 @@ Example:
     # Default execution (CPU-only)
     pipeline.add_stage(VADSegmentationStage(min_duration_sec=2.0, threshold=0.5))
 
-    # Opt into GPU if desired
+    # TensorRT execution with a shareable single-GPU memory request
     pipeline.add_stage(
-        VADSegmentationStage(min_duration_sec=2.0)
-        .with_(resources=Resources(gpus=0.3))
+        VADSegmentationStage(
+            min_duration_sec=2.0,
+            backend="tensorrt",
+            tensorrt_engine_path="silero.plan",
+        ).with_(resources=Resources(gpu_memory_gb=2.0), batch_size=64)
     )
 """
 
@@ -102,7 +105,8 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
     Note:
         Default resources: cpus=1.0, gpus=0.0 (CPU). Silero VAD is lightweight.
-        Use .with_(resources=Resources(gpus=X)) to opt into GPU execution.
+        TensorRT requires a GPU resource declaration. For single-GPU pipelines,
+        prefer ``Resources(gpu_memory_gb=X)`` so the stage can share the device.
     """
 
     min_interval_ms: int = 500
@@ -168,7 +172,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
             return
         self._check_gpu_availability(self._resources.gpus)
         if self.backend == "tensorrt" and self._resources.gpus <= 0:
-            msg = "The Silero TensorRT backend requires resources=Resources(gpus=X) with X > 0"
+            msg = "The Silero TensorRT backend requires a non-zero GPU resource declaration"
             raise RuntimeError(msg)
         try:
             with warnings.catch_warnings():

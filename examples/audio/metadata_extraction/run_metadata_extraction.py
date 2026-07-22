@@ -96,8 +96,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="TensorRT engine path; required when --vad_backend=tensorrt.",
     )
-    vad.add_argument("--vad_batch_size", type=int, default=1, help="VAD stage batch size.")
-    vad.add_argument("--vad_gpus", type=float, default=0.0, help="GPUs allocated to each VAD worker.")
+    vad.add_argument(
+        "--vad_batch_size",
+        type=int,
+        default=1,
+        help="Recordings per VAD call; use a TensorRT engine profile that supports this value.",
+    )
+    vad.add_argument(
+        "--vad_gpu_memory_gb",
+        type=float,
+        default=2.0,
+        help="GPU memory in GB for each TensorRT VAD worker.",
+    )
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
     sed.add_argument("--sed_checkpoint", type=str, default=None, help="Path to PANNs CNN14 checkpoint. Enables SED.")
@@ -158,6 +168,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -> list:
     corpus_filter = [args.corpus] if args.corpus else None
+    vad_resources = Resources(cpus=1.0)
+    if args.vad_backend == "tensorrt":
+        vad_resources = Resources(cpus=1.0, gpu_memory_gb=args.vad_gpu_memory_gb)
 
     stages = [
         NeMoSpeechAudioReader(
@@ -200,7 +213,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             tensorrt_engine_path=args.vad_tensorrt_engine,
             batch_size=args.vad_batch_size,
             nested=False,
-            resources=Resources(cpus=1.0, gpus=args.vad_gpus),
+            resources=vad_resources,
         )
     )
     stages.append(SqueezeWaveformStage())
@@ -284,6 +297,8 @@ def main() -> None:
         f"min_interval_ms={args.min_interval_ms}, "
         f"speech_pad_ms={args.speech_pad_ms}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s"
     )
+    if args.vad_backend == "tensorrt":
+        logger.info(f"  VAD GPU memory: {args.vad_gpu_memory_gb} GB/worker")
     if args.sed_checkpoint:
         logger.info(f"  SED: enabled (checkpoint={args.sed_checkpoint})")
     if not args.skip_langid:
