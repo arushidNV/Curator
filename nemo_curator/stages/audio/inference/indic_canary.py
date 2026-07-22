@@ -58,10 +58,10 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
 _TARGET_SR = 16000
-# Encoder engines are built for a 30-second window; clip anything longer. Both
+# Encoder engines are built for a 40-second window; clip anything longer. Both
 # bounds are configurable (see IndicCanaryTRTLLMASR / InferenceIndicCanaryStage);
 # these are just the defaults.
-_DEFAULT_MAX_DURATION_SEC = 30.0
+_DEFAULT_MAX_DURATION_SEC = 40.0
 _DEFAULT_MIN_DURATION_SEC = 3.0
 _MAX_SAMPLES = int(_DEFAULT_MAX_DURATION_SEC * _TARGET_SR)
 _MIN_SAMPLES = int(_DEFAULT_MIN_DURATION_SEC * _TARGET_SR)
