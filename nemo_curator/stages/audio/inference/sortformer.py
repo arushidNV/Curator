@@ -75,14 +75,30 @@ def _safe_rttm_basename(sess_name: str) -> str:
     return sess_name.replace("\\", "_").replace("/", "_")
 
 
-def _write_rttm(segments: list[dict[str, Any]], sess_name: str, rttm_out_dir: str) -> None:
+def _resolve_rttm_dir(rttm_out_dir: str, shard_key: str | None = None) -> str:
+    """Resolve RTTM output directory, mirroring pipeline shard layout when possible."""
+    if shard_key:
+        return os.path.join(rttm_out_dir, shard_key, "rttm")
+    return os.path.join(rttm_out_dir, "rttm")
+
+
+def _write_rttm(
+    segments: list[dict[str, Any]],
+    sess_name: str,
+    rttm_out_dir: str,
+    *,
+    shard_key: str | None = None,
+) -> str:
     """Write diarization segments to an RTTM file.
 
     Called once per full-audio recording (before VAD fan-out), so one file per input —
-    not a per-segment bottleneck.
+    not a per-segment bottleneck. When ``shard_key`` is provided, RTTMs are written
+    under ``{rttm_out_dir}/{shard_key}/rttm/`` to mirror the pipeline output layout
+    without mixing RTTM files with opus segments.
     """
-    os.makedirs(rttm_out_dir, exist_ok=True)
-    rttm_path = os.path.join(rttm_out_dir, f"{_safe_rttm_basename(sess_name)}.rttm")
+    out_dir = _resolve_rttm_dir(rttm_out_dir, shard_key)
+    os.makedirs(out_dir, exist_ok=True)
+    rttm_path = os.path.join(out_dir, f"{_safe_rttm_basename(sess_name)}.rttm")
     lines: list[str] = []
     for seg in segments:
         duration = seg["end"] - seg["start"]
@@ -92,6 +108,7 @@ def _write_rttm(segments: list[dict[str, Any]], sess_name: str, rttm_out_dir: st
         lines.append(f"SPEAKER {sess_name} 1 {seg['start']:.3f} {duration:.3f} <NA> <NA> {seg['speaker']} <NA> <NA>\n")
     with open(rttm_path, "w") as f:
         f.writelines(lines)
+    return rttm_path
 
 
 @dataclass
@@ -120,7 +137,9 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         diar_segments_key: Key in output data for diarization segments list.
         num_speakers_key: Key in output data for the number of distinct speakers.
         store_segments: Whether to store the full diar_segments in task.data.
-        rttm_out_dir: Optional directory to write RTTM files.
+        rttm_out_dir: Optional directory to write RTTM files. When tasks carry
+            ``_shard_key`` metadata, RTTMs are nested under
+            ``{rttm_out_dir}/{shard_key}/rttm/`` to mirror pipeline output layout.
         chunk_len: Streaming chunk size in 80 ms frames.
         chunk_right_context: Right context frames.
         fifo_len: FIFO queue size in frames.
@@ -248,6 +267,24 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
             return os.path.splitext(os.path.basename(filepath))[0]
         return task.task_id
 
+    def _rttm_shard_key(self, task: AudioTask) -> str | None:
+        shard_key = task._metadata.get("_shard_key")
+        return shard_key if isinstance(shard_key, str) and shard_key else None
+
+    def _relative_rttm_path(self, rttm_path: str) -> str:
+        return os.path.relpath(rttm_path, self.rttm_out_dir) if self.rttm_out_dir else rttm_path
+
+    def _write_task_rttm(self, task: AudioTask, segments: list[dict[str, Any]]) -> None:
+        if self.rttm_out_dir is None:
+            return
+        rttm_path = _write_rttm(
+            segments,
+            self._session_name(task),
+            self.rttm_out_dir,
+            shard_key=self._rttm_shard_key(task),
+        )
+        task.data["rttm_filepath"] = self._relative_rttm_path(rttm_path)
+
     def process(self, task: AudioTask) -> AudioTask:
         """Run speaker diarization on a single task."""
         if task.data.get("read_error"):
@@ -269,8 +306,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
                 raise ValueError(msg)
             segments = self._diarize([filepath])[0]
 
-        if self.rttm_out_dir is not None:
-            _write_rttm(segments, self._session_name(task), self.rttm_out_dir)
+        self._write_task_rttm(task, segments)
 
         self._apply_results(task, segments)
         task.task_id = f"{task.task_id}_sortformer"
@@ -308,7 +344,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         # Write RTTM files after all GPU results are applied (batch disk I/O)
         if self.rttm_out_dir is not None:
             for task, segments in zip(to_process, all_segments, strict=True):
-                _write_rttm(segments, self._session_name(task), self.rttm_out_dir)
+                self._write_task_rttm(task, segments)
 
         for task in to_process:
             task.task_id = f"{task.task_id}_sortformer"

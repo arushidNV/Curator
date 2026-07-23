@@ -45,6 +45,7 @@ except (ImportError, ModuleNotFoundError):
 
 from nemo.collections.common.data.lhotse.nemo_adapters import expand_sharded_filepaths as _expand_nemo_path
 
+from nemo_curator.stages.audio.io.shard_key import derive_manifest_shard_key
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.tasks import AudioTask, FileGroupTask, _EmptyTask
 
@@ -186,6 +187,7 @@ def _shards_from_cfg_entry(cfg: dict[str, Any], corpus: str, language: str) -> l
     Tarred entries pair each expanded manifest with its tar path; non-tarred
     entries emit one descriptor per expanded manifest path.
     """
+    shard_key_prefix = cfg.get("shard_key_prefix")
     if "tarred_audio_filepaths" in cfg:
         manifest_paths = _expand_nemo_path(cfg["manifest_filepath"])
         tar_paths = _expand_nemo_path(cfg["tarred_audio_filepaths"])
@@ -193,12 +195,12 @@ def _shards_from_cfg_entry(cfg: dict[str, Any], corpus: str, language: str) -> l
             msg = f"Manifest/tar count mismatch for {corpus}: {len(manifest_paths)} vs {len(tar_paths)}"
             raise ValueError(msg)
         return [
-            {"corpus": corpus, "manifest_path": mp, "tar_path": tp, "language": language}
+            {"corpus": corpus, "manifest_path": mp, "tar_path": tp, "language": language, "shard_key_prefix": shard_key_prefix}
             for mp, tp in zip(manifest_paths, tar_paths, strict=False)
         ]
     if "manifest_filepath" in cfg:
         return [
-            {"corpus": corpus, "manifest_path": mp, "language": language}
+            {"corpus": corpus, "manifest_path": mp, "language": language, "shard_key_prefix": shard_key_prefix}
             for mp in _expand_nemo_path(cfg["manifest_filepath"])
         ]
     return []
@@ -212,7 +214,7 @@ def _parse_input_cfg(
     """Parse a NeMo ``input_cfg`` list into shard descriptors.
 
     Each descriptor has ``manifest_path``, optional ``tar_path``,
-    ``corpus``, and ``language``.
+    ``corpus``, ``language``, and optional ``shard_key_prefix``.
 
     Only supports the standard NeMo config format with ``input_cfg``
     entries of type ``nemo_tarred`` or ``nemo``.
@@ -302,7 +304,11 @@ class NeMoSpeechDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         skipped = 0
         for desc in shard_descs:
             corpus = desc["corpus"]
-            shard_key = _manifest_to_shard_key(desc["manifest_path"], corpus)
+            shard_key = derive_manifest_shard_key(
+                desc["manifest_path"],
+                corpus,
+                shard_key_prefix=desc.get("shard_key_prefix"),
+            )
             if shard_key in completed:
                 skipped += 1
                 continue
