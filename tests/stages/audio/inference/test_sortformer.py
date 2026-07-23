@@ -65,7 +65,7 @@ class TestWriteRttm:
             {"start": 3.0, "end": 5.0, "speaker": "speaker_1"},
         ]
         _write_rttm(segments, "test_session", str(tmp_path))
-        rttm_path = tmp_path / "test_session.rttm"
+        rttm_path = tmp_path / "rttm" / "test_session.rttm"
         assert rttm_path.exists()
         lines = rttm_path.read_text().strip().split("\n")
         assert len(lines) == 2
@@ -74,11 +74,18 @@ class TestWriteRttm:
         assert lines[1].startswith("SPEAKER test_session 1 3.000 2.000")
         assert "speaker_1" in lines[1]
 
+    def test_writes_rttm_under_shard_key_subdir(self, tmp_path: Path) -> None:
+        segments = [{"start": 0.0, "end": 1.0, "speaker": "speaker_0"}]
+        shard_key = "yt_harvested/es/youtube/v1.1_wer10_whisper/yt_mixed/manifest_0"
+        _write_rttm(segments, "recording_1", str(tmp_path), shard_key=shard_key)
+        rttm_path = tmp_path / shard_key / "rttm" / "recording_1.rttm"
+        assert rttm_path.exists()
+
     def test_sanitizes_slashes_in_session_name(self, tmp_path: Path) -> None:
         segments = [{"start": 0.0, "end": 1.0, "speaker": "speaker_0"}]
         sess_name = "audio-riva-originals/nl/pilot_90files_5"
         _write_rttm(segments, sess_name, str(tmp_path))
-        rttm_path = tmp_path / "audio-riva-originals_nl_pilot_90files_5.rttm"
+        rttm_path = tmp_path / "rttm" / "audio-riva-originals_nl_pilot_90files_5.rttm"
         assert rttm_path.exists()
         assert "SPEAKER audio-riva-originals/nl/pilot_90files_5" in rttm_path.read_text()
 
@@ -150,6 +157,24 @@ class TestWriteRttm:
             batch_size=1,
         )
 
+    def test_process_writes_rttm_under_shard_key(self, tmp_path: Path) -> None:
+        fake_output = [["0.00 2.50 speaker_0"]]
+        mock_model = self._make_mock_model(fake_output)
+        stage = InferenceSortformerStage(
+            diar_model=mock_model,
+            rttm_out_dir=str(tmp_path),
+        )
+        shard_key = "yt_harvested/es/manifest_0"
+        task = AudioTask(
+            data={"audio_filepath": "/test/my_audio.wav"},
+            _metadata={"_shard_key": shard_key},
+        )
+        stage.process(task)
+
+        rttm_file = tmp_path / shard_key / "rttm" / "my_audio.rttm"
+        assert rttm_file.exists()
+        assert task.data["rttm_filepath"] == f"{shard_key}/rttm/my_audio.rttm"
+
     def test_process_writes_rttm(self, tmp_path: Path) -> None:
         fake_output = [["0.00 2.50 speaker_0"]]
         mock_model = self._make_mock_model(fake_output)
@@ -161,8 +186,9 @@ class TestWriteRttm:
         task = AudioTask(data={"audio_filepath": "/test/my_audio.wav"})
         stage.process(task)
 
-        rttm_file = tmp_path / "my_audio.rttm"
+        rttm_file = tmp_path / "rttm" / "my_audio.rttm"
         assert rttm_file.exists()
+        assert task.data["rttm_filepath"] == "rttm/my_audio.rttm"
         content = rttm_file.read_text()
         assert "SPEAKER my_audio" in content
 
@@ -190,4 +216,5 @@ class TestWriteRttm:
             data={"audio_filepath": "/test/audio1.wav", "session_name": "sess_42"},
         )
         stage.process(task)
-        assert (tmp_path / "sess_42.rttm").exists()
+        assert (tmp_path / "rttm" / "sess_42.rttm").exists()
+        assert task.data["rttm_filepath"] == "rttm/sess_42.rttm"

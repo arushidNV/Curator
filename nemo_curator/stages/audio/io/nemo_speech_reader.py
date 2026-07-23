@@ -45,6 +45,7 @@ except (ImportError, ModuleNotFoundError):
 
 from nemo.collections.common.data.lhotse.nemo_adapters import expand_sharded_filepaths as _expand_nemo_path
 
+from nemo_curator.stages.audio.io.shard_key import derive_manifest_shard_key
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.tasks import AudioTask, FileGroupTask, _EmptyTask
 
@@ -94,48 +95,6 @@ def _dedup_entries_by_stem(entries: list[dict], shard_key: str) -> list[dict]:
     return deduped
 
 
-def _manifest_to_shard_key(manifest_path: str, corpus: str) -> str:
-    """Derive a shard key from a manifest path starting at the corpus directory.
-
-    Matches the logic in ``NemoTarShardDiscoveryStage._manifest_to_rel_path``:
-    finds the corpus name (case-insensitive, must appear exactly once) in
-    the path components and returns everything from that point onward with
-    the file extension stripped.
-    """
-    parts = manifest_path.replace("\\", "/").split("/")
-    parts_lower = [p.lower() for p in parts]
-    corpus_lower = corpus.lower()
-    matches = [i for i, p in enumerate(parts_lower) if p == corpus_lower]
-    if len(matches) == 0:
-        msg = (
-            f"Corpus name '{corpus}' not found in manifest path: {manifest_path}. "
-            f"The YAML 'corpus' field must match a directory component in the manifest path (case-insensitive)."
-        )
-        raise ValueError(msg)
-    if len(matches) > 1:
-        msg = (
-            f"Corpus name '{corpus}' appears {len(matches)} times in manifest path: {manifest_path}. "
-            f"It must appear exactly once for unambiguous path extraction."
-        )
-        raise ValueError(msg)
-    idx = matches[0]
-    rel = "/".join(parts[idx:])
-    if rel.endswith(".jsonl.gz"):
-        rel = rel[: -len(".jsonl.gz")]
-    elif rel.endswith(".jsonl"):
-        rel = rel[: -len(".jsonl")]
-    elif rel.endswith(".json"):
-        rel = rel[: -len(".json")]
-    return rel
-
-
-
-
-# ---------------------------------------------------------------------------
-# YAML parsing (input_cfg format only)
-# ---------------------------------------------------------------------------
-
-
 def _parse_input_cfg(
     yaml_path: str,
     corpus_filter: list[str] | None,
@@ -144,7 +103,7 @@ def _parse_input_cfg(
     """Parse a NeMo ``input_cfg`` YAML into shard descriptors.
 
     Each descriptor has ``manifest_path``, optional ``tar_path``,
-    ``corpus``, and ``language``.
+    ``corpus``, ``language``, and optional ``shard_key_prefix``.
 
     Only supports the standard NeMo config format with ``input_cfg``
     entries of type ``nemo_tarred`` or ``nemo``.
@@ -169,6 +128,8 @@ def _parse_input_cfg(
             if language_filter and language not in language_filter:
                 continue
 
+            shard_key_prefix = cfg.get("shard_key_prefix")
+
             if "tarred_audio_filepaths" in cfg:
                 manifest_paths = _expand_nemo_path(cfg["manifest_filepath"])
                 tar_paths = _expand_nemo_path(cfg["tarred_audio_filepaths"])
@@ -176,10 +137,21 @@ def _parse_input_cfg(
                     msg = f"Manifest/tar count mismatch for {corpus}: {len(manifest_paths)} vs {len(tar_paths)}"
                     raise ValueError(msg)
                 for mp, tp in zip(manifest_paths, tar_paths, strict=False):
-                    shards.append({"corpus": corpus, "manifest_path": mp, "tar_path": tp, "language": language})
+                    shards.append({
+                        "corpus": corpus,
+                        "manifest_path": mp,
+                        "tar_path": tp,
+                        "language": language,
+                        "shard_key_prefix": shard_key_prefix,
+                    })
             elif "manifest_filepath" in cfg:
                 for mp in _expand_nemo_path(cfg["manifest_filepath"]):
-                    shards.append({"corpus": corpus, "manifest_path": mp, "language": language})
+                    shards.append({
+                        "corpus": corpus,
+                        "manifest_path": mp,
+                        "language": language,
+                        "shard_key_prefix": shard_key_prefix,
+                    })
 
     return shards
 
@@ -247,7 +219,11 @@ class NeMoSpeechDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         skipped = 0
         for desc in shard_descs:
             corpus = desc["corpus"]
-            shard_key = _manifest_to_shard_key(desc["manifest_path"], corpus)
+            shard_key = derive_manifest_shard_key(
+                desc["manifest_path"],
+                corpus,
+                shard_key_prefix=desc.get("shard_key_prefix"),
+            )
             if shard_key in completed:
                 skipped += 1
                 continue
