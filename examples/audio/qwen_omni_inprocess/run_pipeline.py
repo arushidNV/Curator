@@ -148,6 +148,15 @@ PARAKEET_RIVA_PRIMARY_LANGS = frozenset({"hi", "ta", "bn"})  # languages covered
 INDIC_MONOLINGUAL_PRIMARY_LANGS = INDIC_CONFORMER_LANGUAGE_CODES - PARAKEET_RIVA_PRIMARY_LANGS
 # Urdu uses indic_monolingual as primary but needs qwen_omni as recovery (not none).
 INDIC_MONOLINGUAL_QWEN_RECOVERY_LANGS = frozenset({"ur"})
+# Languages supported by the (Indic) Canary TRT-LLM engine (InferenceIndicCanaryStage).
+# The engine derives its supported set from the tokenizer at runtime; this is the
+# expected list for the current build (currently the same 22 Indic languages as
+# INDIC_CONFORMER_LANGUAGE_CODES). Kept explicit here for reference/validation when
+# selecting indic_canary as a --primary_model/--recovery_model.
+INDIC_CANARY_SUPPORTED_LANGS = frozenset({
+    "as", "bn", "brx", "doi", "gu", "hi", "kn", "kok", "ks", "mai", "ml", "mni",
+    "mr", "ne", "or", "pa", "sa", "sat", "sd", "ta", "te", "ur",
+})
 
 # Default recovery model paired with each primary (when --recovery_model is not set):
 #   qwen_omni → qwen_asr;  qwen_asr → whisper;  parakeet_v3 → whisper;  whisper → parakeet_v3

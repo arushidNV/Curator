@@ -23,14 +23,20 @@ from upstream downsampling), plus a per-shard JSONL manifest with metadata:
         <shard_key>.jsonl
         <shard_key>.jsonl.done          (written when all inputs in shard are processed)
 
-When ``split_manifest_by_language=True``, manifests instead use:
+When ``split_manifest_by_language=True``, each shard's rows are additionally
+split into per-language manifests:
 
     output_dir/
         <language>/
             <shard_key>.jsonl
 
-Shard completion markers remain at ``<shard_key>.jsonl.done`` so resume
-tracking stays recording/shard based rather than language based.
+The completion marker is deliberately NOT split by language: it stays a single
+``<shard_key>.jsonl.done`` at the top level (not ``<language>/<shard_key>.jsonl.done``).
+A shard corresponds to one input recording/group, whose segments may span several
+languages, so "done" is only meaningful once *all* of that shard's inputs have been
+processed. Keeping one marker per shard lets resume logic count completed input
+recordings (shard-based) instead of trying to reason about which languages a shard
+happened to produce (language-based), which would be ambiguous and racy.
 """
 
 from __future__ import annotations
@@ -343,9 +349,6 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         if not has_waveform and self.save_audio:
             return FileGroupTask(task_id=task.task_id, dataset_name=task.dataset_name, data=[])
 
-        if has_waveform:
-            waveform = self._ensure_numpy(waveform)
-
         # Derive filename from the original audio path, preserving directory structure
         # so distinct recordings that share a basename across dirs don't collide.
         base_name = _source_output_stem(original_file) if original_file else str(self._total_written)
@@ -361,6 +364,8 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
 
         out_path = os.path.join(segment_dir, filename)
         if self.save_audio and has_waveform:
+            # Only needed for opus encoding; skip the conversion in manifest-only mode.
+            waveform = self._ensure_numpy(waveform)
             opus_bytes = self._encode_opus(waveform, sr)
             _write_opus_atomic(out_path, opus_bytes)
 
