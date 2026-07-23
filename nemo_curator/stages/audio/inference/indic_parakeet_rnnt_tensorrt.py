@@ -206,7 +206,16 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
         )
         if not chunks:
             return [""] * len(waveforms)
-        chunk_texts = super().transcribe_waveforms(chunks, chunk_sample_rates)
+        duration_order = sorted(
+            range(len(chunks)),
+            key=lambda index: chunks[index].shape[0] / chunk_sample_rates[index],
+        )
+        ordered_chunks = [chunks[index] for index in duration_order]
+        ordered_sample_rates = [chunk_sample_rates[index] for index in duration_order]
+        ordered_texts = super().transcribe_waveforms(ordered_chunks, ordered_sample_rates)
+        chunk_texts = [""] * len(chunks)
+        for original_index, text in zip(duration_order, ordered_texts, strict=True):
+            chunk_texts[original_index] = text
         return merge_chunk_texts(chunk_texts, owners, len(waveforms))
 
     def teardown(self) -> None:

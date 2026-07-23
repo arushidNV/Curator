@@ -189,7 +189,7 @@ def test_tensorrt_wrapper_replaces_only_encoder(tmp_path: Path) -> None:
 def test_tensorrt_wrapper_chunks_long_audio_without_overlap(tmp_path: Path) -> None:
     wrapper = TensorRTParakeetRNNTModel(_engine_bundle(tmp_path))
     wrapper._chunk_duration_sec = 20.0
-    transcribe = MagicMock(return_value=["first", "second", "third"])
+    transcribe = MagicMock(return_value=["third", "first", "second"])
     wrapper.asr_model = SimpleNamespace(transcribe=transcribe)
     waveform = np.zeros(45 * 16000, dtype=np.float32)
 
@@ -199,8 +199,27 @@ def test_tensorrt_wrapper_chunks_long_audio_without_overlap(tmp_path: Path) -> N
     )
 
     prepared = transcribe.call_args.args[0]
-    assert [chunk.shape[0] for chunk in prepared] == [20 * 16000, 20 * 16000, 5 * 16000]
+    assert [chunk.shape[0] for chunk in prepared] == [5 * 16000, 20 * 16000, 20 * 16000]
     assert texts == ["first second third", ""]
+
+
+def test_tensorrt_wrapper_orders_chunks_by_duration_across_sample_rates(tmp_path: Path) -> None:
+    wrapper = TensorRTParakeetRNNTModel(_engine_bundle(tmp_path))
+    wrapper._chunk_duration_sec = 20.0
+    transcribe = MagicMock(return_value=["second", "first"])
+    wrapper.asr_model = SimpleNamespace(transcribe=transcribe)
+
+    texts = wrapper.transcribe_waveforms(
+        [
+            np.zeros(8 * 16000, dtype=np.float32),
+            np.zeros(6 * 48000, dtype=np.float32),
+        ],
+        [16000, 48000],
+    )
+
+    prepared = transcribe.call_args.args[0]
+    assert [chunk.shape[0] for chunk in prepared] == [6 * 16000, 8 * 16000]
+    assert texts == ["first", "second"]
 
 
 def test_parakeet_stage_preserves_nemo_default() -> None:
