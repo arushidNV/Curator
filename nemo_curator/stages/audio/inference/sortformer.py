@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from huggingface_hub import snapshot_download
 from loguru import logger
@@ -63,6 +63,14 @@ def _parse_sortformer_segments(raw_segments: list) -> list[dict[str, Any]]:
                     "start": float(seg[0]),
                     "end": float(seg[1]),
                     "speaker": str(seg[2]),
+                }
+            )
+        elif isinstance(seg, dict) and {"start", "end", "speaker"} <= seg.keys():
+            segments.append(
+                {
+                    "start": float(seg["start"]),
+                    "end": float(seg["end"]),
+                    "speaker": str(seg["speaker"]),
                 }
             )
         else:
@@ -134,18 +142,25 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         filepath_key: Key in data for path to audio file.
         waveform_key: Key in data for in-memory waveform (numpy float32).
         sample_rate_key: Key in data for sample rate (int).
+        duration_key: Key in data for audio duration in seconds.
         diar_segments_key: Key in output data for diarization segments list.
         num_speakers_key: Key in output data for the number of distinct speakers.
         store_segments: Whether to store the full diar_segments in task.data.
         rttm_out_dir: Optional directory to write RTTM files. When tasks carry
             ``_shard_key`` metadata, RTTMs are nested under
             ``{rttm_out_dir}/{shard_key}/rttm/`` to mirror pipeline output layout.
-        chunk_len: Streaming chunk size in 80 ms frames.
-        chunk_right_context: Right context frames.
-        fifo_len: FIFO queue size in frames.
-        spkcache_update_period: Speaker cache update period in frames.
-        spkcache_len: Speaker cache size in frames.
+        chunk_len: Optional streaming chunk size override in encoder frames.
+        chunk_right_context: Optional right context override in encoder frames.
+        fifo_len: Optional FIFO queue size override in encoder frames.
+        spkcache_update_period: Optional speaker cache update period override.
+        spkcache_len: Optional speaker cache size override in encoder frames.
         inference_batch_size: Batch size passed to diarize().
+        backend: ``"nemo"`` or ``"tensorrt"``.
+        tensorrt_engine_path: TensorRT plan file.
+        tensorrt_config_path: Runtime JSON stored with the TensorRT plan.
+        tensorrt_runtime_module_path: Matching Riva ``sortformer_modules.py``.
+        precision: Inference precision.
+        compile_encoder: Whether to compile the 31-layer encoder with torch.compile.
         name: Stage name.
     """
 
@@ -156,26 +171,47 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     filepath_key: str = "audio_filepath"
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
+    duration_key: str = "duration"
     diar_segments_key: str = "diar_segments"
     num_speakers_key: str = "num_speakers"
     store_segments: bool = True
     rttm_out_dir: str | None = None
-    chunk_len: int = 340
-    chunk_right_context: int = 40
-    fifo_len: int = 40
-    spkcache_update_period: int = 300
-    spkcache_len: int = 188
+    chunk_len: int | None = None
+    chunk_right_context: int | None = None
+    fifo_len: int | None = None
+    spkcache_update_period: int | None = None
+    spkcache_len: int | None = None
     inference_batch_size: int = 1
     num_workers_override: int | None = None
+    backend: Literal["nemo", "tensorrt"] = "nemo"
+    tensorrt_engine_path: str | None = None
+    tensorrt_config_path: str | None = None
+    tensorrt_runtime_module_path: str | None = None
+    precision: Literal["fp32", "fp16", "bf16"] = "fp32"
+    compile_encoder: bool = False
     name: str = "Sortformer_inference"
     batch_size: int = 8
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0, gpu_memory_gb=8.0))
+
+    def __post_init__(self) -> None:
+        if self.backend not in {"nemo", "tensorrt"}:
+            msg = f"Unsupported Sortformer backend: {self.backend}"
+            raise ValueError(msg)
+        if self.precision not in {"fp32", "fp16", "bf16"}:
+            msg = f"Unsupported Sortformer precision: {self.precision}"
+            raise ValueError(msg)
+        if self.backend == "tensorrt" and not all(
+            (self.tensorrt_engine_path, self.tensorrt_config_path, self.tensorrt_runtime_module_path)
+        ):
+            msg = "Sortformer TensorRT requires engine, config, and runtime module paths"
+            raise ValueError(msg)
+        self._tensorrt_model = None
 
     def setup_on_node(
         self, _node_info: NodeInfo | None = None, _worker_metadata: WorkerMetadata | None = None
     ) -> None:
         """Pre-download model weights on the node so actors load from cache."""
-        if self.model_path is not None:
+        if self.backend == "tensorrt" or self.model_path is not None:
             return
         try:
             repo_dir = snapshot_download(repo_id=self.model_name, cache_dir=self.cache_dir)
@@ -189,9 +225,22 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         """Load Sortformer model from Hugging Face or a local .nemo file."""
+        if self.backend == "tensorrt":
+            from nemo_curator.stages.audio.inference.sortformer_tensorrt import TensorRTSortformer
+
+            self._tensorrt_model = TensorRTSortformer(
+                self.tensorrt_engine_path,
+                self.tensorrt_config_path,
+                self.tensorrt_runtime_module_path,
+            )
+            self._warm_up()
+            return
+
         if self.diar_model is not None:
             self.diar_model.eval()
             self._configure_streaming()
+            self._compile_encoder()
+            self._warm_up()
             return
 
         restore_path = self.model_path
@@ -212,15 +261,47 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
         self.diar_model.eval()
         self._configure_streaming()
+        self._compile_encoder()
+        self._warm_up()
+
+    def teardown(self) -> None:
+        if self._tensorrt_model is not None:
+            self._tensorrt_model.close()
+            self._tensorrt_model = None
 
     def _configure_streaming(self) -> None:
-        """Apply streaming configuration to the loaded model."""
+        """Apply explicit streaming overrides to the loaded model."""
         sm = self.diar_model.sortformer_modules
-        sm.chunk_len = self.chunk_len
-        sm.chunk_right_context = self.chunk_right_context
-        sm.fifo_len = self.fifo_len
-        sm.spkcache_update_period = self.spkcache_update_period
-        sm.spkcache_len = self.spkcache_len
+        overrides = {
+            "chunk_len": self.chunk_len,
+            "chunk_right_context": self.chunk_right_context,
+            "fifo_len": self.fifo_len,
+            "spkcache_update_period": self.spkcache_update_period,
+            "spkcache_len": self.spkcache_len,
+        }
+        for name, value in overrides.items():
+            if value is not None:
+                setattr(sm, name, value)
+        if any(value is not None for value in overrides.values()) and hasattr(sm, "_check_streaming_parameters"):
+            sm._check_streaming_parameters()
+
+    def _warm_up(self) -> None:
+        """Compile and initialize the configured inference batch once per worker."""
+        import numpy as np
+
+        sample_rate = 16000
+        silence = np.zeros(sample_rate * 4, dtype=np.float32)
+        self._diarize([silence] * self.inference_batch_size, sample_rate=sample_rate)
+        logger.info(f"Sortformer: warmed up batch size {self.inference_batch_size}")
+
+    def _compile_encoder(self) -> None:
+        """Compile the fixed-shape encoder core."""
+        if not self.compile_encoder:
+            return
+        import torch
+
+        self.diar_model.encoder = torch.compile(self.diar_model.encoder, dynamic=False)
+        logger.info("Sortformer: compiled encoder")
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -244,7 +325,17 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         kwargs: dict[str, Any] = {"audio": audio, "batch_size": self.inference_batch_size}
         if sample_rate is not None:
             kwargs["sample_rate"] = sample_rate
-        predicted_segments = self.diar_model.diarize(**kwargs)
+        if self.backend == "tensorrt":
+            kwargs.pop("batch_size")
+            return self._tensorrt_model.diarize(**kwargs)
+        if self.precision == "fp32":
+            predicted_segments = self.diar_model.diarize(**kwargs)
+        else:
+            import torch
+
+            dtype = torch.float16 if self.precision == "fp16" else torch.bfloat16
+            with torch.autocast(device_type="cuda", dtype=dtype):
+                predicted_segments = self.diar_model.diarize(**kwargs)
         return [_parse_sortformer_segments(segs) for segs in predicted_segments]
 
     def _apply_results(self, task: AudioTask, segments: list[dict[str, Any]]) -> None:
@@ -285,6 +376,23 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         )
         task.data["rttm_filepath"] = self._relative_rttm_path(rttm_path)
 
+    def _duration(self, task: AudioTask) -> float:
+        """Return duration for local batch ordering, with a waveform fallback."""
+        duration = task.data.get(self.duration_key)
+        if duration is not None:
+            try:
+                value = float(duration)
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+
+        waveform = task.data.get(self.waveform_key)
+        sample_rate = task.data.get(self.sample_rate_key)
+        if waveform is not None and sample_rate:
+            return float(waveform.shape[-1]) / float(sample_rate)
+        return float("inf")
+
     def process(self, task: AudioTask) -> AudioTask:
         """Run speaker diarization on a single task."""
         if task.data.get("read_error"):
@@ -317,7 +425,10 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if len(tasks) == 0:
             return []
 
-        to_process = [t for t in tasks if not t.data.get("read_error")]
+        to_process = sorted(
+            (task for task in tasks if not task.data.get("read_error")),
+            key=self._duration,
+        )
         if not to_process:
             return tasks
 
