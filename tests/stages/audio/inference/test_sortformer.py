@@ -126,7 +126,7 @@ class TestWriteRttm:
             stage.setup()
 
         runtime_class.assert_called_once_with("model.plan", "model.json", "sortformer_modules.py")
-        assert len(runtime.diarize.call_args.kwargs["audio"]) == 2
+        runtime.diarize.assert_not_called()
         stage.teardown()
         runtime.close.assert_called_once_with()
 
@@ -166,20 +166,6 @@ class TestWriteRttm:
         assert sm.spkcache_update_period == 124
         assert sm.spkcache_len == 200
         sm._check_streaming_parameters.assert_called_once_with()
-
-    def test_setup_warms_up_inference_batch(self) -> None:
-        mock_model = MagicMock()
-        mock_model.sortformer_modules = MagicMock()
-        mock_model.diarize.return_value = [[], [], []]
-        stage = InferenceSortformerStage(diar_model=mock_model, inference_batch_size=3)
-
-        stage.setup()
-
-        kwargs = mock_model.diarize.call_args.kwargs
-        assert kwargs["batch_size"] == 3
-        assert kwargs["sample_rate"] == 16000
-        assert len(kwargs["audio"]) == 3
-        assert all(waveform.shape == (64000,) for waveform in kwargs["audio"])
 
     def test_setup_compiles_encoder(self) -> None:
         mock_model = MagicMock()
