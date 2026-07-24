@@ -86,6 +86,7 @@ def _export_onnx(model_path: Path, onnx_path: Path):  # noqa: ANN202
         def __init__(self, sortformer: SortformerEncLabelModel) -> None:
             super().__init__()
             self.sortformer = sortformer
+            self.feature_stacking = str(sortformer.cfg.encoder.subsampling) == "feature_stacking"
 
         @staticmethod
         def _gather_frames(source: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -135,8 +136,9 @@ def _export_onnx(model_path: Path, onnx_path: Path):  # noqa: ANN202
             fifo: torch.Tensor,
             fifo_lengths: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            encoder_input = chunk.transpose(1, 2) if self.feature_stacking else chunk
             chunk_embs, chunk_emb_lengths = self.sortformer.encoder.pre_encode(
-                x=chunk,
+                x=encoder_input,
                 lengths=chunk_lengths,
             )
             combined, combined_lengths = self._compact_states(
@@ -158,9 +160,8 @@ def _export_onnx(model_path: Path, onnx_path: Path):  # noqa: ANN202
             )
             return predictions, encoded_lengths, chunk_embs, chunk_emb_lengths
 
-    # NeMo 2.7.2 hard-codes 80 mel bins in streaming_input_examples(), while
-    # diar_streaming_sortformer_4spk-v2 uses 128. Build the example from the
-    # restored checkpoint and export a vectorized replacement for concat_embs.
+    # Build the example from the restored checkpoint and export a vectorized
+    # replacement for concat_embs.
     modules = model.sortformer_modules
     feature_dim = int(model.cfg.preprocessor.features)
     batch_size = 4
