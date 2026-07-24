@@ -439,7 +439,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     asr.add_argument(
         "--indic_canary_max_new_tokens",
         type=int,
-        default=246,
+        default=374,
         help="Max generated tokens for the Indic Canary TRT-LLM engine.",
     )
     asr.add_argument(
