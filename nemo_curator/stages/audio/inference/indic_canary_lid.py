@@ -99,7 +99,7 @@ class IndicCanaryLangIDStage(BaseLangIDStage):
     prompt_text: str | None = None
     max_duration_sec: float = _DEFAULT_MAX_DURATION_SEC
     candidate_langs: list[str] | None = None
-    batch_size: int = 8
+    batch_size: int = 32
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
 
     model: Any = field(default=None, init=False, repr=False)

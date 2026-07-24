@@ -23,14 +23,20 @@ from upstream downsampling), plus a per-shard JSONL manifest with metadata:
         <shard_key>.jsonl
         <shard_key>.jsonl.done          (written when all inputs in shard are processed)
 
-When ``split_manifest_by_language=True``, manifests instead use:
+When ``split_manifest_by_language=True``, each shard's rows are additionally
+split into per-language manifests:
 
     output_dir/
         <language>/
             <shard_key>.jsonl
 
-Shard completion markers remain at ``<shard_key>.jsonl.done`` so resume
-tracking stays recording/shard based rather than language based.
+The completion marker is deliberately NOT split by language: it stays a single
+``<shard_key>.jsonl.done`` at the top level (not ``<language>/<shard_key>.jsonl.done``).
+A shard corresponds to one input recording/group, whose segments may span several
+languages, so "done" is only meaningful once *all* of that shard's inputs have been
+processed. Keeping one marker per shard lets resume logic count completed input
+recordings (shard-based) instead of trying to reason about which languages a shard
+happened to produce (language-based), which would be ambiguous and racy.
 """
 
 from __future__ import annotations
@@ -315,7 +321,15 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             source_duration = task.data.get("duration_sec") or task.data.get("duration")
             if source_duration is not None:
                 manifest_entry["source_duration"] = round(float(source_duration), 4)
-            for key in ("language", "language_confidence", "sed_events", "num_speakers", "corpus", "shard_id"):
+            for key in (
+                "language",
+                "language_confidence",
+                "sed_events",
+                "num_speakers",
+                "rttm_filepath",
+                "corpus",
+                "shard_id",
+            ):
                 if key in task.data:
                     manifest_entry[key] = task.data[key]
             return self._emit_manifest_only(task, manifest_entry, shard_subdir, input_id, shard_total)
@@ -343,9 +357,6 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         if not has_waveform and self.save_audio:
             return FileGroupTask(task_id=task.task_id, dataset_name=task.dataset_name, data=[])
 
-        if has_waveform:
-            waveform = self._ensure_numpy(waveform)
-
         # Derive filename from the original audio path, preserving directory structure
         # so distinct recordings that share a basename across dirs don't collide.
         base_name = _source_output_stem(original_file) if original_file else str(self._total_written)
@@ -361,6 +372,8 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
 
         out_path = os.path.join(segment_dir, filename)
         if self.save_audio and has_waveform:
+            # Only needed for opus encoding; skip the conversion in manifest-only mode.
+            waveform = self._ensure_numpy(waveform)
             opus_bytes = self._encode_opus(waveform, sr)
             _write_opus_atomic(out_path, opus_bytes)
 
@@ -393,6 +406,8 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             manifest_entry["sed_events"] = task.data["sed_events"]
         if "num_speakers" in task.data:
             manifest_entry["num_speakers"] = task.data["num_speakers"]
+        if "rttm_filepath" in task.data:
+            manifest_entry["rttm_filepath"] = task.data["rttm_filepath"]
 
         # Forward all remaining text/metadata fields from upstream stages.
         # Recording-level / internal keys are excluded so per-segment rows stay small
@@ -413,6 +428,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             "language_confidence",
             "sed_events",
             "num_speakers",
+            "rttm_filepath",
             "duration",
             "duration_sec",
             "original_sampling_rate",

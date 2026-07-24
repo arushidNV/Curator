@@ -58,11 +58,11 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
 _TARGET_SR = 16000
-# Encoder engines are built for a 30-second window; clip anything longer. Both
+# Encoder engines are built for a 40-second window; clip anything longer. Both
 # bounds are configurable (see IndicCanaryTRTLLMASR / InferenceIndicCanaryStage);
 # these are just the defaults.
-_DEFAULT_MAX_DURATION_SEC = 30.0
-_DEFAULT_MIN_DURATION_SEC = 3.0
+_DEFAULT_MAX_DURATION_SEC = 40.0
+_DEFAULT_MIN_DURATION_SEC = 0.5
 _MAX_SAMPLES = int(_DEFAULT_MAX_DURATION_SEC * _TARGET_SR)
 _MIN_SAMPLES = int(_DEFAULT_MIN_DURATION_SEC * _TARGET_SR)
 # `per_feature` normalization computes std over the valid frames; a single mel
@@ -86,19 +86,23 @@ class IndicCanaryTRTLLMASR(ModelInterface):
         engine_dir: str,
         *,
         num_beams: int = 4,
-        max_new_tokens: int = 246,
+        max_new_tokens: int = 374,
         pnc: bool = False,
         max_duration_sec: float = _DEFAULT_MAX_DURATION_SEC,
         min_duration_sec: float = _DEFAULT_MIN_DURATION_SEC,
+        kv_cache_free_gpu_memory_fraction: float = 0.3,
     ):
         self.engine_dir = engine_dir
         self.num_beams = num_beams
         self.max_new_tokens = max_new_tokens
         self.pnc = pnc
+        self.kv_cache_free_gpu_memory_fraction = kv_cache_free_gpu_memory_fraction
         # Window bounds in samples. max clips overly long clips to the encoder's
         # build-time window; min sets the floor the batch is zero-padded up to.
+        # min is capped at max so a misconfigured min_duration_sec can never pad
+        # beyond the encoder window.
         self.max_samples = int(max_duration_sec * _TARGET_SR)
-        self.min_samples = int(min_duration_sec * _TARGET_SR)
+        self.min_samples = min(int(min_duration_sec * _TARGET_SR), self.max_samples)
         self._model: Any = None
 
     @property
@@ -110,7 +114,11 @@ class IndicCanaryTRTLLMASR(ModelInterface):
         from nemo_curator.stages.audio.inference.indic_canary_trtllm_runtime import CanaryTRTLLM
 
         logger.info(f"Loading Indic Canary TRT-LLM engine from {self.engine_dir}")
-        self._model = CanaryTRTLLM(self.engine_dir, device="cuda:0")
+        self._model = CanaryTRTLLM(
+            self.engine_dir,
+            device="cuda:0",
+            kv_cache_free_gpu_memory_fraction=self.kv_cache_free_gpu_memory_fraction,
+        )
         logger.info(
             f"Indic Canary ready: prompt_format={self._model.tokenizer.prompt_format}, "
             f"max_batch_size={self._model.max_batch_size}, langs={len(self._model.tokenizer.langs)}"
@@ -191,6 +199,12 @@ class IndicCanaryTRTLLMASR(ModelInterface):
             wav = wav.reshape(-1)
             if int(sr) != _TARGET_SR:
                 wav = AF.resample(wav, orig_freq=int(sr), new_freq=_TARGET_SR)
+            if wav.shape[0] > self.max_samples:
+                logger.warning(
+                    f"Audio clip is {wav.shape[0] / _TARGET_SR:.2f}s, longer than the "
+                    f"{self.max_samples / _TARGET_SR:.2f}s encoder window; truncating the remainder. "
+                    "Split long input with VAD before Indic Canary inference."
+                )
             wav = wav[: self.max_samples]
             prepared.append(wav)
             lengths.append(int(wav.shape[0]))
@@ -203,7 +217,10 @@ class IndicCanaryTRTLLMASR(ModelInterface):
             end = start + max_bs
             chunk = prepared[start:end]
             chunk_lengths = lengths[start:end]
-            pad_len = min(max(*chunk_lengths, self.min_samples), self.max_samples)
+            # Clips were already clipped to <= max_samples above, and min_samples is
+            # capped at max_samples, so pad only up to the longest clip in the chunk
+            # (floored at min_samples) — no need to re-clamp to max_samples here.
+            pad_len = max(*chunk_lengths, self.min_samples)
             padded = [pad_or_trim(w, pad_len) for w in chunk]
             durations = [min(max(length, _MIN_DURATION_SAMPLES), pad_len) for length in chunk_lengths]
             prompts_cfg = [self._prompt_cfg(langs_norm[i]) for i in range(start, end) if i < len(langs_norm)]
@@ -240,26 +257,35 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
         min_duration_sec: Lower bound in seconds; shorter clips are zero-padded up
             to this length before inference.
         source_lang_key: Task key holding the per-sample ISO language code.
+        skip_me_key: Task key for the shared downstream "skip this entry" flag; set
+            to ``lang_not_supported:<stage>`` for unsupported-language samples.
         keep_waveform: When True the waveform is left on the task for a later stage.
     """
 
     name: str = "IndicCanary_inference"
     engine_dir: str = ""
     num_beams: int = 4
-    max_new_tokens: int = 246
+    # Matches the default 40 s encoder window (build tooling: 30 s -> 246, 40 s -> 374);
+    # clamped to the engine's own budget at inference time.
+    max_new_tokens: int = 374
     pnc: bool = False
     max_duration_sec: float = _DEFAULT_MAX_DURATION_SEC
     min_duration_sec: float = _DEFAULT_MIN_DURATION_SEC
+    # Fraction of free GPU memory TRT-LLM may claim for its KV cache. Keep low
+    # (~0.3) when Canary shares a GPU with other stages (metadata-extraction
+    # pipeline); raise toward 0.9 when it owns the whole GPU (dedicated ASR).
+    kv_cache_free_gpu_memory_fraction: float = 0.3
     source_lang_key: str = "source_lang"
     waveform_key: str = "waveform"
     sample_rate_key: str = "sampling_rate"
     pred_text_key: str = "asr_prediction"
     language_key: str = "asr_language"
     notes_key: str = "additional_notes"
+    skip_me_key: str = "_skipme"
     keep_waveform: bool = False
     num_workers_override: int | None = None
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
-    batch_size: int = 8
+    batch_size: int = 64
     _model: IndicCanaryTRTLLMASR | None = field(default=None, init=False, repr=False)
 
     def num_workers(self) -> int | None:
@@ -279,6 +305,7 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
             pnc=self.pnc,
             max_duration_sec=self.max_duration_sec,
             min_duration_sec=self.min_duration_sec,
+            kv_cache_free_gpu_memory_fraction=self.kv_cache_free_gpu_memory_fraction,
         )
 
     def setup_on_node(
@@ -326,15 +353,18 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
         raise NotImplementedError(msg)
 
     def _eligible_indices(self, tasks: list[AudioTask]) -> list[int]:
-        """Indices of tasks whose source language the engine supports; annotate the rest."""
+        """Indices of tasks whose source language the engine supports; flag the rest."""
         eligible: list[int] = []
         for i, task in enumerate(tasks):
             lang = str(task.data.get(self.source_lang_key, "") or "").strip().lower()
             if self._model.supports_language(lang):
                 eligible.append(i)
             else:
+                # Leave primary/fallback predictions empty and flag via _skipme.
+                task.data[self.pred_text_key] = ""
+                if not task.data.get(self.skip_me_key, ""):
+                    task.data[self.skip_me_key] = f"lang_not_supported:{self.name}"
                 set_note(task.data, self.name, f"skipped (unsupported language: {lang})", self.notes_key)
-                set_note(task.data, self.pred_text_key, f"lang_not_supported:{lang}", self.notes_key)
         return eligible
 
     def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
@@ -361,6 +391,21 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
         waveforms = [t.data[self.waveform_key] for t in eligible_tasks]
         sample_rates = [t.data[self.sample_rate_key] for t in eligible_tasks]
         lang_codes = [str(t.data.get(self.source_lang_key, "") or "").strip().lower() for t in eligible_tasks]
+
+        # Record encoder-window truncation in the manifest (additional_notes), not
+        # just the worker log: generate() clips clips longer than the build-time
+        # window, which drops the tail of the transcription.
+        for t, w, sr in zip(eligible_tasks, waveforms, sample_rates, strict=True):
+            n_samples = w.shape[-1] if getattr(w, "ndim", 1) > 1 else len(w)
+            duration = n_samples / sr if sr else 0.0
+            if duration >= self.max_duration_sec:
+                set_note(
+                    t.data,
+                    self.name,
+                    f"audio {duration:.2f}s exceeds {self.max_duration_sec:.0f}s encoder window; "
+                    "transcription truncated (split with VAD before inference)",
+                    self.notes_key,
+                )
 
         pred_texts, langs_out = self._model.generate(waveforms, sample_rates, lang_codes)
 

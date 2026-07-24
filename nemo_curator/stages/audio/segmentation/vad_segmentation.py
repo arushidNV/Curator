@@ -100,8 +100,8 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
     nested: bool = False
 
     name: str = "VADSegmentation"
-    batch_size: int = 1
-    resources: Resources = field(default_factory=lambda: Resources(cpus=1.0, gpus=0.0))
+    batch_size: int = 8
+    resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=4.0))
 
     def __post_init__(self):
         super().__init__()

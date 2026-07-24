@@ -120,8 +120,10 @@ class TestProcessBatch:
         assert out[0].data["asr_prediction"] == "pred_hi"
         assert out[0].data["asr_language"] == "hi"
         assert out[2].data["asr_prediction"] == "pred_ta"
-        # Unsupported language is annotated, not transcribed.
+        # Unsupported language: prediction left empty, flagged via _skipme, and the
+        # per-field note kept for SelectBestPrediction's primary/fallback routing.
         assert out[1].data["asr_prediction"] == ""
+        assert out[1].data["_skipme"].startswith("lang_not_supported")
         assert "lang_not_supported" in str(out[1].data.get("additional_notes", ""))
 
     def test_waveform_popped_by_default(self) -> None:
@@ -143,6 +145,14 @@ class TestProcessBatch:
         out = stage.process_batch([_make_task("zz")])
         assert out[0].data["asr_prediction"] == ""
         assert out[0].data["asr_language"] == ""
+        assert out[0].data["_skipme"].startswith("lang_not_supported")
+
+    def test_long_audio_adds_truncation_note(self) -> None:
+        stage = InferenceIndicCanaryStage(engine_dir="canary_engine")
+        stage._model = _mock_engine(supported={"hi"})
+        # 45 s @ 16 kHz exceeds the default 40 s encoder window.
+        out = stage.process_batch([_make_task("hi", n=45 * 16000)])
+        assert "truncated" in str(out[0].data.get("additional_notes", ""))
 
 
 class TestEngineHelpers:
@@ -269,14 +279,16 @@ class TestGenerateWaveformPrep:
         whole clip to a single value and yielding near-silent, truncated output.
         """
         eng = _engine_for_generate()
-        n = _TARGET_SR  # 1 s @ 16 kHz
+        # Sub-floor clip (> _MIN_DURATION_SAMPLES, < _MIN_SAMPLES) so the real
+        # duration is preserved but the buffer is zero-padded up to the min floor.
+        n = _MIN_SAMPLES // 2
         wav = np.full((1, n), 0.1, dtype=np.float32)  # (channels, samples)
 
         texts, _ = eng.generate([wav], [_TARGET_SR], ["hi"])
 
         call = eng._model.calls[0]
         assert call["durations"][0] == n  # real duration preserved, not 1
-        assert int(call["padded"][0].shape[0]) == _MIN_SAMPLES  # padded to the 3 s floor
+        assert int(call["padded"][0].shape[0]) == _MIN_SAMPLES  # padded to the min-duration floor
         assert len(texts) == 1
 
     def test_stereo_downmixed_to_mono_length(self) -> None:
@@ -313,13 +325,24 @@ class TestGenerateWaveformPrep:
 
     def test_long_clip_trimmed_to_window(self) -> None:
         eng = _engine_for_generate()
-        wav = np.zeros(40 * _TARGET_SR, dtype=np.float32)  # 40 s > 30 s window
+        wav = np.zeros(45 * _TARGET_SR, dtype=np.float32)  # 45 s > 40 s window
 
         eng.generate([wav], [_TARGET_SR], ["hi"])
 
         call = eng._model.calls[0]
         assert call["durations"][0] == _MAX_SAMPLES
         assert int(call["padded"][0].shape[0]) == _MAX_SAMPLES
+
+    def test_long_clip_warns_before_trimming(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        eng = _engine_for_generate()
+        warning = MagicMock()
+        monkeypatch.setattr(indic_canary_mod.logger, "warning", warning)
+        wav = np.zeros(45 * _TARGET_SR, dtype=np.float32)  # 45 s > 40 s window
+
+        eng.generate([wav], [_TARGET_SR], ["hi"])
+
+        warning.assert_called_once()
+        assert "truncating" in warning.call_args.args[0].lower()
 
     def test_resample_changes_sample_count(self) -> None:
         eng = _engine_for_generate()

@@ -226,45 +226,11 @@ class TestNeMoSpeechWriterStage:
         assert (output_dir / "shard_c.jsonl.done").is_file()
         assert len((output_dir / "shard_c.jsonl").read_text(encoding="utf-8").strip().splitlines()) == 2
 
-    def test_splits_manifests_by_normalized_language(self, tmp_path: Path) -> None:
+    def test_missing_language_writes_manifest_only_row(self, tmp_path: Path) -> None:
         output_dir = tmp_path / "out"
         stage = NeMoSpeechWriterStage(
             output_dir=str(output_dir),
             writer_concurrency=1,
-            save_audio=False,
-            split_manifest_by_language=True,
-        )
-        stage.setup()
-        metadata = {"_shard_key": "youtube/00000", "_shard_total": 2}
-
-        for task_id, language in (("hi_clip", "hi: Hindi"), ("en_clip", "en: English")):
-            stage.process(
-                AudioTask(
-                    task_id=task_id,
-                    dataset_name="test",
-                    data={
-                        "sample_rate": 16000,
-                        "duration_sec": 1.0,
-                        "original_file": f"s3://bucket/audio/{task_id}.wav",
-                        "language": language,
-                    },
-                    _metadata=metadata,
-                )
-            )
-
-        hi_manifest = output_dir / "hi" / "youtube" / "00000.jsonl"
-        en_manifest = output_dir / "en" / "youtube" / "00000.jsonl"
-        assert json.loads(hi_manifest.read_text(encoding="utf-8"))["language"] == "hi: Hindi"
-        assert json.loads(en_manifest.read_text(encoding="utf-8"))["language"] == "en: English"
-        assert not (output_dir / "youtube" / "00000.jsonl").exists()
-        assert (output_dir / "youtube" / "00000.jsonl.done").is_file()
-
-    def test_missing_language_routes_manifest_to_und(self, tmp_path: Path) -> None:
-        output_dir = tmp_path / "out"
-        stage = NeMoSpeechWriterStage(
-            output_dir=str(output_dir),
-            writer_concurrency=1,
-            split_manifest_by_language=True,
         )
         stage.setup()
 
@@ -281,4 +247,4 @@ class TestNeMoSpeechWriterStage:
             )
         )
 
-        assert (output_dir / "und" / "youtube" / "00000.jsonl").is_file()
+        assert (output_dir / "youtube" / "00000.jsonl").is_file()

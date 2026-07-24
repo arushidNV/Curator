@@ -389,13 +389,11 @@ class CanaryModel:
                     ],
                     dim=0,
                 ).contiguous()
-                dst = weights[
-                    f'{trtllm_layer_name_prefix}.self_attention.qkv.weight'] = t
+                weights[f'{trtllm_layer_name_prefix}.self_attention.qkv.weight'] = t
                 t = model_params[
                     f'_decoder.layers.{i}.first_sub_layer.out_projection.weight'].contiguous(
                     )
-                dst = weights[
-                    f'{trtllm_layer_name_prefix}.self_attention.dense.weight'] = t
+                weights[f'{trtllm_layer_name_prefix}.self_attention.dense.weight'] = t
 
                 weights[f'{trtllm_layer_name_prefix}.self_attention.qkv.bias'] = torch.cat(
                     [
@@ -431,15 +429,13 @@ class CanaryModel:
                     dim=0,
                 ).contiguous()
 
-                dst = weights[
-                    f'{trtllm_layer_name_prefix}.cross_attention.qkv.weight'] = t
+                weights[f'{trtllm_layer_name_prefix}.cross_attention.qkv.weight'] = t
 
                 t = model_params[
                     f'_decoder.layers.{i}.second_sub_layer.out_projection.weight'].contiguous(
                     )
 
-                dst = weights[
-                    f'{trtllm_layer_name_prefix}.cross_attention.dense.weight'] = t
+                weights[f'{trtllm_layer_name_prefix}.cross_attention.dense.weight'] = t
 
                 cross_attn_qkv_bias = torch.cat([
                     model_params[

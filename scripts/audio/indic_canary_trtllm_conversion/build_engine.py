@@ -75,6 +75,29 @@ _REQUIRED_ARTIFACTS: tuple[str, ...] = (
 # Conformer subsampling factor: encoder output frames = 1 + feat_len / SUBSAMPLING.
 _SUBSAMPLING_FACTOR = 8
 
+# Length derivation from the max audio window (see _derive_engine_lengths):
+#   * 10 ms window shift -> 100 feature frames per second.
+#   * ~8 decoder output tokens per second is a safe ASR upper bound.
+#   * The decoder sequence budget is rounded up to a multiple of 128, matching
+#     the known-good engines (30s -> 246 output tokens, 40s -> 374).
+_FRAMES_PER_SECOND = 100
+_OUTPUT_TOKENS_PER_SECOND = 8
+_SEQ_LEN_MULTIPLE = 128
+
+
+def _derive_engine_lengths(max_audio_seconds: float, max_prompt_tokens: int) -> tuple[int, int]:
+    """Derive (max_feat_len, max_output_tokens) from the max audio window.
+
+    ``max_feat_len`` is the encoder input length in feature frames; the decoder
+    budget is ``~8 tokens/s + prompt`` rounded up to the next 128, minus the
+    prompt. Reproduces the shipped engines: 30s -> (3001, 246), 40s -> (4001, 374).
+    """
+    max_feat_len = round(max_audio_seconds * _FRAMES_PER_SECOND) + 1
+    raw_seq_len = round(max_audio_seconds * _OUTPUT_TOKENS_PER_SECOND) + max_prompt_tokens
+    max_seq_len = -(-raw_seq_len // _SEQ_LEN_MULTIPLE) * _SEQ_LEN_MULTIPLE
+    max_output_tokens = max_seq_len - max_prompt_tokens
+    return max_feat_len, max_output_tokens
+
 
 def _run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     """Echo and run a subprocess, raising on non-zero exit."""
@@ -203,6 +226,11 @@ def build(args: argparse.Namespace) -> None:
         message = f"--nemo_model_path does not exist: {args.nemo_model_path}"
         raise FileNotFoundError(message)
 
+    # Derive the dependent sequence lengths from the single audio-window knob.
+    args.max_feat_len, args.max_output_tokens = _derive_engine_lengths(
+        args.max_audio_seconds, args.max_prompt_tokens
+    )
+
     engine_dir = Path(args.engine_dir).resolve()
     engine_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = Path(args.checkpoint_dir).resolve() if args.checkpoint_dir else engine_dir / "tllm_checkpoint"
@@ -218,7 +246,9 @@ def build(args: argparse.Namespace) -> None:
     print(f"\nCANARY_TRTLLM_ENGINE_BUILD_PASSED engine_dir={engine_dir}")
     print(
         f"  dtype={args.dtype} max_batch_size={args.max_batch_size} "
-        f"max_beam_width={args.max_beam_width} max_seq_len={max_seq_len}"
+        f"max_beam_width={args.max_beam_width} max_audio_seconds={args.max_audio_seconds} "
+        f"max_feat_len={args.max_feat_len} max_output_tokens={args.max_output_tokens} "
+        f"max_seq_len={max_seq_len}"
     )
     print(
         "Use it with InferenceIndicCanaryStage(engine_dir=...) or "
@@ -265,7 +295,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["float16", "bfloat16"],
         help="Inference precision for the engine (default: bfloat16).",
     )
-    parser.add_argument("--max_batch_size", type=int, default=8, help="Engine max batch size.")
+    parser.add_argument("--max_batch_size", type=int, default=64, help="Engine max batch size.")
     parser.add_argument(
         "--max_beam_width",
         type=int,
@@ -273,16 +303,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Decoder beam width. Must be >= the --num_beams used at inference.",
     )
     parser.add_argument(
-        "--max_feat_len",
-        type=int,
-        default=4001,
-        help="Max audio duration(ms)/10ms window shift. Default 4001 ~= 40s.",
-    )
-    parser.add_argument(
-        "--max_output_tokens",
-        type=int,
-        default=374,
-        help="Max generated tokens. 374 + 10 prompt = 384 seq len (recommended for ~40s audio).",
+        "--max_audio_seconds",
+        type=float,
+        default=40.0,
+        help="Longest audio window the engine must handle, in seconds. Both the encoder "
+        "feature length and the decoder token budget are derived from this "
+        "(e.g. 30s -> feat_len 3001 / 246 tokens, 40s -> 4001 / 374).",
     )
     parser.add_argument(
         "--max_prompt_tokens",

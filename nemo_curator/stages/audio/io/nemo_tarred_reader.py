@@ -37,6 +37,7 @@ try:
     from nemo_curator.backends.experimental.utils import RayStageSpecKeys
 except ModuleNotFoundError:
     RayStageSpecKeys = None
+from nemo_curator.stages.audio.io.shard_key import derive_manifest_shard_key
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.tasks import AudioTask, FileGroupTask, _EmptyTask
 
@@ -146,7 +147,7 @@ class NemoTarShardDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         return completed
 
     @staticmethod
-    def _manifest_to_rel_path(manifest_path: str, corpus: str) -> str:
+    def _manifest_to_rel_path(manifest_path: str, corpus: str, shard_key_prefix: str | None = None) -> str:
         """Extract relative output path from a manifest path, starting at the corpus name.
 
         Example::
@@ -156,30 +157,10 @@ class NemoTarShardDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
             → "yodas/0_from_captions/en/sharded_manifests/manifest_42"
 
         The ``.jsonl`` extension is stripped so it can be used as a shard key.
+        When ``shard_key_prefix`` is set (via the YAML), it overrides corpus-based
+        extraction with ``{prefix}/{path tail after the prefix's last segment}``.
         """
-        parts = manifest_path.replace("\\", "/").split("/")
-        parts_lower = [p.lower() for p in parts]
-        corpus_lower = corpus.lower()
-        matches = [i for i, p in enumerate(parts_lower) if p == corpus_lower]
-        if len(matches) == 0:
-            msg = (
-                f"Corpus name '{corpus}' not found in manifest path: {manifest_path}. "
-                f"The YAML 'corpus' field must match a directory component in the manifest path (case-insensitive)."
-            )
-            raise ValueError(msg)
-        if len(matches) > 1:
-            msg = (
-                f"Corpus name '{corpus}' appears {len(matches)} times in manifest path: {manifest_path}. "
-                f"It must appear exactly once for unambiguous path extraction."
-            )
-            raise ValueError(msg)
-        idx = matches[0]
-        rel = "/".join(parts[idx:])
-        if rel.endswith(".jsonl"):
-            rel = rel[:-len(".jsonl")]
-        elif rel.endswith(".json"):
-            rel = rel[:-len(".json")]
-        return rel
+        return derive_manifest_shard_key(manifest_path, corpus, shard_key_prefix=shard_key_prefix)
 
     def process(self, _task: _EmptyTask) -> list[FileGroupTask]:  # noqa: C901
         import yaml
@@ -205,6 +186,7 @@ class NemoTarShardDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
                 if cfg.get("type", "nemo_tarred") != "nemo_tarred":
                     logger.warning(f"Skipping non-nemo_tarred corpus {corpus} (type={cfg.get('type')})")
                     continue
+                shard_key_prefix = cfg.get("shard_key_prefix")
                 manifest_paths = _expand_nemo_path(cfg["manifest_filepath"])
                 tar_paths = _expand_nemo_path(cfg["tarred_audio_filepaths"])
                 if len(manifest_paths) != len(tar_paths):
@@ -214,7 +196,7 @@ class NemoTarShardDiscoveryStage(ProcessingStage[_EmptyTask, FileGroupTask]):
                     )
                     raise ValueError(msg)
                 for mp, tp in zip(manifest_paths, tar_paths, strict=False):
-                    shard_key = self._manifest_to_rel_path(mp, corpus)
+                    shard_key = self._manifest_to_rel_path(mp, corpus, shard_key_prefix)
                     if shard_key in completed:
                         skipped += 1
                         continue
