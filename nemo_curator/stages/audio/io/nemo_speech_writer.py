@@ -23,20 +23,10 @@ from upstream downsampling), plus a per-shard JSONL manifest with metadata:
         <shard_key>.jsonl
         <shard_key>.jsonl.done          (written when all inputs in shard are processed)
 
-When ``split_manifest_by_language=True``, each shard's rows are additionally
-split into per-language manifests:
-
-    output_dir/
-        <language>/
-            <shard_key>.jsonl
-
-The completion marker is deliberately NOT split by language: it stays a single
-``<shard_key>.jsonl.done`` at the top level (not ``<language>/<shard_key>.jsonl.done``).
-A shard corresponds to one input recording/group, whose segments may span several
-languages, so "done" is only meaningful once *all* of that shard's inputs have been
-processed. Keeping one marker per shard lets resume logic count completed input
-recordings (shard-based) instead of trying to reason about which languages a shard
-happened to produce (language-based), which would be ambiguous and racy.
+The completion marker (``<shard_key>.jsonl.done``) is written once per shard, at the
+top level, when all of that shard's inputs have been processed. A shard corresponds to
+one input recording/group, so resume logic counts completed input recordings
+(shard-based).
 """
 
 from __future__ import annotations
@@ -176,11 +166,6 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         target_sample_rate: Expected sample rate (default 16000).
         waveform_key: Task data key for audio waveform.
         sample_rate_key: Task data key for sample rate.
-        language_key: Task data key containing the predicted language.
-        split_manifest_by_language: If True, write each row to
-            ``<output_dir>/<language>/<shard_key>.jsonl``. Language labels such
-            as ``"hi: Hindi"`` are normalized to ``"hi"``; missing labels use
-            ``"und"``. Defaults to False for backward compatibility.
         save_audio: If True (default), encode and save opus audio files to
             the output directory. Set to False to write only the JSONL manifest
             without producing audio files.
@@ -191,8 +176,6 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
     target_sample_rate: int = _TARGET_SR
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
-    language_key: str = "language"
-    split_manifest_by_language: bool = False
     writer_concurrency: int = 1
     save_audio: bool = True
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
@@ -268,15 +251,8 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         sf.write(buf, waveform, sr, format="OGG", subtype="OPUS")
         return buf.getvalue()
 
-    def _language_subdir(self, data: dict[str, Any]) -> str:
-        language = str(data.get(self.language_key, "") or "")
-        language = language.split(":", maxsplit=1)[0].strip()
-        return language.replace("/", "_").replace("\\", "_") or "und"
-
-    def _shard_manifest_path(self, shard_subdir: str, data: dict[str, Any]) -> str:
+    def _shard_manifest_path(self, shard_subdir: str) -> str:
         name = f"{shard_subdir}.jsonl" if shard_subdir else "manifest.jsonl"
-        if self.split_manifest_by_language:
-            name = os.path.join(self._language_subdir(data), name)
         return os.path.join(self.output_dir, name)
 
     def _emit_manifest_only(
@@ -288,7 +264,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         shard_total: int,
     ) -> FileGroupTask:
         """Write a manifest-only row (no opus) for placeholder tasks and record shard progress."""
-        manifest_path = self._shard_manifest_path(shard_subdir, manifest_entry)
+        manifest_path = self._shard_manifest_path(shard_subdir)
         os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
         _append_manifest_line(manifest_path, json.dumps(manifest_entry))
         _record_shard_input(self.output_dir, shard_subdir, input_id, shard_total)
@@ -446,7 +422,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
                 manifest_entry[key] = value
 
         # Write to per-shard manifest
-        shard_manifest_path = self._shard_manifest_path(shard_subdir, manifest_entry)
+        shard_manifest_path = self._shard_manifest_path(shard_subdir)
         os.makedirs(os.path.dirname(shard_manifest_path), exist_ok=True)
         _append_manifest_line(shard_manifest_path, json.dumps(manifest_entry))
 
