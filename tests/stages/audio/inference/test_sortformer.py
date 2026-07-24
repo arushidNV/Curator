@@ -74,6 +74,14 @@ class TestWriteRttm:
         with pytest.raises(ValueError, match="requires engine, config, and runtime module"):
             InferenceSortformerStage(backend="tensorrt", tensorrt_engine_path="model.plan")
 
+    def test_tensorrt_highres_requires_all_artifacts(self) -> None:
+        with pytest.raises(ValueError, match="requires model, cold engine, and steady engine"):
+            InferenceSortformerStage(
+                backend="tensorrt_highres",
+                model_path="model.nemo",
+                tensorrt_cold_engine_path="cold.plan",
+            )
+
     def test_writes_rttm_file(self, tmp_path: Path) -> None:
         segments = [
             {"start": 0.0, "end": 2.5, "speaker": "speaker_0"},
@@ -127,6 +135,24 @@ class TestWriteRttm:
 
         runtime_class.assert_called_once_with("model.plan", "model.json", "sortformer_modules.py")
         runtime.diarize.assert_not_called()
+        stage.teardown()
+        runtime.close.assert_called_once_with()
+
+    def test_setup_uses_highres_tensorrt_runtime(self) -> None:
+        stage = InferenceSortformerStage(
+            backend="tensorrt_highres",
+            model_path="model.nemo",
+            tensorrt_cold_engine_path="cold.plan",
+            tensorrt_steady_engine_path="steady.plan",
+        )
+        runtime = MagicMock()
+        with patch(
+            "nemo_curator.stages.audio.inference.sortformer_tensorrt_highres.HighResolutionTensorRTSortformer",
+            return_value=runtime,
+        ) as runtime_class:
+            stage.setup()
+
+        runtime_class.assert_called_once_with("model.nemo", "cold.plan", "steady.plan")
         stage.teardown()
         runtime.close.assert_called_once_with()
 

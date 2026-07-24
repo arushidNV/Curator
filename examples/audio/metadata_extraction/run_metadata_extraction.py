@@ -162,7 +162,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     diar.add_argument("--sortformer_batch_size", type=int, default=1, help="Sortformer inference batch size.")
     diar.add_argument(
         "--sortformer_backend",
-        choices=["nemo", "tensorrt"],
+        choices=["nemo", "tensorrt", "tensorrt_highres"],
         default="nemo",
         help="Sortformer inference backend.",
     )
@@ -173,6 +173,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Matching Riva sortformer_modules.py.",
+    )
+    diar.add_argument(
+        "--sortformer_tensorrt_cold_engine",
+        type=str,
+        default=None,
+        help="High-resolution first-chunk TensorRT plan.",
+    )
+    diar.add_argument(
+        "--sortformer_tensorrt_steady_engine",
+        type=str,
+        default=None,
+        help="High-resolution steady-state TensorRT plan.",
     )
     diar.add_argument(
         "--sortformer_precision",
@@ -231,7 +243,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
         MonoDownsampleStage(target_sample_rate=args.target_sample_rate),
     ]
 
-    if args.sortformer_model or args.sortformer_tensorrt_engine:
+    if args.sortformer_model or args.sortformer_tensorrt_engine or args.sortformer_tensorrt_cold_engine:
         model_path = (
             args.sortformer_model if args.sortformer_model and args.sortformer_model.endswith(".nemo") else None
         )
@@ -250,6 +262,8 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 tensorrt_engine_path=args.sortformer_tensorrt_engine,
                 tensorrt_config_path=args.sortformer_tensorrt_config,
                 tensorrt_runtime_module_path=args.sortformer_tensorrt_runtime_module,
+                tensorrt_cold_engine_path=args.sortformer_tensorrt_cold_engine,
+                tensorrt_steady_engine_path=args.sortformer_tensorrt_steady_engine,
                 precision=args.sortformer_precision,
                 compile_encoder=args.sortformer_compile_encoder,
                 rttm_out_dir=args.rttm_out_dir,
@@ -340,13 +354,18 @@ def main() -> None:
     logger.info(f"  Input: {args.data_config}")
     if language_filter:
         logger.info(f"  Language filter: {language_filter}")
-    if args.sortformer_model or args.sortformer_tensorrt_engine:
+    if args.sortformer_model or args.sortformer_tensorrt_engine or args.sortformer_tensorrt_cold_engine:
         sf_desc = (
             f"gpus={args.sortformer_gpus}/actor"
             if args.sortformer_gpus is not None
             else f"gpu_memory_gb={args.sortformer_gpu_memory_gb}"
         )
-        model = args.sortformer_tensorrt_engine if args.sortformer_backend == "tensorrt" else args.sortformer_model
+        if args.sortformer_backend == "tensorrt":
+            model = args.sortformer_tensorrt_engine
+        elif args.sortformer_backend == "tensorrt_highres":
+            model = args.sortformer_tensorrt_cold_engine
+        else:
+            model = args.sortformer_model
         logger.info(f"  Sortformer: {model} ({sf_desc}, on full audio before VAD)")
     logger.info(
         f"  VAD: backend={args.vad_backend}, threshold={args.vad_threshold}, "

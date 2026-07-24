@@ -104,6 +104,9 @@ class TensorRTSession:
         expected_dtype = _trt_dtype_to_torch(self._engine.get_tensor_dtype(name))
         return tensor if tensor.dtype == expected_dtype else tensor.to(expected_dtype)
 
+    def tensor_shape(self, name: str) -> tuple[int, ...]:
+        return tuple(self._engine.get_tensor_shape(name))
+
     def _output_buffer(self, name: str, shape: tuple[int, ...]) -> torch.Tensor:
         if any(dimension < 0 for dimension in shape):
             msg = f"TensorRT did not resolve output shape for {name!r}: {shape}"

@@ -136,10 +136,12 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         spkcache_update_period: Optional speaker cache update period override.
         spkcache_len: Optional speaker cache size override in encoder frames.
         inference_batch_size: Batch size passed to diarize().
-        backend: ``"nemo"`` or ``"tensorrt"``.
+        backend: ``"nemo"``, ``"tensorrt"``, or ``"tensorrt_highres"``.
         tensorrt_engine_path: TensorRT plan file.
         tensorrt_config_path: Runtime JSON stored with the TensorRT plan.
         tensorrt_runtime_module_path: Matching Riva ``sortformer_modules.py``.
+        tensorrt_cold_engine_path: High-resolution first-chunk TensorRT plan.
+        tensorrt_steady_engine_path: High-resolution steady-state TensorRT plan.
         precision: Inference precision.
         compile_encoder: Whether to compile the 31-layer encoder with torch.compile.
         name: Stage name.
@@ -163,10 +165,12 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     spkcache_update_period: int | None = None
     spkcache_len: int | None = None
     inference_batch_size: int = 1
-    backend: Literal["nemo", "tensorrt"] = "nemo"
+    backend: Literal["nemo", "tensorrt", "tensorrt_highres"] = "nemo"
     tensorrt_engine_path: str | None = None
     tensorrt_config_path: str | None = None
     tensorrt_runtime_module_path: str | None = None
+    tensorrt_cold_engine_path: str | None = None
+    tensorrt_steady_engine_path: str | None = None
     precision: Literal["fp32", "fp16", "bf16"] = "fp32"
     compile_encoder: bool = False
     name: str = "Sortformer_inference"
@@ -174,7 +178,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0, gpu_memory_gb=8.0))
 
     def __post_init__(self) -> None:
-        if self.backend not in {"nemo", "tensorrt"}:
+        if self.backend not in {"nemo", "tensorrt", "tensorrt_highres"}:
             msg = f"Unsupported Sortformer backend: {self.backend}"
             raise ValueError(msg)
         if self.precision not in {"fp32", "fp16", "bf16"}:
@@ -185,13 +189,18 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         ):
             msg = "Sortformer TensorRT requires engine, config, and runtime module paths"
             raise ValueError(msg)
+        if self.backend == "tensorrt_highres" and not all(
+            (self.model_path, self.tensorrt_cold_engine_path, self.tensorrt_steady_engine_path)
+        ):
+            msg = "High-resolution Sortformer TensorRT requires model, cold engine, and steady engine paths"
+            raise ValueError(msg)
         self._tensorrt_model = None
 
     def setup_on_node(
         self, _node_info: NodeInfo | None = None, _worker_metadata: WorkerMetadata | None = None
     ) -> None:
         """Pre-download model weights on the node so actors load from cache."""
-        if self.backend == "tensorrt" or self.model_path is not None:
+        if self.backend in {"tensorrt", "tensorrt_highres"} or self.model_path is not None:
             return
         try:
             repo_dir = snapshot_download(repo_id=self.model_name, cache_dir=self.cache_dir)
@@ -212,6 +221,17 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
                 self.tensorrt_engine_path,
                 self.tensorrt_config_path,
                 self.tensorrt_runtime_module_path,
+            )
+            return
+        if self.backend == "tensorrt_highres":
+            from nemo_curator.stages.audio.inference.sortformer_tensorrt_highres import (
+                HighResolutionTensorRTSortformer,
+            )
+
+            self._tensorrt_model = HighResolutionTensorRTSortformer(
+                self.model_path,
+                self.tensorrt_cold_engine_path,
+                self.tensorrt_steady_engine_path,
             )
             return
 
@@ -290,7 +310,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         kwargs: dict[str, Any] = {"audio": audio, "batch_size": self.inference_batch_size}
         if sample_rate is not None:
             kwargs["sample_rate"] = sample_rate
-        if self.backend == "tensorrt":
+        if self.backend in {"tensorrt", "tensorrt_highres"}:
             kwargs.pop("batch_size")
             return self._tensorrt_model.diarize(**kwargs)
         if self.precision == "fp32":
