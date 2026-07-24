@@ -79,8 +79,8 @@ except ImportError as exc:  # pragma: no cover - runtime-only optional dependenc
 
 CONSTANT = 1e-5
 SAMPLE_RATE = 16000
-CHUNK_LENGTH = 30
-N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE  # 480000 samples in a 30-second chunk
+CHUNK_LENGTH = 40
+N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE  # 640000 samples in a 40-second chunk
 
 
 def pad_or_trim(array: Any, length: int = N_SAMPLES, *, axis: int = -1) -> Any:
@@ -490,7 +490,14 @@ class CanaryEncoder:
 class CanaryDecoding:
     """Transformer decoder TensorRT-LLM engine (C++ static-batch session)."""
 
-    def __init__(self, engine_dir: Path, tokenizer: CanaryTokenizer, debug_mode: bool = False, device: str = "cuda:0"):
+    def __init__(
+        self,
+        engine_dir: Path,
+        tokenizer: CanaryTokenizer,
+        debug_mode: bool = False,
+        device: str = "cuda:0",
+        kv_cache_free_gpu_memory_fraction: float = 0.3,
+    ):
         self.tokenizer = tokenizer
         self.decoder_config = read_config("decoder", engine_dir)
         self.prompt_format = self.decoder_config["prompt_format"]
@@ -499,6 +506,7 @@ class CanaryDecoding:
         self.max_seq_len = self.decoder_config["max_seq_len"]
         self.max_input_len = self.decoder_config["max_input_len"]
         self.device = device
+        self.kv_cache_free_gpu_memory_fraction = kv_cache_free_gpu_memory_fraction
         self.decoder_generation_session = self._get_cpp_session(engine_dir, debug_mode)
 
     def _get_cpp_session(self, engine_dir: Path, debug_mode: bool = False) -> Any:
@@ -510,7 +518,11 @@ class CanaryDecoding:
             "max_output_len": self.max_seq_len - self.max_input_len,
             "max_beam_width": self.decoder_config["max_beam_width"],
             "debug_mode": debug_mode,
-            "kv_cache_free_gpu_memory_fraction": 0.9,
+            # 0.9 assumes Canary owns the whole GPU. In the metadata-extraction pipeline it
+            # co-resides with Sortformer/VAD/SED/SpeechBrain on one GPU, and TRT-LLM's KV-cache
+            # grab is invisible to Ray's gpu_memory_gb scheduler, so 0.9 (~70GB) starves the
+            # other stages -> CUDA OOM. Bound it (configurable) to fit the shared budget.
+            "kv_cache_free_gpu_memory_fraction": self.kv_cache_free_gpu_memory_fraction,
             "cross_kv_cache_fraction": 0.5,
         }
         # KVCacheType is imported for parity with the reference runner's config path.
@@ -572,7 +584,13 @@ class CanaryDecoding:
 class CanaryTRTLLM:
     """End-to-end static-batch Canary TRT-LLM pipeline: mel → encoder → decoder."""
 
-    def __init__(self, engine_dir: str | Path, debug_mode: bool = False, device: str = "cuda:0"):
+    def __init__(
+        self,
+        engine_dir: str | Path,
+        debug_mode: bool = False,
+        device: str = "cuda:0",
+        kv_cache_free_gpu_memory_fraction: float = 0.3,
+    ):
         self.device = device
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
@@ -605,7 +623,13 @@ class CanaryTRTLLM:
         )
         self.tokenizer = CanaryTokenizer(engine_dir)
         self.encoder = CanaryEncoder(engine_dir)
-        self.decoder = CanaryDecoding(engine_dir, tokenizer=self.tokenizer, debug_mode=debug_mode, device=self.device)
+        self.decoder = CanaryDecoding(
+            engine_dir,
+            tokenizer=self.tokenizer,
+            debug_mode=debug_mode,
+            device=self.device,
+            kv_cache_free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        )
 
     def process_batch(
         self,

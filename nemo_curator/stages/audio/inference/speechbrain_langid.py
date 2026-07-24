@@ -54,7 +54,10 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
     name: str = "SpeechBrainLangID"
     source: str = "speechbrain/lang-id-voxlingua107-ecapa"
     savedir: str = field(default_factory=lambda: os.path.join(tempfile.gettempdir(), "speechbrain_langid"))
-    batch_size: int = 32
+    # batch_size / max_duration_sec / max_workers inherited from BaseLangIDStage
+    # (16 / 10s / None). These bound the padded-batch activation footprint of the
+    # ECAPA-TDNN forward, which is the usual OOM source when this stage co-resides on a
+    # shared GPU.
 
     _classifier: Any = field(default=None, init=False, repr=False)
 

@@ -126,6 +126,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     lid.add_argument("--langid_model", type=str, default=None, help="Model name/path (default depends on backend).")
     lid.add_argument("--langid_gpu_memory_gb", type=float, default=4.0, help="GPU memory for LangID stage.")
+    lid.add_argument(
+        "--langid_max_workers", type=int, default=2,
+        help="Hard cap on concurrent LangID actors per GPU (0/negative = executor autoscales). "
+        "Default 2: prevents the autoscaler from packing ~10 actors on one GPU (a common "
+        "SpeechBrain OOM cause when co-resident with other GPU stages).",
+    )
+    lid.add_argument(
+        "--langid_max_duration_sec", type=float, default=10.0,
+        help="Truncate each segment to this many seconds before LangID. LangID needs only a few "
+        "seconds; longer segments inflate the padded batch and drive GPU OOM. 0 = no truncation.",
+    )
+    lid.add_argument("--langid_batch_size", type=int, default=16, help="LangID inference batch size.")
     lid.add_argument("--skip_langid", action="store_true", default=False, help="Skip language ID stage.")
 
     diar = ap.add_argument_group("Speaker Diarization (Sortformer)")
@@ -161,6 +173,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     out = ap.add_argument_group("Output")
     out.add_argument("--target_sample_rate", type=int, default=16000, help="Output sample rate.")
+
+    ex = ap.add_argument_group("Executor")
+    ex.add_argument(
+        "--executor", choices=["ray_data", "xenna"], default="ray_data",
+        help="Backend executor. 'xenna' (Cosmos-Xenna) supports batch mode where stages run "
+        "sequentially so GPU stages never co-reside (avoids single-GPU OOM/contention).",
+    )
+    ex.add_argument(
+        "--execution_mode", choices=["streaming", "batch"], default="streaming",
+        help="Xenna execution mode: 'batch' materializes each stage before the next (one GPU "
+        "stage resident at a time); 'streaming' pipelines them. Only used with --executor xenna.",
+    )
 
     return ap
 
@@ -232,7 +256,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             )
         )
 
-    if not args.skip_langid:
+        langid_max_workers = args.langid_max_workers if args.langid_max_workers > 0 else None
         if args.langid_backend == "speechbrain":
             from nemo_curator.stages.audio.inference.speechbrain_langid import SpeechBrainLangIDStage
 
@@ -240,6 +264,9 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             stages.append(
                 SpeechBrainLangIDStage(
                     source=langid_source,
+                    max_duration_sec=args.langid_max_duration_sec,
+                    batch_size=args.langid_batch_size,
+                    max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
@@ -248,6 +275,9 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             stages.append(
                 AmberNetLangIDStage(
                     model_name=langid_model,
+                    max_duration_sec=args.langid_max_duration_sec,
+                    batch_size=args.langid_batch_size,
+                    max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
@@ -275,9 +305,16 @@ def main() -> None:
 
     pipeline = Pipeline(name=pipeline_name, stages=stages)
 
-    from nemo_curator.backends.ray_data import RayDataExecutor
+    if args.executor == "xenna":
+        from nemo_curator.backends.xenna import XennaExecutor
 
-    executor = RayDataExecutor()
+        executor = XennaExecutor(config={"execution_mode": args.execution_mode})
+        logger.info(f"Executor: XennaExecutor (execution_mode={args.execution_mode})")
+    else:
+        from nemo_curator.backends.ray_data import RayDataExecutor
+
+        executor = RayDataExecutor()
+        logger.info("Executor: RayDataExecutor (streaming)")
 
     logger.info(f"Metadata extraction pipeline: {len(stages)} stages ({pipeline_name})")
     logger.info(f"  Output: {args.output_dir}")
