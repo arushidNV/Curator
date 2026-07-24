@@ -65,8 +65,6 @@ _SB_LANG_KEY = "speechbrain_language"
 _SB_CONF_KEY = "speechbrain_language_confidence"
 _IC_LANG_KEY = "indic_canary_language"
 _IC_CONF_KEY = "indic_canary_language_confidence"
-_AN_LANG_KEY = "ambernet_language"
-_AN_CONF_KEY = "ambernet_language_confidence"
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -92,6 +90,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to prebuilt Indic Canary TRT-LLM engine directory. Required when --indic is set.",
+    )
+    ap.add_argument(
+        "--indic_canary_lid_max_duration_sec",
+        type=float,
+        default=15.0,
+        help="Truncate each segment to this many seconds before Indic Canary LID. LID needs only "
+        "a few seconds; the stage default (40s) inflates the padded batch / mel + encoder "
+        "activations and drives GPU OOM. 0 = no truncation.",
     )
     ap.add_argument(
         "--resampled_output_dir",
@@ -294,32 +300,26 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             stages.append(
                 SpeechBrainLangIDStage(
                     source=langid_source,
-<<<<<<< HEAD
                     output_key=primary_out_key,
                     confidence_key=primary_conf_key,
-=======
                     max_duration_sec=args.langid_max_duration_sec,
                     batch_size=args.langid_batch_size,
                     max_workers=langid_max_workers,
->>>>>>> a3835ee6e2d22af4634a280b30f3daf24735a5d5
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
         else:
             langid_model = args.langid_model or "langid_ambernet"
-            primary_out_key = _AN_LANG_KEY if args.indic else "language"
-            primary_conf_key = _AN_CONF_KEY if args.indic else "language_confidence"
+            primary_out_key = _SB_LANG_KEY if args.indic else "language"
+            primary_conf_key = _SB_CONF_KEY if args.indic else "language_confidence"
             stages.append(
                 AmberNetLangIDStage(
                     model_name=langid_model,
-<<<<<<< HEAD
                     output_key=primary_out_key,
                     confidence_key=primary_conf_key,
-=======
                     max_duration_sec=args.langid_max_duration_sec,
                     batch_size=args.langid_batch_size,
                     max_workers=langid_max_workers,
->>>>>>> a3835ee6e2d22af4634a280b30f3daf24735a5d5
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
@@ -335,7 +335,8 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                     engine_dir=args.indic_canary_engine_dir,
                     output_key=_IC_LANG_KEY,
                     confidence_key=_IC_CONF_KEY,
-                    resources=Resources(gpus=1.0),
+                    max_duration_sec=args.indic_canary_lid_max_duration_sec,
+                    resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
             stages.append(
