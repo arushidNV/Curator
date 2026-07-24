@@ -107,6 +107,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--min_interval_ms", type=int, default=500,
         help="Minimum silence gap (ms) between speech segments — higher values merge more, reducing short segments.",
     )
+    vad.add_argument("--vad_gpu_memory_gb", type=float, default=4.0, help="GPU memory for VAD stage.")
+    vad.add_argument("--vad_batch_size", type=int, default=8, help="VAD GPU batch size.")
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
     sed.add_argument("--sed_checkpoint", type=str, default=None, help="Path to PANNs CNN14 checkpoint. Enables SED.")
@@ -237,6 +239,8 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             speech_pad_ms=args.speech_pad_ms,
             nested=False,
             filepath_key="resampled_audio_filepath" if args.resampled_output_dir else "audio_filepath",
+            resources=Resources(gpu_memory_gb=args.vad_gpu_memory_gb),
+            batch_size=args.vad_batch_size,
         )
     )
     stages.append(SqueezeWaveformStage())
