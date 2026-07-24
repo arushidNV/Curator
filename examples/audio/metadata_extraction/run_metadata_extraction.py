@@ -65,6 +65,8 @@ _SB_LANG_KEY = "speechbrain_language"
 _SB_CONF_KEY = "speechbrain_language_confidence"
 _IC_LANG_KEY = "indic_canary_language"
 _IC_CONF_KEY = "indic_canary_language_confidence"
+_AN_LANG_KEY = "ambernet_language"
+_AN_CONF_KEY = "ambernet_language_confidence"
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -305,8 +307,8 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             )
         else:
             langid_model = args.langid_model or "langid_ambernet"
-            primary_out_key = _SB_LANG_KEY if args.indic else "language"
-            primary_conf_key = _SB_CONF_KEY if args.indic else "language_confidence"
+            primary_out_key = _AN_LANG_KEY if args.indic else "language"
+            primary_conf_key = _AN_CONF_KEY if args.indic else "language_confidence"
             stages.append(
                 AmberNetLangIDStage(
                     model_name=langid_model,

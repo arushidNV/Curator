@@ -31,18 +31,30 @@ from nemo_curator.tasks import AudioTask
 
 # Language codes that SpeechBrain recognises as Indic and should be routed to Indic Canary.
 _DEFAULT_INDIC_LANGUAGES: frozenset[str] = frozenset({
-    "hi",  # Hindi
-    "ta",  # Tamil
-    "bn",  # Bengali
-    "ur",  # Urdu
-    "gu",  # Gujarati
-    "mr",  # Marathi
-    "ml",  # Malayalam
-    "kn",  # Kannada
-    "te",  # Telugu
-    "or",  # Odia
-    "as",  # Assamese
-    "pa",  # Punjabi
+    "hi", # Hindi
+    "ta", # Tamil
+    "bn", # Bengali
+    "ur", # Urdu
+    "gu", # Gujarati
+    "mr", # Marathi
+    "ml", # Malayalam
+    "kn", # Kannada
+    "te", # Telugu
+    "or", # Odia
+    "as", # Assamese
+    "pa", # Punjabi
+    "ne", # Nepali
+    "sa", # Sanskrit
+    "sd", # Sindhi
+    "si", # Sinhala
+    "kok", # Konkani
+    "mai", # Maithili
+    "doi", # Dogri
+    "ks", # Kashmiri
+    "mni", # Manipuri (Meitei)
+    "sat", # Santali
+    "brx", # Bodo
+    "bo", # Tibetan
 })
 
 
@@ -89,7 +101,9 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.output_key, self.confidence_key, self.source_key]
 
     def process(self, task: AudioTask) -> AudioTask:
-        sb_lang = str(task.data.get(self.speechbrain_language_key, "") or "").strip().lower()
+        sb_raw = str(task.data.get(self.speechbrain_language_key, "") or "").strip()
+        # SpeechBrain may return "ta: Tamil" — extract just the code before the colon.
+        sb_lang = sb_raw.split(":")[0].strip().lower()
         sb_confidence = float(task.data.get(self.speechbrain_confidence_key, 0.0) or 0.0)
 
         canary_lang = str(task.data.get(self.indic_canary_language_key, "") or "").strip()
@@ -100,12 +114,12 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
             task.data[self.output_key] = canary_lang
             task.data[self.confidence_key] = canary_confidence
             task.data[self.source_key] = "indic_canary"
-            set_note(task.data, self.name, f"indic_canary (speechbrain={sb_lang})", self.notes_key)
+            set_note(task.data, self.name, f"indic_canary (language={canary_lang})", self.notes_key)
         else:
             # Non-Indic language detected by SpeechBrain; keep its prediction.
             task.data[self.output_key] = sb_lang
             task.data[self.confidence_key] = sb_confidence
             task.data[self.source_key] = "speechbrain"
-            set_note(task.data, self.name, f"speechbrain (lang={sb_lang})", self.notes_key)
+            set_note(task.data, self.name, f"speechbrain (language={sb_lang})", self.notes_key)
 
         return task
