@@ -114,12 +114,12 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
             task.data[self.output_key] = canary_lang
             task.data[self.confidence_key] = canary_confidence
             task.data[self.source_key] = "indic_canary"
-            set_note(task.data, self.name, f"indic_canary (speechbrain={sb_lang})", self.notes_key)
+            set_note(task.data, self.name, f"indic_canary (language={canary_lang})", self.notes_key)
         else:
             # Non-Indic language detected by SpeechBrain; keep its prediction.
             task.data[self.output_key] = sb_lang
             task.data[self.confidence_key] = sb_confidence
             task.data[self.source_key] = "speechbrain"
-            set_note(task.data, self.name, f"speechbrain (lang={sb_lang})", self.notes_key)
+            set_note(task.data, self.name, f"speechbrain (language={sb_lang})", self.notes_key)
 
         return task
