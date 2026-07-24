@@ -233,14 +233,12 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
                 self.tensorrt_config_path,
                 self.tensorrt_runtime_module_path,
             )
-            self._warm_up()
             return
 
         if self.diar_model is not None:
             self.diar_model.eval()
             self._configure_streaming()
             self._compile_encoder()
-            self._warm_up()
             return
 
         restore_path = self.model_path
@@ -262,7 +260,6 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         self.diar_model.eval()
         self._configure_streaming()
         self._compile_encoder()
-        self._warm_up()
 
     def teardown(self) -> None:
         if self._tensorrt_model is not None:
@@ -284,15 +281,6 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
                 setattr(sm, name, value)
         if any(value is not None for value in overrides.values()) and hasattr(sm, "_check_streaming_parameters"):
             sm._check_streaming_parameters()
-
-    def _warm_up(self) -> None:
-        """Compile and initialize the configured inference batch once per worker."""
-        import numpy as np
-
-        sample_rate = 16000
-        silence = np.zeros(sample_rate * 4, dtype=np.float32)
-        self._diarize([silence] * self.inference_batch_size, sample_rate=sample_rate)
-        logger.info(f"Sortformer: warmed up batch size {self.inference_batch_size}")
 
     def _compile_encoder(self) -> None:
         """Compile the fixed-shape encoder core."""
