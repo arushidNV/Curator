@@ -111,8 +111,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
     sed.add_argument("--sed_checkpoint", type=str, default=None, help="Path to PANNs CNN14 checkpoint. Enables SED.")
+    sed.add_argument(
+        "--sed_backend",
+        choices=["torch", "tensorrt"],
+        default="torch",
+        help="CNN14 inference backend.",
+    )
+    sed.add_argument(
+        "--sed_tensorrt_engine",
+        type=str,
+        default=None,
+        help="TensorRT engine path; required when --sed_backend=tensorrt.",
+    )
     sed.add_argument("--sed_threshold", type=float, default=0.5, help="SED event confidence threshold.")
-    sed.add_argument("--sed_batch_size", type=int, default=32, help="SED GPU batch size.")
+    sed.add_argument(
+        "--sed_batch_size",
+        type=int,
+        default=32,
+        help="SED GPU batch size; the TensorRT engine profile must support this value.",
+    )
     sed.add_argument("--sed_gpu_memory_gb", type=float, default=4.0, help="GPU memory for SED stage.")
     sed.add_argument(
         "--sed_emit_superclasses", type=lambda x: x.lower() not in ("false", "0", "no"),
@@ -222,6 +239,8 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
         stages.append(
             SEDInferenceStage(
                 checkpoint_path=args.sed_checkpoint,
+                backend=args.sed_backend,
+                tensorrt_engine_path=args.sed_tensorrt_engine,
                 batch_size=args.sed_batch_size,
                 resources=Resources(gpu_memory_gb=args.sed_gpu_memory_gb),
             )
@@ -300,7 +319,12 @@ def main() -> None:
     if args.vad_backend == "tensorrt":
         logger.info(f"  VAD GPU memory: {args.vad_gpu_memory_gb} GB/worker")
     if args.sed_checkpoint:
-        logger.info(f"  SED: enabled (checkpoint={args.sed_checkpoint})")
+        logger.info(
+            f"  SED: backend={args.sed_backend}, checkpoint={args.sed_checkpoint}, "
+            f"batch_size={args.sed_batch_size}"
+        )
+        if args.sed_backend == "tensorrt":
+            logger.info(f"  SED TensorRT engine: {args.sed_tensorrt_engine}")
     if not args.skip_langid:
         langid_desc = args.langid_model or (
             "speechbrain/lang-id-voxlingua107-ecapa" if args.langid_backend == "speechbrain" else "langid_ambernet"
