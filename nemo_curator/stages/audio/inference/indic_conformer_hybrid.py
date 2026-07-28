@@ -296,16 +296,58 @@ class IndicConformerHybridASR(ModelInterface):
         return [self.model_id]
 
     @staticmethod
+    def _offline() -> bool:
+        return os.environ.get("HF_HUB_OFFLINE", "0").strip().lower() not in ("0", "", "false", "no")
+
+    @classmethod
+    def download_to_cache(cls, model_id: str) -> str:
+        """Download the repo's ``.nemo`` into the HF cache **once** (online).
+
+        Meant to be called from :meth:`InferenceIndicConformerHybridStage.setup_on_node`
+        so exactly one download happens per node — workers then resolve it from the
+        cache in :meth:`setup` without each re-downloading. No-op for a local path or
+        when ``HF_HUB_OFFLINE=1`` (the cache is assumed pre-populated). Returns the
+        resolved local ``.nemo`` path.
+        """
+        if model_id.endswith(".nemo") or os.path.exists(model_id):
+            return model_id
+        if cls._offline():
+            # Offline: rely on the pre-populated cache (no network listing/download).
+            return cls._resolve_nemo_path(model_id)
+        files = [f for f in HfApi().list_repo_files(model_id) if f.endswith(".nemo")]
+        if not files:
+            msg = f"No .nemo file found in HuggingFace repo '{model_id}'"
+            raise RuntimeError(msg)
+        return hf_hub_download(model_id, files[0])
+
+    @staticmethod
     def _resolve_nemo_path(model_id: str) -> str:
-        """Resolve ``model_id`` to a local ``.nemo`` path.
+        """Resolve ``model_id`` to a local ``.nemo`` path — **cache-first, no download**.
 
         Accepts a local ``.nemo`` file, or a HuggingFace repo id like
-        ``ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large`` (downloads the
-        single ``.nemo`` it contains). The HF repos are gated — set ``HF_TOKEN``.
+        ``ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large``.
+
+        Resolution order (so a pre-populated HF cache works offline, i.e. without
+        compute-node egress or ``HF_TOKEN``, when ``HF_HUB_OFFLINE=1``):
+          1. a literal local ``.nemo`` path,
+          2. the ``.nemo`` inside the repo's **cached** snapshot (``local_files_only``),
+          3. an online listing + download (only reached when the cache is empty AND
+             :meth:`download_to_cache` was not run first; gated repos need ``HF_TOKEN``).
         """
         if model_id.endswith(".nemo") or os.path.exists(model_id):
             return model_id
 
+        # 2. Cache-only lookup: reads $HF_HOME/hub without any network call.
+        from huggingface_hub import snapshot_download
+        try:
+            snap_dir = snapshot_download(model_id, local_files_only=True)
+            cached = [f for f in os.listdir(snap_dir) if f.endswith(".nemo")]
+            if cached:
+                return os.path.join(snap_dir, cached[0])
+        except Exception:  # noqa: BLE001 — fall through to the online path below.
+            pass
+
+        # 3. Online fallback (needs egress; gated repos need HF_TOKEN).
         files = [f for f in HfApi().list_repo_files(model_id) if f.endswith(".nemo")]
         if not files:
             msg = f"No .nemo file found in HuggingFace repo '{model_id}'"
@@ -619,8 +661,10 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         _node_info: NodeInfo | None = None,
         _worker_metadata: WorkerMetadata | None = None,
     ) -> None:
-        # Pre-download the checkpoint onto the node (HF repo -> local .nemo).
-        IndicConformerHybridASR._resolve_nemo_path(self.model_id)
+        # Download the checkpoint into the shared HF cache exactly ONCE per node
+        # (online). Per-worker setup() then resolves it from cache without each
+        # re-downloading. No-op for a local path or when HF_HUB_OFFLINE=1.
+        IndicConformerHybridASR.download_to_cache(self.model_id)
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         if self._model is None:

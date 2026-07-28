@@ -328,8 +328,6 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
         if missing:
             msg = f"engine_dir '{self.engine_dir}' is missing required file(s): {missing}"
             raise FileNotFoundError(msg)
-        self._model = self._create_model()
-        self._model.setup()
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         if self._model is None:
