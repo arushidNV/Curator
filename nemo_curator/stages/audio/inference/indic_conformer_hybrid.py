@@ -75,8 +75,8 @@ from nemo.collections.asr.parts.mixins.mixins import ASRBPEMixin
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.models.base import ModelInterface
 from nemo_curator.stages.audio.inference.audio_chunking import (
+    engine_chunk_duration,
     merge_chunk_texts,
-    model_chunk_duration,
     split_waveforms,
 )
 from nemo_curator.stages.audio.pipeline_utils import set_note
@@ -85,6 +85,7 @@ from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
 
 _TARGET_SR = 16000
+_MAX_CHUNK_DURATION_SEC = 40.0
 
 # Set once ``_apply_multisoftmax_patches`` has run.
 _PATCHED = False
@@ -456,7 +457,7 @@ class IndicConformerHybridASR(ModelInterface):
         self._model = nemo_asr.models.ASRModel.restore_from(nemo_path, map_location=self._device)
         self._model.to(self._device)
         self._model.eval()
-        self._chunk_duration_sec = model_chunk_duration(self._model)
+        self._chunk_duration_sec = _MAX_CHUNK_DURATION_SEC
         if self.rnnt_precision == "fp16":
             if self._device.type != "cuda":
                 msg = "IndicConformer FP16 RNNT inference requires CUDA"
@@ -523,7 +524,10 @@ class IndicConformerHybridASR(ModelInterface):
             subsampling_factor=int(metadata["subsampling_factor"]),
         )
         max_feature_frames = self._trt_encoder.max_input_shape("audio_signal")[2]
-        self._chunk_duration_sec = model_chunk_duration(self._model, max_feature_frames)
+        self._chunk_duration_sec = min(
+            _MAX_CHUNK_DURATION_SEC,
+            engine_chunk_duration(self._model, max_feature_frames),
+        )
         self._model.encoder = self._trt_encoder
         logger.info(f"IndicConformer TensorRT encoder loaded: {engine_path}")
 

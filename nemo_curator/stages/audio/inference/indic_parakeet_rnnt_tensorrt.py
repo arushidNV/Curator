@@ -18,15 +18,15 @@ from __future__ import annotations
 
 import gc
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from loguru import logger
 
 from nemo_curator.stages.audio.inference.asr_nemo import NemoASRModel
 from nemo_curator.stages.audio.inference.audio_chunking import (
+    engine_chunk_duration,
     merge_chunk_texts,
-    model_chunk_duration,
     split_waveforms,
 )
 from nemo_curator.stages.audio.inference.tensorrt_encoder import (
@@ -65,7 +65,11 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
         engine_dir: str | Path,
         *,
         inference_batch_size: int = 16,
+        chunking_mode: Literal["engine", "none"] = "engine",
     ) -> None:
+        if chunking_mode not in {"engine", "none"}:
+            msg = f"Unsupported Indic Parakeet chunking mode: {chunking_mode!r}"
+            raise ValueError(msg)
         self.engine_dir = Path(engine_dir)
         self.metadata = load_engine_metadata(self.engine_dir)
         engine_path = self.engine_dir / ENGINE_FILENAME
@@ -78,6 +82,7 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
             raise FileNotFoundError(msg)
 
         super().__init__(model_name=str(model_path), inference_batch_size=inference_batch_size)
+        self.chunking_mode = chunking_mode
         self._engine_path = engine_path
         self._trt_encoder: TensorRTEncoder | None = None
         self._chunk_duration_sec: float | None = None
@@ -116,7 +121,8 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
         max_input_shape = self._trt_encoder.max_input_shape("audio_signal")
         self.inference_batch_size = min(self.inference_batch_size, max_input_shape[0])
         max_feature_frames = max_input_shape[2]
-        self._chunk_duration_sec = model_chunk_duration(self.asr_model, max_feature_frames)
+        if self.chunking_mode == "engine":
+            self._chunk_duration_sec = engine_chunk_duration(self.asr_model, max_feature_frames)
         self.asr_model.encoder = self._trt_encoder
         logger.info(f"Indic Parakeet TensorRT encoder loaded: {self._engine_path}")
 
@@ -195,6 +201,8 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
             raise RuntimeError(msg)
         if not waveforms:
             return []
+        if self.chunking_mode == "none":
+            return super().transcribe_waveforms(waveforms, sample_rates)
         if self._chunk_duration_sec is None:
             msg = "Indic Parakeet chunk duration was not initialized from the model"
             raise RuntimeError(msg)

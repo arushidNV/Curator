@@ -43,7 +43,11 @@ def model_chunk_duration(model: object, max_feature_frames: int | None = None) -
     training_duration = model_training_max_duration(model)
     if max_feature_frames is None:
         return training_duration
+    return min(training_duration, engine_chunk_duration(model, max_feature_frames))
 
+
+def engine_chunk_duration(model: object, max_feature_frames: int) -> float:
+    """Return the largest safe audio window supported by an encoder profile."""
     preprocessor = getattr(getattr(model, "cfg", None), "preprocessor", None)
     try:
         sample_rate = int(preprocessor.sample_rate)
@@ -55,8 +59,7 @@ def model_chunk_duration(model: object, max_feature_frames: int | None = None) -
     if sample_rate <= 0 or hop_samples <= 0 or max_feature_frames < 1:
         msg = "Cannot derive a safe audio window from the model preprocessor and encoder shape"
         raise ValueError(msg)
-    engine_duration = (max_feature_frames * hop_samples - 1) / sample_rate
-    return min(training_duration, engine_duration)
+    return (max_feature_frames * hop_samples - 1) / sample_rate
 
 
 def split_waveforms(

@@ -183,13 +183,13 @@ def test_tensorrt_wrapper_replaces_only_encoder(tmp_path: Path) -> None:
     assert model.joint._vocab_size == 958
     model.to.assert_called_once_with(dtype=torch.float16)
     model.change_decoding_strategy.assert_called_once()
-    assert wrapper._chunk_duration_sec == 20.0
+    assert wrapper._chunk_duration_sec == 479999 / 16000
 
 
 def test_tensorrt_wrapper_chunks_long_audio_without_overlap(tmp_path: Path) -> None:
     wrapper = TensorRTParakeetRNNTModel(_engine_bundle(tmp_path))
-    wrapper._chunk_duration_sec = 20.0
-    transcribe = MagicMock(return_value=["third", "first", "second"])
+    wrapper._chunk_duration_sec = 40.0
+    transcribe = MagicMock(return_value=["second", "first"])
     wrapper.asr_model = SimpleNamespace(transcribe=transcribe)
     waveform = np.zeros(45 * 16000, dtype=np.float32)
 
@@ -199,13 +199,25 @@ def test_tensorrt_wrapper_chunks_long_audio_without_overlap(tmp_path: Path) -> N
     )
 
     prepared = transcribe.call_args.args[0]
-    assert [chunk.shape[0] for chunk in prepared] == [5 * 16000, 20 * 16000, 20 * 16000]
-    assert texts == ["first second third", ""]
+    assert [chunk.shape[0] for chunk in prepared] == [5 * 16000, 40 * 16000]
+    assert texts == ["first second", ""]
+
+
+def test_tensorrt_wrapper_can_disable_chunking(tmp_path: Path) -> None:
+    wrapper = TensorRTParakeetRNNTModel(_engine_bundle(tmp_path), chunking_mode="none")
+    wrapper.asr_model = object()
+    waveform = np.zeros(45 * 16000, dtype=np.float32)
+
+    with patch.object(NemoASRModel, "transcribe_waveforms", return_value=["full"]) as transcribe:
+        texts = wrapper.transcribe_waveforms([waveform], [16000])
+
+    transcribe.assert_called_once_with([waveform], [16000])
+    assert texts == ["full"]
 
 
 def test_tensorrt_wrapper_orders_chunks_by_duration_across_sample_rates(tmp_path: Path) -> None:
     wrapper = TensorRTParakeetRNNTModel(_engine_bundle(tmp_path))
-    wrapper._chunk_duration_sec = 20.0
+    wrapper._chunk_duration_sec = 40.0
     transcribe = MagicMock(return_value=["second", "first"])
     wrapper.asr_model = SimpleNamespace(transcribe=transcribe)
 
@@ -233,6 +245,11 @@ def test_parakeet_stage_requires_engine_directory() -> None:
         InferenceParakeetStage(backend="tensorrt")
 
 
+def test_parakeet_stage_rejects_invalid_chunking_mode() -> None:
+    with pytest.raises(ValueError, match="chunking mode"):
+        InferenceParakeetStage(chunking_mode="invalid")
+
+
 def test_parakeet_stage_creates_tensorrt_wrapper() -> None:
     optimized_wrapper = MagicMock()
     with patch(
@@ -243,10 +260,12 @@ def test_parakeet_stage_creates_tensorrt_wrapper() -> None:
             backend="tensorrt",
             tensorrt_engine_dir="/engines/indic-rnnt",
             inference_batch_size=12,
+            chunking_mode="none",
         )
         assert stage._create_wrapper() is optimized_wrapper
 
     wrapper_type.assert_called_once_with(
         engine_dir="/engines/indic-rnnt",
         inference_batch_size=12,
+        chunking_mode="none",
     )

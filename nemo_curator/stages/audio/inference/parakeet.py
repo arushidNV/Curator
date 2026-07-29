@@ -53,6 +53,8 @@ class InferenceParakeetStage(ProcessingStage[AudioTask, AudioTask]):
             for the optimized Indic Parakeet RNN-T engine bundle.
         tensorrt_engine_dir: Directory containing ``encoder.plan``, ``model.nemo``,
             and ``metadata.json``. Required when ``backend="tensorrt"``.
+        chunking_mode: TensorRT input handling. ``"engine"`` splits only inputs
+            that exceed the engine profile; ``"none"`` sends each input unchanged.
         waveform_key: Task data key for the mono float32 numpy waveform.
         sample_rate_key: Task data key for the integer sample rate.
         pred_text_key: Output key for the predicted transcription.
@@ -74,6 +76,7 @@ class InferenceParakeetStage(ProcessingStage[AudioTask, AudioTask]):
     inference_batch_size: int = 16
     backend: Literal["nemo", "tensorrt"] = "nemo"
     tensorrt_engine_dir: str | None = None
+    chunking_mode: Literal["engine", "none"] = "engine"
     waveform_key: str = "waveform"
     sample_rate_key: str = "sampling_rate"
     pred_text_key: str = "asr_prediction"
@@ -93,6 +96,9 @@ class InferenceParakeetStage(ProcessingStage[AudioTask, AudioTask]):
             raise ValueError(msg)
         if self.backend == "tensorrt" and not self.tensorrt_engine_dir:
             msg = "tensorrt_engine_dir is required when backend='tensorrt'"
+            raise ValueError(msg)
+        if self.chunking_mode not in {"engine", "none"}:
+            msg = f"Unsupported Parakeet chunking mode: {self.chunking_mode!r}"
             raise ValueError(msg)
 
     # ------------------------------------------------------------------
@@ -125,6 +131,7 @@ class InferenceParakeetStage(ProcessingStage[AudioTask, AudioTask]):
             return TensorRTParakeetRNNTModel(
                 engine_dir=engine_dir,
                 inference_batch_size=self.inference_batch_size,
+                chunking_mode=self.chunking_mode,
             )
         return NemoASRModel(
             model_name=self.model_id,

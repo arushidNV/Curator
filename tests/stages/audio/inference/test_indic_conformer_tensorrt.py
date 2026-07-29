@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from nemo_curator.stages.audio.inference.indic_conformer_hybrid import (
+    _MAX_CHUNK_DURATION_SEC,
     IndicConformerHybridASR,
     InferenceIndicConformerHybridStage,
 )
@@ -151,6 +152,28 @@ def test_indic_conformer_chunks_and_merges_before_inference() -> None:
     assert [chunk.shape[0] for chunk in chunks] == [2, 2, 1]
     assert texts == ["first second third"]
     assert languages == ["hi"]
+
+
+def test_indic_conformer_only_chunks_audio_over_40_seconds() -> None:
+    model = IndicConformerHybridASR("unused.nemo", decode_mode="ctc")
+    model._model = object()
+    model._chunk_duration_sec = _MAX_CHUNK_DURATION_SEC
+    waveforms = [
+        np.zeros(40, dtype=np.float32),
+        np.zeros(45, dtype=np.float32),
+    ]
+
+    with patch.object(
+        model,
+        "_generate_chunks",
+        return_value=(["whole", "first", "second"], ["hi", "hi", "hi"]),
+    ) as generate_chunks:
+        texts, languages = model.generate(waveforms, [1, 1], ["hi", "hi"])
+
+    chunks = generate_chunks.call_args.args[0]
+    assert [chunk.shape[0] for chunk in chunks] == [40, 40, 5]
+    assert texts == ["whole", "first second"]
+    assert languages == ["hi", "hi"]
 
 
 def test_tensorrt_path_respects_inference_batch_size() -> None:
