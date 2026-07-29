@@ -39,11 +39,12 @@ config keys, so ``ASRModel.restore_from`` fails out of the box:
 Rather than installing the fork (which is pinned to NeMo 1.23 and would break the
 rest of the pipeline), :func:`_apply_multisoftmax_patches` **monkeypatches just those
 three module classes** on top of the installed NeMo so the checkpoint loads, and the
-model then runs a **compact greedy CTC / RNNT decode** that mirrors the fork's decode
-semantics (per-language blank index ``V/num_langs``, per-language joint head, local-id
-feedback to the prediction network). Decoding maps the per-language local token ids
-back to text through the model's own ``AggregateTokenizer`` (which already ships the
-per-language tokenizers and offset tables in 2.7.x).
+model then runs compact greedy CTC decoding and NeMo's optimized batched label-looping
+RNNT decoder while preserving the fork's multilingual semantics (per-language blank
+index ``V/num_langs``, per-language joint head, local-id feedback to the prediction
+network). Decoding maps the per-language local token ids back to text through the
+model's own ``AggregateTokenizer`` (which already ships the per-language tokenizers
+and offset tables in 2.7.x).
 
 The patches are idempotent and additive: when ``multisoftmax`` / ``multilingual`` are
 absent (a normal NeMo model), every patched path falls back to the original behaviour,
@@ -98,6 +99,50 @@ INDIC_CONFORMER_HYBRID_LANGS: frozenset[str] = frozenset({
     "as", "bn", "brx", "doi", "gu", "hi", "kn", "kok", "ks", "mai", "ml",
     "mni", "mr", "ne", "or", "pa", "sa", "sat", "sd", "ta", "te", "ur",
 })
+
+
+class _LanguageRNNTDecoder:
+    """Route NeMo's per-language blank to the aggregate predictor's SOS token."""
+
+    def __init__(self, decoder: Any, blank_index: int):
+        self._decoder = decoder
+        self._blank_index = blank_index
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._decoder, name)
+
+    def predict(self, y: Any = None, state: Any = None, **kwargs: Any) -> Any:
+        if y is not None:
+            y = y.masked_fill(y == self._blank_index, self._decoder.blank_idx)
+        return self._decoder.predict(y, state=state, **kwargs)
+
+
+class _LanguageRNNTJoint:
+    """Bind the multilingual joint network to one language head."""
+
+    def __init__(self, joint: Any, language: str, num_classes_with_blank: int):
+        self._joint = joint
+        self._language = language
+        self._num_classes_with_blank = num_classes_with_blank
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._joint, name)
+
+    @property
+    def num_classes_with_blank(self) -> int:
+        return self._num_classes_with_blank
+
+    def project_encoder(self, encoder_output: Any) -> Any:
+        project = getattr(self._joint, "project_encoder", self._joint.enc)
+        return project(encoder_output)
+
+    def project_prednet(self, prednet_output: Any) -> Any:
+        project = getattr(self._joint, "project_prednet", self._joint.pred)
+        return project(prednet_output)
+
+    def joint_after_projection(self, f: Any, g: Any) -> Any:
+        language_ids = [self._language] * f.shape[0]
+        return self._joint.joint_after_projection(f, g, language_ids=language_ids)
 
 
 def _apply_multisoftmax_patches() -> None:  # noqa: C901, PLR0915
@@ -319,6 +364,7 @@ class IndicConformerHybridASR(ModelInterface):
         self._trt_encoder: Any = None
         self._trt_metadata: dict[str, Any] | None = None
         self._chunk_duration_sec: float | None = None
+        self._rnnt_decoders: dict[str, Any] = {}
 
     @property
     def model_id_names(self) -> list[str]:
@@ -484,6 +530,10 @@ class IndicConformerHybridASR(ModelInterface):
     def teardown(self) -> None:
         import torch
 
+        for decoder in self._rnnt_decoders.values():
+            if decoder.decoding_computer is not None:
+                decoder.decoding_computer.reset_cuda_graphs_state()
+        self._rnnt_decoders.clear()
         if self._trt_encoder is not None:
             self._trt_encoder.close()
             self._trt_encoder = None
@@ -678,39 +728,29 @@ class IndicConformerHybridASR(ModelInterface):
             prev = p
         return self._ids_to_text(out, lang)
 
-    def _decode_rnnt(self, encoded: Any, enc_len: int, lang: str) -> str:
-        # Compact greedy transducer decode mirroring the fork's single-sample path:
-        # per-language joint head, blank index = V/num_langs, local-id feedback.
-        joint = self._model.joint
-        decoder = self._model.decoder
-        blank = self._per_lang_classes
-        x = encoded.transpose(1, 2).to(dtype=next(joint.parameters()).dtype)  # [B, T, D_enc]
-        f_enc = joint.enc(x)  # project encoder once: [B, T, H]
+    def _rnnt_decoder(self, lang: str) -> Any:
+        decoder = self._rnnt_decoders.get(lang)
+        if decoder is not None:
+            return decoder
 
-        last_token: int | None = None
-        state: Any = None
-        hyp: list[int] = []
-        for t in range(enc_len):
-            f = f_enc[:, t : t + 1, :]  # [B, 1, H]
-            not_blank = True
-            symbols = 0
-            while not_blank and symbols < self.max_symbols_per_step:
-                if last_token is None and state is None:
-                    g, new_state = decoder.predict(None, state=None, add_sos=False, batch_size=1)
-                else:
-                    label = torch.full([1, 1], fill_value=last_token, dtype=torch.long, device=self._device)
-                    g, new_state = decoder.predict(label, state=state, add_sos=False, batch_size=1)
-                g = joint.pred(g)  # [1, 1, H]
-                logp = joint.joint_after_projection(f, g, language_ids=[lang])[0, 0, 0, :]
-                k = int(logp.argmax(dim=-1).item())
-                if k == blank:
-                    not_blank = False
-                else:
-                    hyp.append(k)
-                    last_token = k
-                    state = new_state
-                symbols += 1
-        return self._ids_to_text(hyp, lang)
+        from nemo.collections.asr.parts.submodules.rnnt_greedy_decoding import GreedyBatchedRNNTInfer
+
+        decoder = GreedyBatchedRNNTInfer(
+            decoder_model=_LanguageRNNTDecoder(self._model.decoder, self._per_lang_classes),
+            joint_model=_LanguageRNNTJoint(
+                self._model.joint,
+                lang,
+                self._per_lang_classes + 1,
+            ),
+            blank_index=self._per_lang_classes,
+            max_symbols_per_step=self.max_symbols_per_step,
+            preserve_alignments=False,
+            preserve_frame_confidence=False,
+            loop_labels=True,
+            use_cuda_graph_decoder=self._device.type == "cuda",
+        )
+        self._rnnt_decoders[lang] = decoder
+        return decoder
 
     def _decode_rnnt_batch(self, encoded: Any, encoded_len: Any, lang_codes: list[str]) -> list[str]:
         import torch
@@ -719,63 +759,30 @@ class IndicConformerHybridASR(ModelInterface):
             batch_size = len(lang_codes)
             if batch_size == 0:
                 return []
-            joint = self._model.joint
-            decoder = self._model.decoder
-            blank = self._per_lang_classes
-            x = encoded.transpose(1, 2).to(dtype=next(joint.parameters()).dtype)  # [B, T, D_enc]
-            f_enc = joint.enc(x)  # [B, T, H]
-            max_time = int(encoded_len.max().item()) if encoded_len.numel() else 0
+            language_groups: dict[str, list[int]] = {}
+            for index, lang in enumerate(lang_codes):
+                language_groups.setdefault(lang, []).append(index)
 
-            # The shared predictor uses the aggregate blank as its zero-valued SOS/padding token.
-            last_tokens = torch.full(
-                (batch_size, 1),
-                fill_value=decoder.blank_idx,
-                dtype=torch.long,
-                device=self._device,
-            )
-            state = decoder.initialize_state(f_enc)
-            emitted_tokens: list[Any] = []
-            emitted_masks: list[Any] = []
+            texts = [""] * batch_size
+            for lang, indices in language_groups.items():
+                if len(indices) == batch_size:
+                    group_encoded = encoded
+                    group_lengths = encoded_len
+                else:
+                    index_tensor = torch.tensor(indices, dtype=torch.long, device=encoded.device)
+                    group_encoded = encoded.index_select(0, index_tensor)
+                    group_lengths = encoded_len.index_select(0, index_tensor)
 
-            for t in range(max_time):
-                finished = t >= encoded_len
-                symbols = 0
-                while symbols < self.max_symbols_per_step:
-                    g, next_state = decoder.predict(
-                        last_tokens,
-                        state=state,
-                        add_sos=False,
-                        batch_size=batch_size,
-                    )
-                    logp = joint.joint_after_projection(
-                        f_enc[:, t : t + 1, :],
-                        joint.pred(g),
-                        language_ids=lang_codes,
-                    )[:, 0, 0, :]
-                    pred_ids = logp.argmax(dim=-1)
-                    emit = ~finished & pred_ids.ne(blank)
-                    if not emit.any():
-                        break
-
-                    decoder.batch_replace_states_mask(
-                        src_states=state,
-                        dst_states=next_state,
-                        mask=~emit,
-                    )
-                    last_tokens = torch.where(emit.unsqueeze(1), pred_ids.unsqueeze(1), last_tokens)
-                    state = next_state
-                    emitted_tokens.append(pred_ids)
-                    emitted_masks.append(emit)
-                    finished = ~emit
-                    symbols += 1
-
-            hyps: list[list[int]] = [[] for _ in range(batch_size)]
-            if emitted_tokens:
-                tokens = torch.stack(emitted_tokens).cpu()
-                masks = torch.stack(emitted_masks).cpu()
-                for idx in range(batch_size):
-                    hyps[idx] = tokens[:, idx][masks[:, idx]].tolist()
-            return [self._ids_to_text(hyp, lang) for hyp, lang in zip(hyps, lang_codes, strict=True)]
+                hypotheses = self._rnnt_decoder(lang)(
+                    encoder_output=group_encoded,
+                    encoded_lengths=group_lengths,
+                )[0]
+                for index, hypothesis in zip(indices, hypotheses, strict=True):
+                    token_ids = hypothesis.y_sequence
+                    if torch.is_tensor(token_ids):
+                        token_ids = token_ids.tolist()
+                    texts[index] = self._ids_to_text(token_ids, lang)
+            return texts
 
 
 @dataclass

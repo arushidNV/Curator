@@ -63,11 +63,14 @@ class _CtcModel:
         return encoded, input_signal_length
 
 
-class _RnntDecoder:
+class _RnntDecoder(torch.nn.Module):
     blank_idx = 3
+    blank_as_pad = True
 
     def __init__(self) -> None:
+        super().__init__()
         self.batch_sizes: list[int] = []
+        self.labels: list[torch.Tensor] = []
 
     def initialize_state(self, y: torch.Tensor) -> list[torch.Tensor]:
         return [torch.zeros((1, y.shape[0], 1))]
@@ -83,6 +86,8 @@ class _RnntDecoder:
         _ = (state, add_sos)
         batch = int(batch_size if y is None else y.shape[0])
         self.batch_sizes.append(batch)
+        if y is not None:
+            self.labels.append(y.clone())
         return torch.zeros((batch, 1, 1)), [torch.zeros((1, batch, 1))]
 
     @classmethod
@@ -93,6 +98,10 @@ class _RnntDecoder:
         mask: torch.Tensor,
     ) -> None:
         torch.where(mask.view(1, -1, 1), src_states[0], dst_states[0], out=dst_states[0])
+
+    @classmethod
+    def batch_split_states(cls, states: list[torch.Tensor]) -> list[list[torch.Tensor]]:
+        return [[state[:, index : index + 1] for state in states] for index in range(states[0].shape[1])]
 
 
 class _RnntJoint(torch.nn.Module):
@@ -175,11 +184,24 @@ def test_rnnt_generate_decodes_active_rows_as_batches() -> None:
     asr = _asr(model, decode_mode="rnnt", batch_size=2)
     waveforms = [np.zeros(8, dtype=np.float32), np.zeros(8, dtype=np.float32)]
 
-    texts, _ = asr.generate(waveforms, [_TARGET_SR, _TARGET_SR], ["hi", "ta"])
+    texts, _ = asr.generate(waveforms, [_TARGET_SR, _TARGET_SR], ["hi", "hi"])
 
     assert [call["shape"][0] for call in model.calls] == [2]
     assert set(model.decoder.batch_sizes) == {2}
-    assert all(language_ids == ["hi", "ta"] for language_ids in model.joint.language_ids)
+    assert all(language_ids == ["hi", "hi"] for language_ids in model.joint.language_ids)
+    assert model.decoder.labels[0].tolist() == [[model.decoder.blank_idx], [model.decoder.blank_idx]]
+    assert texts == ["a", "b"]
+
+
+def test_rnnt_decode_groups_languages_and_preserves_order() -> None:
+    model = _RnntModel()
+    asr = _asr(model, decode_mode="rnnt", batch_size=2)
+    encoded = torch.tensor([[[0.0, 0.0]], [[1.0, 1.0]]])
+
+    texts = asr._decode_rnnt_batch(encoded, torch.tensor([2, 2]), ["hi", "ta"])
+
+    assert set(model.decoder.batch_sizes) == {1}
+    assert {tuple(language_ids) for language_ids in model.joint.language_ids} == {("hi",), ("ta",)}
     assert texts == ["a", "b"]
 
 
