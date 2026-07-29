@@ -443,12 +443,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Max generated tokens for the Indic Canary TRT-LLM engine.",
     )
     asr.add_argument(
-        "--indic_canary_pnc",
-        action="store_true",
-        default=False,
-        help="Request punctuation & capitalization in the Indic Canary control prompt.",
-    )
-    asr.add_argument(
         "--whisper_model_size_or_path",
         type=str,
         default=WHISPER_DEFAULT_MODEL,
@@ -794,7 +788,6 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 engine_dir=args.indic_canary_engine_dir,
                 num_beams=args.indic_canary_num_beams,
                 max_new_tokens=args.indic_canary_max_new_tokens,
-                pnc=args.indic_canary_pnc,
                 source_lang_key=args.source_lang_key,
                 pred_text_key="primary_model_prediction",
                 keep_waveform=has_recovery,
@@ -905,7 +898,6 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 engine_dir=args.indic_canary_engine_dir,
                 num_beams=args.indic_canary_num_beams,
                 max_new_tokens=args.indic_canary_max_new_tokens,
-                pnc=args.indic_canary_pnc,
                 source_lang_key=args.source_lang_key,
                 pred_text_key="fallback_model_prediction",
                 batch_size=args.asr_batch_size,
