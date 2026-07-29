@@ -664,6 +664,31 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             duration = len(audio) / sr
         return audio, sr, duration
 
+    @staticmethod
+    def _normalize_lang_fields(entry_data: dict[str, Any]) -> None:
+        """Normalise the language metadata carried on an incoming manifest entry.
+
+        The source (e.g. YouTube) manifest ships its own catalogued language under
+        ``language`` plus a few provenance fields. The pipeline reserves ``source_lang``
+        for the FINAL, unified LID prediction (written later by SelectBestLIDPrediction),
+        so here we:
+          * rename the incoming ``language`` -> ``original_language`` (the language that
+            came with the audio metadata),
+          * rename ``language_source`` -> ``original_language_source``,
+          * drop the stale metadata-prediction fields ``language_pred`` /
+            ``language_pred_source`` / ``language_pred_prob`` (superseded by the
+            pipeline's own ``primary_lang_pred`` / ``secondary_lang_pred``).
+        Idempotent: a no-op when those keys are absent (e.g. re-reading pipeline output).
+        """
+        if "language" in entry_data:
+            entry_data.setdefault("original_language", entry_data.get("language"))
+            entry_data.pop("language", None)
+        if "language_source" in entry_data:
+            entry_data.setdefault("original_language_source", entry_data.get("language_source"))
+            entry_data.pop("language_source", None)
+        for stale in ("language_pred", "language_pred_source", "language_pred_prob"):
+            entry_data.pop(stale, None)
+
     def _read_error_task(self, task: FileGroupTask) -> AudioTask:
         """Build a read_error placeholder AudioTask for a source that could not be read.
 
@@ -678,6 +703,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         audio_path = task.data[0] if task.data else entry.get("audio_filepath", "")
 
         entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
+        self._normalize_lang_fields(entry_data)
         entry_data.update(
             {
                 "read_error": True,
@@ -728,6 +754,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             duration = len(audio) / sr
 
         entry_data = {k: v for k, v in entry.items() if k != "audio_filepath"}
+        self._normalize_lang_fields(entry_data)
         entry_data.update(
             {
                 "sampling_rate": sr,
@@ -771,6 +798,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
         audio = np.asarray(audio, dtype=np.float32)
         entry_data = dict(cut.custom) if cut.custom else {}
+        self._normalize_lang_fields(entry_data)
         entry_data.update(
             {
                 "sampling_rate": target_sr,

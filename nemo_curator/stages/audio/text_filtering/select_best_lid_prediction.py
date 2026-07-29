@@ -68,24 +68,24 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
       which is purpose-built for Indic speech and gives higher accuracy.
 
     Args:
-        speechbrain_language_key: Task data key holding SpeechBrain's language prediction.
-        speechbrain_confidence_key: Task data key holding SpeechBrain's confidence score.
-        indic_canary_language_key: Task data key holding Indic Canary's language prediction.
-        indic_canary_confidence_key: Task data key holding Indic Canary's confidence score.
-        output_key: Task data key for the selected best language (default ``language``).
-        confidence_key: Task data key for the selected confidence score (default ``language_confidence``).
+        primary_language_key: Task data key holding the primary (SpeechBrain/AmberNet) language prediction.
+        primary_confidence_key: Task data key holding the primary model's confidence score.
+        secondary_language_key: Task data key holding the secondary (Indic Canary) language prediction.
+        secondary_confidence_key: Task data key holding the secondary model's confidence score.
+        output_key: Task data key for the finalized language (default ``source_lang``).
+        confidence_key: Task data key for the finalized confidence score (default ``source_lid_confidence``).
         model_note_key: ``additional_notes`` field recording which model was chosen
             (``"speechbrain"`` or ``"indic_canary"``).
         notes_key: Task data key for pipeline notes.
         indic_languages: Set of language codes (lowercase) considered Indic and routed to Indic Canary.
     """
 
-    speechbrain_language_key: str = "speechbrain_language"
-    speechbrain_confidence_key: str = "speechbrain_language_confidence"
-    indic_canary_language_key: str = "indic_canary_language"
-    indic_canary_confidence_key: str = "indic_canary_language_confidence"
-    output_key: str = "language"
-    confidence_key: str = "language_confidence"
+    primary_language_key: str = "primary_lang_pred"
+    primary_confidence_key: str = "primary_lid_confidence"
+    secondary_language_key: str = "secondary_lang_pred"
+    secondary_confidence_key: str = "secondary_lid_confidence"
+    output_key: str = "source_lang"
+    confidence_key: str = "source_lid_confidence"
     model_note_key: str = "audio_language_id_model"
     notes_key: str = "additional_notes"
     indic_languages: frozenset[str] = field(default_factory=lambda: _DEFAULT_INDIC_LANGUAGES)
@@ -94,21 +94,21 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], [
-            self.speechbrain_language_key,
-            self.indic_canary_language_key,
+            self.primary_language_key,
+            self.secondary_language_key,
         ]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.output_key, self.confidence_key, self.notes_key]
 
     def process(self, task: AudioTask) -> AudioTask:
-        sb_raw = str(task.data.get(self.speechbrain_language_key, "") or "").strip()
+        sb_raw = str(task.data.get(self.primary_language_key, "") or "").strip()
         # SpeechBrain may return "ta: Tamil" — extract just the code before the colon.
         sb_lang = sb_raw.split(":")[0].strip().lower()
-        sb_confidence = float(task.data.get(self.speechbrain_confidence_key, 0.0) or 0.0)
+        sb_confidence = float(task.data.get(self.primary_confidence_key, 0.0) or 0.0)
 
-        canary_lang = str(task.data.get(self.indic_canary_language_key, "") or "").strip()
-        canary_confidence = float(task.data.get(self.indic_canary_confidence_key, 0.0) or 0.0)
+        canary_lang = str(task.data.get(self.secondary_language_key, "") or "").strip()
+        canary_confidence = float(task.data.get(self.secondary_confidence_key, 0.0) or 0.0)
 
         if sb_lang in self.indic_languages:
             # SpeechBrain flagged an Indic language; defer to the specialist model.

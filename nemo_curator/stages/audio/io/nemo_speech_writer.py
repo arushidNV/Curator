@@ -298,8 +298,10 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             if source_duration is not None:
                 manifest_entry["source_duration"] = round(float(source_duration), 4)
             for key in (
-                "language",
-                "language_confidence",
+                "source_lang",
+                "source_lid_confidence",
+                "original_language",
+                "original_language_source",
                 "sed_events",
                 "num_speakers",
                 "rttm_filepath",
@@ -355,17 +357,19 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
 
         # Build manifest entry
         duration = task.data.get("duration_sec") or (len(waveform) / sr if has_waveform and sr > 0 else 0)
-        original_sr = task.data.get("original_sampling_rate", sr)
-        original_channels = task.data.get("original_channels", 1)
+        original_sr = task.data.get("original_sampling_rate")
+        original_channels = task.data.get("original_channels")
         rel_path = os.path.join(shard_subdir, filename) if shard_subdir else filename
         manifest_entry = {
             "audio_filepath": rel_path,
             "duration": round(duration, 4),
             "sample_rate": sr,
             "sampling_rate": sr,
-            "original_sampling_rate": original_sr,
-            "original_channels": original_channels,
         }
+        if original_sr:
+            manifest_entry["original_sampling_rate"] = original_sr
+        if original_channels:
+            manifest_entry["original_channels"] = original_channels
 
         original_file = task.data.get("original_file", task.data.get("audio_filepath", ""))
         if original_file:
@@ -374,10 +378,13 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             manifest_entry["offset"] = task.data["start_ms"] / 1000.0
         if "end_ms" in task.data:
             manifest_entry["original_end"] = task.data["end_ms"] / 1000.0
-        if "language" in task.data:
-            manifest_entry["language"] = task.data["language"]
-        if "language_confidence" in task.data:
-            manifest_entry["language_confidence"] = round(task.data["language_confidence"], 4)
+        # Final unified language (SelectBestLIDPrediction). Fall back to the catalogued
+        # original_language when LID was skipped so downstream always has source_lang.
+        source_lang = task.data.get("source_lang") or task.data.get("original_language")
+        if source_lang:
+            manifest_entry["source_lang"] = source_lang
+        if "source_lid_confidence" in task.data:
+            manifest_entry["source_lid_confidence"] = round(task.data["source_lid_confidence"], 4)
         if "sed_events" in task.data:
             manifest_entry["sed_events"] = task.data["sed_events"]
         if "num_speakers" in task.data:
@@ -400,8 +407,8 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             "audio_filepath",
             "start_ms",
             "end_ms",
-            "language",
-            "language_confidence",
+            "source_lang",
+            "source_lid_confidence",
             "sed_events",
             "num_speakers",
             "rttm_filepath",

@@ -36,7 +36,7 @@ Pipeline:
         -> SqueezeWaveformStage (flatten VAD output shape)
         -> SEDInferenceStage (sound event detection on each segment) [optional]
         -> SEDPostprocessingStage (converts framewise probs to event labels) [optional]
-        -> LangID: AmberNet (NeMo, 20 langs) or SpeechBrain VoxLingua107 (107 langs)
+        -> LangID: AmberNet (NeMo, 20 langs) or SpeechBrain VoxLingua107 (107 langs) or Indic Canary (Indic, 23 langs)
         -> NeMoSpeechWriterStage (encodes to opus at 16kHz)
 """
 
@@ -59,12 +59,16 @@ from nemo_curator.stages.audio.segmentation import VADSegmentationStage
 from nemo_curator.stages.audio.text_filtering.select_best_lid_prediction import SelectBestLIDPredictionStage
 from nemo_curator.stages.resources import Resources
 
-# Intermediate keys used during two-pass Indic LID; final result lands in the
-# default "language" / "language_confidence" keys that downstream stages expect.
-_SB_LANG_KEY = "speechbrain_language"
-_SB_CONF_KEY = "speechbrain_language_confidence"
-_IC_LANG_KEY = "indic_canary_language"
-_IC_CONF_KEY = "indic_canary_language_confidence"
+# Per-model LID keys used during two-pass Indic LID. The primary (SpeechBrain/AmberNet)
+# and secondary (Indic Canary) predictions are kept side by side; the final unified
+# result lands in "source_lang" / "source_lid_confidence" (used by all later stages).
+_PRIMARY_LANG_KEY = "primary_lang_pred"
+_PRIMARY_CONF_KEY = "primary_lid_confidence"
+_SECONDARY_LANG_KEY = "secondary_lang_pred"
+_SECONDARY_CONF_KEY = "secondary_lid_confidence"
+# Final unified language ID (SelectBestLIDPrediction output) consumed downstream.
+_FINAL_LANG_KEY = "source_lang"
+_FINAL_CONF_KEY = "source_lid_confidence"
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -288,15 +292,15 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             )
         )
 
+
+    if not args.skip_langid:
         langid_max_workers = args.langid_max_workers if args.langid_max_workers > 0 else None
         if args.langid_backend == "speechbrain":
             from nemo_curator.stages.audio.inference.speechbrain_langid import SpeechBrainLangIDStage
 
             langid_source = args.langid_model or "speechbrain/lang-id-voxlingua107-ecapa"
-            # In two-pass Indic mode write to intermediate key; otherwise use the
-            # default "language" key that downstream stages (writer) expect.
-            primary_out_key = _SB_LANG_KEY if args.indic else "language"
-            primary_conf_key = _SB_CONF_KEY if args.indic else "language_confidence"
+            primary_out_key = _PRIMARY_LANG_KEY if args.indic else _FINAL_LANG_KEY
+            primary_conf_key = _PRIMARY_CONF_KEY if args.indic else _FINAL_CONF_KEY
             stages.append(
                 SpeechBrainLangIDStage(
                     source=langid_source,
@@ -310,8 +314,8 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             )
         else:
             langid_model = args.langid_model or "langid_ambernet"
-            primary_out_key = _SB_LANG_KEY if args.indic else "language"
-            primary_conf_key = _SB_CONF_KEY if args.indic else "language_confidence"
+            primary_out_key = _PRIMARY_LANG_KEY if args.indic else _FINAL_LANG_KEY
+            primary_conf_key = _PRIMARY_CONF_KEY if args.indic else _FINAL_CONF_KEY
             stages.append(
                 AmberNetLangIDStage(
                     model_name=langid_model,
@@ -333,20 +337,20 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             stages.append(
                 IndicCanaryLangIDStage(
                     engine_dir=args.indic_canary_engine_dir,
-                    output_key=_IC_LANG_KEY,
-                    confidence_key=_IC_CONF_KEY,
+                    output_key=_SECONDARY_LANG_KEY,
+                    confidence_key=_SECONDARY_CONF_KEY,
                     max_duration_sec=args.indic_canary_lid_max_duration_sec,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
             stages.append(
                 SelectBestLIDPredictionStage(
-                    speechbrain_language_key=_SB_LANG_KEY,
-                    speechbrain_confidence_key=_SB_CONF_KEY,
-                    indic_canary_language_key=_IC_LANG_KEY,
-                    indic_canary_confidence_key=_IC_CONF_KEY,
-                    output_key="language",
-                    confidence_key="language_confidence",
+                    primary_language_key=_PRIMARY_LANG_KEY,
+                    primary_confidence_key=_PRIMARY_CONF_KEY,
+                    secondary_language_key=_SECONDARY_LANG_KEY,
+                    secondary_confidence_key=_SECONDARY_CONF_KEY,
+                    output_key=_FINAL_LANG_KEY,
+                    confidence_key=_FINAL_CONF_KEY,
                 )
             )
 
