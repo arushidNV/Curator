@@ -69,9 +69,25 @@ def _load_state_module(path: Path) -> ModuleType:
 class TensorRTSortformer:
     """Persistent TensorRT engine and streaming state manager."""
 
-    def __init__(self, engine_path: str, config_path: str, runtime_module_path: str) -> None:
+    def __init__(
+        self,
+        engine_path: str,
+        config_path: str,
+        runtime_module_path: str,
+        inference_batch_size: int | None = None,
+    ) -> None:
         config_file = Path(config_path)
         self.config = json.loads(config_file.read_text())
+        engine_max_batch_size = int(self.config["max_batch_size"])
+        self.inference_batch_size = (
+            engine_max_batch_size if inference_batch_size is None else int(inference_batch_size)
+        )
+        if not 1 <= self.inference_batch_size <= engine_max_batch_size:
+            msg = (
+                f"Sortformer TensorRT inference batch size must be between 1 and "
+                f"{engine_max_batch_size}, got {self.inference_batch_size}"
+            )
+            raise ValueError(msg)
         self.session = TensorRTSession(engine_path)
         state_module = _load_state_module(Path(runtime_module_path))
         self.modules = state_module.SortformerModules(
@@ -119,29 +135,30 @@ class TensorRTSortformer:
         return waveforms
 
     def _features(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
-        lengths = [waveform.numel() for waveform in waveforms]
-        padded = torch.zeros((len(waveforms), max(lengths)), dtype=torch.float32, device="cuda")
-        for index, waveform in enumerate(waveforms):
-            padded[index, : waveform.numel()] = waveform.to(device="cuda", non_blocking=True)
-
+        features = []
         preemphasis = float(self.config["preemphasis"])
-        padded = torch.cat((padded[:, :1], padded[:, 1:] - preemphasis * padded[:, :-1]), dim=1)
-        spectrum = torch.stft(
-            padded,
-            n_fft=int(self.config["n_fft"]),
-            hop_length=int(self.config["hop_length"]),
-            win_length=int(self.config["win_length"]),
-            window=self.window,
-            center=True,
-            pad_mode="constant",
-            return_complex=True,
-        )
-        mel = torch.log(torch.matmul(self.mel_basis.unsqueeze(0), spectrum.abs().square()) + self.config["log_guard"])
         hop_length = int(self.config["hop_length"])
-        return [
-            mel[index, :, : max(1, length // hop_length)].transpose(0, 1).contiguous()
-            for index, length in enumerate(lengths)
-        ]
+        with torch.inference_mode():
+            for waveform in waveforms:
+                length = waveform.numel()
+                signal = waveform.reshape(1, -1).to(device="cuda", non_blocking=True)
+                signal = torch.cat((signal[:, :1], signal[:, 1:] - preemphasis * signal[:, :-1]), dim=1)
+                spectrum = torch.stft(
+                    signal,
+                    n_fft=int(self.config["n_fft"]),
+                    hop_length=hop_length,
+                    win_length=int(self.config["win_length"]),
+                    window=self.window,
+                    center=True,
+                    pad_mode="constant",
+                    return_complex=True,
+                )
+                mel = torch.log(
+                    torch.matmul(self.mel_basis.unsqueeze(0), spectrum.abs().square()) + self.config["log_guard"]
+                )
+                logical_length = max(1, length // hop_length)
+                features.append(mel[0, :, :logical_length].transpose(0, 1).to(device="cpu").contiguous())
+        return features
 
     def _infer_probabilities(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
         count = len(features)
@@ -160,63 +177,65 @@ class TensorRTSortformer:
             active = [index for index in range(count) if positions[index] < features[index].shape[0]]
             if not active:
                 break
-            batch_states = [states[index] for index in active]
-            self.modules.sync_pending_compression_batched(batch_states)
+            for batch_start in range(0, len(active), self.inference_batch_size):
+                batch_active = active[batch_start : batch_start + self.inference_batch_size]
+                batch_states = [states[index] for index in batch_active]
+                self.modules.sync_pending_compression_batched(batch_states)
 
-            chunks = torch.zeros((len(active), chunk_len, 128), dtype=torch.float32, device="cuda")
-            chunk_lengths = []
-            embedding_lengths = []
-            left_embeddings = []
-            right_embeddings = []
-            end_flags = []
-            for batch_index, item_index in enumerate(active):
-                feature = features[item_index]
-                center_start = positions[item_index]
-                center_end = min(center_start + center_frames, feature.shape[0])
-                window_start = max(0, center_start - left_frames)
-                window_end = min(feature.shape[0], center_end + right_frames)
-                chunk = feature[window_start:window_end]
-                valid_frames = min(chunk.shape[0], chunk_len)
-                chunks[batch_index, :valid_frames] = chunk[:valid_frames]
-                chunk_lengths.append(valid_frames)
-                embedding_lengths.append((valid_frames - 1) // subsampling + 1)
-                left_embeddings.append((center_start - window_start + subsampling - 1) // subsampling)
-                right_embeddings.append((window_end - center_end + subsampling - 1) // subsampling)
-                end_flags.append(int(center_end == feature.shape[0]))
-                positions[item_index] = center_end
+                chunks = torch.zeros((len(batch_active), chunk_len, 128), dtype=torch.float32, device="cuda")
+                chunk_lengths = []
+                embedding_lengths = []
+                left_embeddings = []
+                right_embeddings = []
+                end_flags = []
+                for batch_index, item_index in enumerate(batch_active):
+                    feature = features[item_index]
+                    center_start = positions[item_index]
+                    center_end = min(center_start + center_frames, feature.shape[0])
+                    window_start = max(0, center_start - left_frames)
+                    window_end = min(feature.shape[0], center_end + right_frames)
+                    chunk = feature[window_start:window_end]
+                    valid_frames = min(chunk.shape[0], chunk_len)
+                    chunks[batch_index, :valid_frames] = chunk[:valid_frames].to(device="cuda", non_blocking=True)
+                    chunk_lengths.append(valid_frames)
+                    embedding_lengths.append((valid_frames - 1) // subsampling + 1)
+                    left_embeddings.append((center_start - window_start + subsampling - 1) // subsampling)
+                    right_embeddings.append((window_end - center_end + subsampling - 1) // subsampling)
+                    end_flags.append(int(center_end == feature.shape[0]))
+                    positions[item_index] = center_end
 
-            speaker_lengths = [state.spkcache_len_cached for state in batch_states]
-            max_speaker_length = max(1, *speaker_lengths)
-            outputs = self.session.infer(
-                {
-                    "chunk": chunks,
-                    "chunk_lengths": torch.tensor(chunk_lengths, dtype=torch.int64, device="cuda"),
-                    "spkcache": torch.stack(
-                        [state.spkcache[0, :max_speaker_length] for state in batch_states],
-                    ),
-                    "spkcache_lengths": torch.tensor(speaker_lengths, dtype=torch.int64, device="cuda"),
-                    "fifo": torch.zeros((len(active), 1, emb_dim), dtype=torch.float32, device="cuda"),
-                    "fifo_lengths": torch.zeros(len(active), dtype=torch.int64, device="cuda"),
-                }
-            )
-            predictions = self.modules.apply_mask_to_preds(outputs["predictions"], outputs["pred_lengths"])
-            updated_states, chunk_predictions, _ = self.modules.streaming_update_batched(
-                batch_states=batch_states,
-                chunk_embs=outputs["chunk_embs"],
-                chunk_emb_lengths=embedding_lengths,
-                preds=predictions,
-                lc_list=left_embeddings,
-                rc_list=right_embeddings,
-                end_flags=end_flags,
-            )
-
-            for batch_index, item_index in enumerate(active):
-                states[item_index] = updated_states[batch_index]
-                output_length = max(
-                    0,
-                    embedding_lengths[batch_index] - left_embeddings[batch_index] - right_embeddings[batch_index],
+                speaker_lengths = [state.spkcache_len_cached for state in batch_states]
+                max_speaker_length = max(1, *speaker_lengths)
+                outputs = self.session.infer(
+                    {
+                        "chunk": chunks,
+                        "chunk_lengths": torch.tensor(chunk_lengths, dtype=torch.int64, device="cuda"),
+                        "spkcache": torch.stack(
+                            [state.spkcache[0, :max_speaker_length] for state in batch_states],
+                        ),
+                        "spkcache_lengths": torch.tensor(speaker_lengths, dtype=torch.int64, device="cuda"),
+                        "fifo": torch.zeros((len(batch_active), 1, emb_dim), dtype=torch.float32, device="cuda"),
+                        "fifo_lengths": torch.zeros(len(batch_active), dtype=torch.int64, device="cuda"),
+                    }
                 )
-                probabilities[item_index].append(chunk_predictions[batch_index, :output_length].float().cpu())
+                predictions = self.modules.apply_mask_to_preds(outputs["predictions"], outputs["pred_lengths"])
+                updated_states, chunk_predictions, _ = self.modules.streaming_update_batched(
+                    batch_states=batch_states,
+                    chunk_embs=outputs["chunk_embs"],
+                    chunk_emb_lengths=embedding_lengths,
+                    preds=predictions,
+                    lc_list=left_embeddings,
+                    rc_list=right_embeddings,
+                    end_flags=end_flags,
+                )
+
+                for batch_index, item_index in enumerate(batch_active):
+                    states[item_index] = updated_states[batch_index]
+                    output_length = max(
+                        0,
+                        embedding_lengths[batch_index] - left_embeddings[batch_index] - right_embeddings[batch_index],
+                    )
+                    probabilities[item_index].append(chunk_predictions[batch_index, :output_length].float().cpu())
 
         num_speakers = int(self.config["num_speakers"])
         return [
