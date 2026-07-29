@@ -23,15 +23,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import soundfile
 import torch
 
 from nemo_curator.stages.audio.common import ensure_waveform_2d, load_audio_file
 from nemo_curator.stages.audio.segmentation.silero_tensorrt import TensorRTSession
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from types import ModuleType
 
 _SPEECH_THRESHOLD = 0.5
+_LONG_AUDIO_SECONDS = 60 * 60
+_STFT_BLOCK_SECONDS = 60 * 60
+_STFT_CONTEXT_HOPS = 2
 
 
 def _binarize(sequence: torch.Tensor, frame_step: float) -> torch.Tensor:
@@ -109,6 +114,9 @@ class TensorRTSortformer:
             dtype=torch.float32,
             device="cuda",
         )
+        hop_length = int(self.config["hop_length"])
+        block_samples = int(self.config["sample_rate"]) * _STFT_BLOCK_SECONDS
+        self._stft_block_samples = block_samples - block_samples % hop_length
 
     def _prepare_waveform(self, waveform: np.ndarray | torch.Tensor, sample_rate: int) -> torch.Tensor:
         tensor = torch.as_tensor(waveform, dtype=torch.float32)
@@ -134,31 +142,145 @@ class TensorRTSortformer:
             waveforms.append(self._prepare_waveform(waveform, file_sample_rate))
         return waveforms
 
-    def _features(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
-        features = []
+    def _extract_features(
+        self,
+        waveform: torch.Tensor,
+        logical_length: int,
+        frame_offset: int = 0,
+    ) -> torch.Tensor:
         preemphasis = float(self.config["preemphasis"])
         hop_length = int(self.config["hop_length"])
         with torch.inference_mode():
-            for waveform in waveforms:
-                length = waveform.numel()
-                signal = waveform.reshape(1, -1).to(device="cuda", non_blocking=True)
-                signal = torch.cat((signal[:, :1], signal[:, 1:] - preemphasis * signal[:, :-1]), dim=1)
-                spectrum = torch.stft(
-                    signal,
-                    n_fft=int(self.config["n_fft"]),
-                    hop_length=hop_length,
-                    win_length=int(self.config["win_length"]),
-                    window=self.window,
-                    center=True,
-                    pad_mode="constant",
-                    return_complex=True,
+            signal = waveform.reshape(1, -1).to(device=self.window.device, non_blocking=True)
+            signal = torch.cat((signal[:, :1], signal[:, 1:] - preemphasis * signal[:, :-1]), dim=1)
+            spectrum = torch.stft(
+                signal,
+                n_fft=int(self.config["n_fft"]),
+                hop_length=hop_length,
+                win_length=int(self.config["win_length"]),
+                window=self.window,
+                center=True,
+                pad_mode="constant",
+                return_complex=True,
+            )
+            mel = torch.log(
+                torch.matmul(self.mel_basis.unsqueeze(0), spectrum.abs().square()) + self.config["log_guard"]
+            )
+            end = frame_offset + logical_length
+            return mel[0, :, frame_offset:end].transpose(0, 1).to(device="cpu").contiguous()
+
+    def _features(self, waveforms: list[torch.Tensor]) -> list[torch.Tensor]:
+        hop_length = int(self.config["hop_length"])
+        return [self._extract_features(waveform, max(1, waveform.numel() // hop_length)) for waveform in waveforms]
+
+    def _is_long_audio(self, audio: np.ndarray | torch.Tensor | str, sample_rate: int | None) -> bool:
+        if sample_rate is None:
+            info = soundfile.info(str(audio))
+            return info.frames > info.samplerate * _LONG_AUDIO_SECONDS
+        waveform = ensure_waveform_2d(torch.as_tensor(audio))
+        return waveform.shape[-1] > sample_rate * _LONG_AUDIO_SECONDS
+
+    def _waveform_feature_blocks(self, waveform: torch.Tensor) -> Iterator[torch.Tensor]:
+        hop_length = int(self.config["hop_length"])
+        context_samples = _STFT_CONTEXT_HOPS * hop_length
+        total_samples = waveform.numel()
+        for start in range(0, total_samples, self._stft_block_samples):
+            end = min(start + self._stft_block_samples, total_samples)
+            logical_length = (end - start) // hop_length
+            if logical_length == 0:
+                continue
+            read_start = max(0, start - context_samples)
+            read_end = min(total_samples, end + context_samples)
+            signal = waveform[read_start:read_end]
+            if start < context_samples:
+                signal = torch.nn.functional.pad(signal, (context_samples - start, 0))
+            yield self._extract_features(signal, logical_length, _STFT_CONTEXT_HOPS)
+
+    def _file_feature_blocks(self, path: str) -> Iterator[torch.Tensor]:
+        target_rate = int(self.config["sample_rate"])
+        hop_length = int(self.config["hop_length"])
+        context_samples = _STFT_CONTEXT_HOPS * hop_length
+        with soundfile.SoundFile(path) as audio_file:
+            if audio_file.samplerate != target_rate:
+                msg = (
+                    f"Long Sortformer inputs must use the engine sample rate "
+                    f"({target_rate} Hz), got {audio_file.samplerate} Hz for {path}"
                 )
-                mel = torch.log(
-                    torch.matmul(self.mel_basis.unsqueeze(0), spectrum.abs().square()) + self.config["log_guard"]
-                )
-                logical_length = max(1, length // hop_length)
-                features.append(mel[0, :, :logical_length].transpose(0, 1).to(device="cpu").contiguous())
-        return features
+                raise ValueError(msg)
+            total_samples = len(audio_file)
+            for start in range(0, total_samples, self._stft_block_samples):
+                end = min(start + self._stft_block_samples, total_samples)
+                logical_length = (end - start) // hop_length
+                if logical_length == 0:
+                    continue
+                read_start = max(0, start - context_samples)
+                read_end = min(total_samples, end + context_samples)
+                audio_file.seek(read_start)
+                data = audio_file.read(read_end - read_start, dtype="float32", always_2d=True)
+                signal = torch.from_numpy(data).mean(dim=1)
+                if start < context_samples:
+                    signal = torch.nn.functional.pad(signal, (context_samples - start, 0))
+                yield self._extract_features(signal, logical_length, _STFT_CONTEXT_HOPS)
+
+    def _streaming_feature_blocks(
+        self,
+        audio: np.ndarray | torch.Tensor | str,
+        sample_rate: int | None,
+    ) -> Iterator[torch.Tensor]:
+        if sample_rate is None:
+            yield from self._file_feature_blocks(str(audio))
+            return
+        waveform = self._prepare_waveform(audio, sample_rate)
+        yield from self._waveform_feature_blocks(waveform)
+
+    def _infer_batch(
+        self,
+        batch_states: list[Any],
+        feature_windows: list[torch.Tensor],
+        left_embeddings: list[int],
+        right_embeddings: list[int],
+        end_flags: list[int],
+    ) -> tuple[list[Any], list[torch.Tensor]]:
+        chunk_len = int(self.config["chunk_len"])
+        subsampling = int(self.config["subsampling_factor"])
+        emb_dim = int(self.config["emb_dim"])
+        self.modules.sync_pending_compression_batched(batch_states)
+
+        chunks = torch.zeros((len(feature_windows), chunk_len, 128), dtype=torch.float32, device="cuda")
+        chunk_lengths = [min(window.shape[0], chunk_len) for window in feature_windows]
+        for index, (window, length) in enumerate(zip(feature_windows, chunk_lengths, strict=True)):
+            chunks[index, :length] = window[:length].to(device="cuda", non_blocking=True)
+        embedding_lengths = [(length - 1) // subsampling + 1 for length in chunk_lengths]
+
+        speaker_lengths = [state.spkcache_len_cached for state in batch_states]
+        max_speaker_length = max(1, *speaker_lengths)
+        outputs = self.session.infer(
+            {
+                "chunk": chunks,
+                "chunk_lengths": torch.tensor(chunk_lengths, dtype=torch.int64, device="cuda"),
+                "spkcache": torch.stack(
+                    [state.spkcache[0, :max_speaker_length] for state in batch_states],
+                ),
+                "spkcache_lengths": torch.tensor(speaker_lengths, dtype=torch.int64, device="cuda"),
+                "fifo": torch.zeros((len(feature_windows), 1, emb_dim), dtype=torch.float32, device="cuda"),
+                "fifo_lengths": torch.zeros(len(feature_windows), dtype=torch.int64, device="cuda"),
+            }
+        )
+        predictions = self.modules.apply_mask_to_preds(outputs["predictions"], outputs["pred_lengths"])
+        updated_states, chunk_predictions, _ = self.modules.streaming_update_batched(
+            batch_states=batch_states,
+            chunk_embs=outputs["chunk_embs"],
+            chunk_emb_lengths=embedding_lengths,
+            preds=predictions,
+            lc_list=left_embeddings,
+            rc_list=right_embeddings,
+            end_flags=end_flags,
+        )
+        probability_chunks = []
+        for index, embedding_length in enumerate(embedding_lengths):
+            output_length = max(0, embedding_length - left_embeddings[index] - right_embeddings[index])
+            probability_chunks.append(chunk_predictions[index, :output_length].float().cpu())
+        return updated_states, probability_chunks
 
     def _infer_probabilities(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
         count = len(features)
@@ -167,7 +289,6 @@ class TensorRTSortformer:
         left_frames = int(self.config["left_context_frames"])
         right_frames = int(self.config["right_context_frames"])
         subsampling = int(self.config["subsampling_factor"])
-        emb_dim = int(self.config["emb_dim"])
 
         states = [self.modules.init_streaming_state(torch.device("cuda")) for _ in features]
         positions = [0] * count
@@ -180,15 +301,11 @@ class TensorRTSortformer:
             for batch_start in range(0, len(active), self.inference_batch_size):
                 batch_active = active[batch_start : batch_start + self.inference_batch_size]
                 batch_states = [states[index] for index in batch_active]
-                self.modules.sync_pending_compression_batched(batch_states)
-
-                chunks = torch.zeros((len(batch_active), chunk_len, 128), dtype=torch.float32, device="cuda")
-                chunk_lengths = []
-                embedding_lengths = []
+                feature_windows = []
                 left_embeddings = []
                 right_embeddings = []
                 end_flags = []
-                for batch_index, item_index in enumerate(batch_active):
+                for item_index in batch_active:
                     feature = features[item_index]
                     center_start = positions[item_index]
                     center_end = min(center_start + center_frames, feature.shape[0])
@@ -196,52 +313,71 @@ class TensorRTSortformer:
                     window_end = min(feature.shape[0], center_end + right_frames)
                     chunk = feature[window_start:window_end]
                     valid_frames = min(chunk.shape[0], chunk_len)
-                    chunks[batch_index, :valid_frames] = chunk[:valid_frames].to(device="cuda", non_blocking=True)
-                    chunk_lengths.append(valid_frames)
-                    embedding_lengths.append((valid_frames - 1) // subsampling + 1)
+                    feature_windows.append(chunk[:valid_frames])
                     left_embeddings.append((center_start - window_start + subsampling - 1) // subsampling)
                     right_embeddings.append((window_end - center_end + subsampling - 1) // subsampling)
                     end_flags.append(int(center_end == feature.shape[0]))
                     positions[item_index] = center_end
 
-                speaker_lengths = [state.spkcache_len_cached for state in batch_states]
-                max_speaker_length = max(1, *speaker_lengths)
-                outputs = self.session.infer(
-                    {
-                        "chunk": chunks,
-                        "chunk_lengths": torch.tensor(chunk_lengths, dtype=torch.int64, device="cuda"),
-                        "spkcache": torch.stack(
-                            [state.spkcache[0, :max_speaker_length] for state in batch_states],
-                        ),
-                        "spkcache_lengths": torch.tensor(speaker_lengths, dtype=torch.int64, device="cuda"),
-                        "fifo": torch.zeros((len(batch_active), 1, emb_dim), dtype=torch.float32, device="cuda"),
-                        "fifo_lengths": torch.zeros(len(batch_active), dtype=torch.int64, device="cuda"),
-                    }
+                updated_states, probability_chunks = self._infer_batch(
+                    batch_states,
+                    feature_windows,
+                    left_embeddings,
+                    right_embeddings,
+                    end_flags,
                 )
-                predictions = self.modules.apply_mask_to_preds(outputs["predictions"], outputs["pred_lengths"])
-                updated_states, chunk_predictions, _ = self.modules.streaming_update_batched(
-                    batch_states=batch_states,
-                    chunk_embs=outputs["chunk_embs"],
-                    chunk_emb_lengths=embedding_lengths,
-                    preds=predictions,
-                    lc_list=left_embeddings,
-                    rc_list=right_embeddings,
-                    end_flags=end_flags,
-                )
-
                 for batch_index, item_index in enumerate(batch_active):
                     states[item_index] = updated_states[batch_index]
-                    output_length = max(
-                        0,
-                        embedding_lengths[batch_index] - left_embeddings[batch_index] - right_embeddings[batch_index],
-                    )
-                    probabilities[item_index].append(chunk_predictions[batch_index, :output_length].float().cpu())
+                    probabilities[item_index].append(probability_chunks[batch_index])
 
         num_speakers = int(self.config["num_speakers"])
         return [
             torch.cat(parts) if parts else torch.empty((0, num_speakers), dtype=torch.float32)
             for parts in probabilities
         ]
+
+    def _infer_streaming_probabilities(self, feature_blocks: Iterator[torch.Tensor]) -> torch.Tensor:
+        center_frames = int(self.config["center_chunk_frames"])
+        left_frames = int(self.config["left_context_frames"])
+        right_frames = int(self.config["right_context_frames"])
+        subsampling = int(self.config["subsampling_factor"])
+        num_speakers = int(self.config["num_speakers"])
+        state = self.modules.init_streaming_state(torch.device("cuda"))
+        buffer = torch.empty((0, 128), dtype=torch.float32)
+        center_start = 0
+        probabilities = []
+
+        def consume(end_of_input: bool) -> None:
+            nonlocal buffer, center_start, state
+            while center_start < buffer.shape[0]:
+                remaining = buffer.shape[0] - center_start
+                if not end_of_input and remaining < center_frames + right_frames:
+                    break
+                center_end = min(center_start + center_frames, buffer.shape[0])
+                if not end_of_input and center_end - center_start < center_frames:
+                    break
+                window_start = max(0, center_start - left_frames)
+                window_end = min(buffer.shape[0], center_end + right_frames)
+                left_embedding = (center_start - window_start + subsampling - 1) // subsampling
+                right_embedding = (window_end - center_end + subsampling - 1) // subsampling
+                updated_states, probability_chunks = self._infer_batch(
+                    [state],
+                    [buffer[window_start:window_end]],
+                    [left_embedding],
+                    [right_embedding],
+                    [int(end_of_input and center_end == buffer.shape[0])],
+                )
+                state = updated_states[0]
+                probabilities.append(probability_chunks[0])
+                keep_start = max(0, center_end - left_frames)
+                buffer = buffer[keep_start:]
+                center_start = center_end - keep_start
+
+        for feature_block in feature_blocks:
+            buffer = torch.cat((buffer, feature_block))
+            consume(end_of_input=False)
+        consume(end_of_input=True)
+        return torch.cat(probabilities) if probabilities else torch.empty((0, num_speakers), dtype=torch.float32)
 
     def _segments(self, probabilities: torch.Tensor) -> list[dict[str, Any]]:
         frame_step = float(self.config["output_step_ms"]) / 1000
@@ -263,8 +399,21 @@ class TensorRTSortformer:
         audio: list[np.ndarray] | list[torch.Tensor] | list[str],
         sample_rate: int | None = None,
     ) -> list[list[dict[str, Any]]]:
-        waveforms = self._load_inputs(audio, sample_rate)
-        return [self._segments(item) for item in self._infer_probabilities(self._features(waveforms))]
+        results: list[list[dict[str, Any]] | None] = [None] * len(audio)
+        regular_indices = [index for index, item in enumerate(audio) if not self._is_long_audio(item, sample_rate)]
+        if regular_indices:
+            regular_audio = [audio[index] for index in regular_indices]
+            waveforms = self._load_inputs(regular_audio, sample_rate)
+            probabilities = self._infer_probabilities(self._features(waveforms))
+            for index, item_probabilities in zip(regular_indices, probabilities, strict=True):
+                results[index] = self._segments(item_probabilities)
+
+        for index, item in enumerate(audio):
+            if results[index] is not None:
+                continue
+            feature_blocks = self._streaming_feature_blocks(item, sample_rate)
+            results[index] = self._segments(self._infer_streaming_probabilities(feature_blocks))
+        return [result if result is not None else [] for result in results]
 
     def close(self) -> None:
         self.session.close()
