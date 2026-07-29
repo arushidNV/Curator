@@ -125,7 +125,7 @@ class TestWriteRttm:
         ) as runtime_class:
             stage.setup()
 
-        runtime_class.assert_called_once_with("model.plan", "model.json", "sortformer_modules.py")
+        runtime_class.assert_called_once_with("model.plan", "model.json", "sortformer_modules.py", 2)
         runtime.diarize.assert_not_called()
         stage.teardown()
         runtime.close.assert_called_once_with()
