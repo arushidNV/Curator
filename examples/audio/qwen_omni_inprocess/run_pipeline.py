@@ -109,10 +109,7 @@ INDIC_CONFORMER_HYBRID_DEFAULT_MODEL_ID = "ai4bharat/indicconformer_stt_{lang}_h
 # faster-whisper alias; equivalent HF openai/whisper-large-v3 in Transformers format.
 WHISPER_DEFAULT_MODEL = "large-v3"
 PARAKEET_V3_DEFAULT_MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
-PARAKEET_RIVA_DEFAULT_MODEL_ID = (
-    "/lustre/fsw/portfolios/convai/users/ntadevosyan/projects/granary-v2-asr/"
-    "checkpoints/parakeet_1.1b_indic_multilingual_v1.0_epoch_37.nemo"
-)
+PARAKEET_RIVA_DEFAULT_MODEL_ID = None
 
 # Recommended language codes for each primary inference model (used for auto-selection via --language).
 QWEN_OMNI_RECOMMENDED_LANGS        = {"en", "de", "es", "fr", "it", "pt", "ru", "nl", "zh", "ja", "ko", "ar",
