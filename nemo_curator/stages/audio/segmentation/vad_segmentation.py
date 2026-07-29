@@ -202,6 +202,18 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
                 "original_file": item.get("original_file", item.get("audio_filepath", "unknown")),
             }
         )
+
+        diar_segments = item.get("diar_segments")
+        if diar_segments is not None:
+            seg_start = segment["start"]
+            seg_end = segment["end"]
+            speakers = {
+                s["speaker"]
+                for s in diar_segments
+                if s["end"] > seg_start and s["start"] < seg_end
+            }
+            segment_data["num_speakers"] = len(speakers)
+
         return segment_data
 
     def _resolve_audio(self, item: dict[str, Any]) -> tuple[torch.Tensor, int] | None:
