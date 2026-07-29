@@ -200,6 +200,9 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if self.precision not in {"fp32", "fp16", "bf16"}:
             msg = f"Unsupported Sortformer precision: {self.precision}"
             raise ValueError(msg)
+        if self.inference_batch_size < 1:
+            msg = f"Sortformer inference batch size must be positive, got {self.inference_batch_size}"
+            raise ValueError(msg)
         if self.backend == "tensorrt" and not all(
             (self.tensorrt_engine_path, self.tensorrt_config_path, self.tensorrt_runtime_module_path)
         ):
@@ -232,6 +235,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
                 self.tensorrt_engine_path,
                 self.tensorrt_config_path,
                 self.tensorrt_runtime_module_path,
+                self.inference_batch_size,
             )
             return
 
