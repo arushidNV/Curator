@@ -47,9 +47,14 @@ from nemo_curator.stages.audio.io.nemo_speech_writer import NeMoSpeechWriterStag
 from nemo_curator.stages.audio.postprocessing.sed_postprocessing import SEDPostprocessingStage
 from nemo_curator.stages.audio.preprocessing import MonoDownsampleStage, SqueezeWaveformStage
 from nemo_curator.stages.audio.segmentation import VADSegmentationStage
+from nemo_curator.stages.audio.text_filtering import SelectBestLIDPredictionStage
 from nemo_curator.stages.resources import Resources
 
 _SORTFORMER_BATCH_WINDOW_MULTIPLIER = 4
+_PRIMARY_LANG_KEY = "primary_language"
+_PRIMARY_CONFIDENCE_KEY = "primary_language_confidence"
+_INDIC_LANG_KEY = "indic_canary_language"
+_INDIC_CONFIDENCE_KEY = "indic_canary_language_confidence"
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -63,6 +68,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Filter to specific language(s) in the YAML (comma-separated, e.g. 'en,de').",
+    )
+    ap.add_argument(
+        "--indic",
+        action="store_true",
+        help="Run Indic Canary after the primary language-identification stage.",
+    )
+    ap.add_argument(
+        "--indic_canary_engine_dir",
+        type=str,
+        default=None,
+        help="Prebuilt Indic Canary TRT-LLM engine directory. Required with --indic.",
+    )
+    ap.add_argument(
+        "--indic_canary_lid_max_duration_sec",
+        type=float,
+        default=15.0,
+        help="Maximum audio duration passed to Indic Canary LID.",
+    )
+    ap.add_argument("--indic_canary_batch_size", type=int, default=16, help="Indic Canary LID batch size.")
+    ap.add_argument(
+        "--indic_canary_num_workers",
+        type=int,
+        default=1,
+        help="Fixed Indic Canary worker count; use 0 to let the executor decide.",
     )
     ap.add_argument(
         "--resampled_output_dir",
@@ -131,8 +160,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     vad.add_argument(
         "--vad_gpu_memory_gb",
         type=float,
-        default=2.0,
+        default=4.0,
         help="GPU memory in GB for each TensorRT VAD worker.",
+    )
+    vad.add_argument(
+        "--vad_num_workers",
+        type=int,
+        default=None,
+        help="Fixed VAD worker count; unset or non-positive lets the executor decide.",
     )
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
@@ -158,6 +193,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     sed.add_argument("--sed_gpu_memory_gb", type=float, default=4.0, help="GPU memory for SED stage.")
     sed.add_argument(
+        "--sed_num_workers",
+        type=int,
+        default=None,
+        help="Fixed SED worker count; unset or non-positive lets the executor decide.",
+    )
+    sed.add_argument(
         "--sed_emit_superclasses",
         type=lambda x: x.lower() not in ("false", "0", "no"),
         default=True,
@@ -174,6 +215,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     lid.add_argument("--langid_model", type=str, default=None, help="Model name/path (default depends on backend).")
     lid.add_argument("--langid_gpu_memory_gb", type=float, default=4.0, help="GPU memory for LangID stage.")
+    lid.add_argument("--langid_batch_size", type=int, default=16, help="Language-identification batch size.")
+    lid.add_argument(
+        "--langid_max_duration_sec",
+        type=float,
+        default=10.0,
+        help="Maximum audio duration passed to the primary LangID model; use 0 for no truncation.",
+    )
+    lid.add_argument(
+        "--langid_max_workers",
+        type=int,
+        default=2,
+        help="Fixed primary LangID worker count; use 0 to let the executor decide.",
+    )
     lid.add_argument("--skip_langid", action="store_true", default=False, help="Skip language ID stage.")
 
     diar = ap.add_argument_group("Speaker Diarization (Sortformer)")
@@ -191,6 +245,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="GPUs per Sortformer actor (e.g. 1.0 for one full GPU). Overrides sortformer_gpu_memory_gb.",
     )
     diar.add_argument("--sortformer_batch_size", type=int, default=1, help="Sortformer inference batch size.")
+    diar.add_argument(
+        "--sortformer_batch_window",
+        type=int,
+        default=None,
+        help="Recordings supplied to each stage call; defaults to four inference batches.",
+    )
+    diar.add_argument(
+        "--sortformer_num_workers",
+        type=int,
+        default=None,
+        help="Fixed Sortformer worker count; unset or non-positive lets the executor decide.",
+    )
     diar.add_argument(
         "--sortformer_backend",
         choices=["nemo", "tensorrt"],
@@ -241,6 +307,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     out = ap.add_argument_group("Output")
     out.add_argument("--target_sample_rate", type=int, default=16000, help="Output sample rate.")
 
+    execution = ap.add_argument_group("Executor")
+    execution.add_argument("--executor", choices=["ray_data", "xenna"], default="ray_data")
+    execution.add_argument(
+        "--execution_mode",
+        choices=["streaming", "batch"],
+        default="streaming",
+        help="Xenna execution mode; ignored by Ray Data.",
+    )
+
     return ap
 
 
@@ -272,6 +347,12 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             args.sortformer_model if args.sortformer_model and args.sortformer_model.endswith(".nemo") else None
         )
         model_name = args.sortformer_model or "nvidia/diar_streaming_sortformer_4spk-v2"
+        sortformer_batch_window = args.sortformer_batch_window
+        if sortformer_batch_window is None:
+            sortformer_batch_window = args.sortformer_batch_size * _SORTFORMER_BATCH_WINDOW_MULTIPLIER
+        if sortformer_batch_window < 1:
+            msg = f"--sortformer_batch_window must be positive, got {sortformer_batch_window}"
+            raise ValueError(msg)
         if args.sortformer_gpus is not None:
             sortformer_resources = Resources(gpus=args.sortformer_gpus)
         else:
@@ -281,7 +362,12 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 model_name=model_name,
                 model_path=model_path,
                 inference_batch_size=args.sortformer_batch_size,
-                batch_size=args.sortformer_batch_size * _SORTFORMER_BATCH_WINDOW_MULTIPLIER,
+                batch_size=sortformer_batch_window,
+                xenna_num_workers=(
+                    args.sortformer_num_workers
+                    if args.sortformer_num_workers is not None and args.sortformer_num_workers > 0
+                    else None
+                ),
                 backend=args.sortformer_backend,
                 tensorrt_engine_path=args.sortformer_tensorrt_engine,
                 tensorrt_config_path=args.sortformer_tensorrt_config,
@@ -294,6 +380,9 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             )
         )
 
+    if args.vad_backend == "tensorrt" and not args.vad_tensorrt_engine:
+        msg = "--vad_tensorrt_engine is required when --vad_backend=tensorrt"
+        raise ValueError(msg)
     stages.append(
         VADSegmentationStage(
             threshold=args.vad_threshold,
@@ -307,6 +396,9 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             nested=False,
             filepath_key="resampled_audio_filepath" if args.resampled_output_dir else "audio_filepath",
             resources=vad_resources,
+            num_workers_override=(
+                args.vad_num_workers if args.vad_num_workers is not None and args.vad_num_workers > 0 else None
+            ),
         )
     )
     stages.append(SqueezeWaveformStage())
@@ -318,6 +410,9 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 backend=args.sed_backend,
                 tensorrt_engine_path=args.sed_tensorrt_engine,
                 batch_size=args.sed_batch_size,
+                num_workers_override=(
+                    args.sed_num_workers if args.sed_num_workers is not None and args.sed_num_workers > 0 else None
+                ),
                 resources=Resources(gpu_memory_gb=args.sed_gpu_memory_gb),
             )
         )
@@ -328,7 +423,14 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             )
         )
 
+    if args.indic and args.skip_langid:
+        msg = "--indic cannot be combined with --skip_langid"
+        raise ValueError(msg)
+
     if not args.skip_langid:
+        primary_language_key = _PRIMARY_LANG_KEY if args.indic else "language"
+        primary_confidence_key = _PRIMARY_CONFIDENCE_KEY if args.indic else "language_confidence"
+        langid_max_workers = args.langid_max_workers if args.langid_max_workers > 0 else None
         if args.langid_backend == "speechbrain":
             from nemo_curator.stages.audio.inference.speechbrain_langid import SpeechBrainLangIDStage
 
@@ -336,6 +438,11 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             stages.append(
                 SpeechBrainLangIDStage(
                     source=langid_source,
+                    output_key=primary_language_key,
+                    confidence_key=primary_confidence_key,
+                    max_duration_sec=args.langid_max_duration_sec,
+                    batch_size=args.langid_batch_size,
+                    max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
@@ -344,7 +451,41 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             stages.append(
                 AmberNetLangIDStage(
                     model_name=langid_model,
+                    output_key=primary_language_key,
+                    confidence_key=primary_confidence_key,
+                    max_duration_sec=args.langid_max_duration_sec,
+                    batch_size=args.langid_batch_size,
+                    max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
+                )
+            )
+
+        if args.indic:
+            from nemo_curator.stages.audio.inference.indic_canary_lid import IndicCanaryLangIDStage
+
+            if not args.indic_canary_engine_dir:
+                msg = "--indic_canary_engine_dir is required when --indic is set"
+                raise ValueError(msg)
+            if args.indic_canary_lid_max_duration_sec <= 0:
+                msg = "--indic_canary_lid_max_duration_sec must be positive"
+                raise ValueError(msg)
+            stages.append(
+                IndicCanaryLangIDStage(
+                    engine_dir=args.indic_canary_engine_dir,
+                    output_key=_INDIC_LANG_KEY,
+                    confidence_key=_INDIC_CONFIDENCE_KEY,
+                    max_duration_sec=args.indic_canary_lid_max_duration_sec,
+                    batch_size=args.indic_canary_batch_size,
+                    max_workers=args.indic_canary_num_workers if args.indic_canary_num_workers > 0 else None,
+                    resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
+                )
+            )
+            stages.append(
+                SelectBestLIDPredictionStage(
+                    speechbrain_language_key=_PRIMARY_LANG_KEY,
+                    speechbrain_confidence_key=_PRIMARY_CONFIDENCE_KEY,
+                    indic_canary_language_key=_INDIC_LANG_KEY,
+                    indic_canary_confidence_key=_INDIC_CONFIDENCE_KEY,
                 )
             )
 
@@ -371,9 +512,14 @@ def main() -> None:
 
     pipeline = Pipeline(name=pipeline_name, stages=stages)
 
-    from nemo_curator.backends.ray_data import RayDataExecutor
+    if args.executor == "xenna":
+        from nemo_curator.backends.xenna import XennaExecutor
 
-    executor = RayDataExecutor()
+        executor = XennaExecutor(config={"execution_mode": args.execution_mode})
+    else:
+        from nemo_curator.backends.ray_data import RayDataExecutor
+
+        executor = RayDataExecutor()
 
     logger.info(f"Metadata extraction pipeline: {len(stages)} stages ({pipeline_name})")
     logger.info(f"  Output: {args.output_dir}")
@@ -387,18 +533,26 @@ def main() -> None:
             else f"gpu_memory_gb={args.sortformer_gpu_memory_gb}"
         )
         model = args.sortformer_tensorrt_engine if args.sortformer_backend == "tensorrt" else args.sortformer_model
-        logger.info(f"  Sortformer: {model} ({sf_desc}, on full audio before VAD)")
+        batch_window = args.sortformer_batch_window
+        if batch_window is None:
+            batch_window = args.sortformer_batch_size * _SORTFORMER_BATCH_WINDOW_MULTIPLIER
+        logger.info(
+            f"  Sortformer: {model} ({sf_desc}, inference_batch_size={args.sortformer_batch_size}, "
+            f"batch_window={batch_window}, workers={args.sortformer_num_workers or 'auto'}, "
+            "on full audio before VAD)"
+        )
     logger.info(
         f"  VAD: backend={args.vad_backend}, threshold={args.vad_threshold}, "
         f"min_interval_ms={args.min_interval_ms}, "
-        f"speech_pad_ms={args.speech_pad_ms}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s"
+        f"speech_pad_ms={args.speech_pad_ms}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s, "
+        f"batch_size={args.vad_batch_size}, workers={args.vad_num_workers or 'auto'}"
     )
     if args.vad_backend == "tensorrt":
         logger.info(f"  VAD GPU memory: {args.vad_gpu_memory_gb} GB/worker")
     if args.sed_checkpoint:
         logger.info(
             f"  SED: backend={args.sed_backend}, checkpoint={args.sed_checkpoint}, "
-            f"batch_size={args.sed_batch_size}"
+            f"batch_size={args.sed_batch_size}, workers={args.sed_num_workers or 'auto'}"
         )
         if args.sed_backend == "tensorrt":
             logger.info(f"  SED TensorRT engine: {args.sed_tensorrt_engine}")
@@ -406,7 +560,14 @@ def main() -> None:
         langid_desc = args.langid_model or (
             "speechbrain/lang-id-voxlingua107-ecapa" if args.langid_backend == "speechbrain" else "langid_ambernet"
         )
-        logger.info(f"  LangID: {args.langid_backend} ({langid_desc})")
+        if args.indic:
+            logger.info(
+                f"  LangID: primary={args.langid_backend} ({langid_desc}), "
+                f"Indic Canary={args.indic_canary_engine_dir}"
+            )
+        else:
+            logger.info(f"  LangID: {args.langid_backend} ({langid_desc})")
+    logger.info(f"  Executor: {args.executor} ({args.execution_mode})")
     logger.info(f"  Target sample rate: {args.target_sample_rate}Hz, writer_concurrency={args.writer_concurrency}")
 
     t0 = time.time()

@@ -25,6 +25,7 @@ from nemo_curator.stages.audio.text_filtering.initialize_fields import Initializ
 from nemo_curator.stages.audio.text_filtering.llm_language_verification import LLMLanguageVerificationStage
 from nemo_curator.stages.audio.text_filtering.instruction_packer import InstructionPackerStage
 from nemo_curator.stages.audio.text_filtering.regex_substitution import RegexSubstitutionStage
+from nemo_curator.stages.audio.text_filtering.select_best_lid_prediction import SelectBestLIDPredictionStage
 from nemo_curator.stages.audio.text_filtering.whisper_hallucination import WhisperHallucinationStage
 
 __all__ = [
@@ -39,5 +40,6 @@ __all__ = [
     "LLMLanguageVerificationStage",
     "InstructionPackerStage",
     "RegexSubstitutionStage",
+    "SelectBestLIDPredictionStage",
     "WhisperHallucinationStage",
 ]

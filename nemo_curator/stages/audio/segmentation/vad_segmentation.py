@@ -126,7 +126,11 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
     name: str = "VADSegmentation"
     batch_size: int = 1
+    num_workers_override: int | None = None
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0, gpus=0.0))
+
+    def num_workers(self) -> int | None:
+        return self.num_workers_override
 
     def __post_init__(self):
         super().__init__()

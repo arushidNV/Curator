@@ -54,7 +54,6 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
     name: str = "SpeechBrainLangID"
     source: str = "speechbrain/lang-id-voxlingua107-ecapa"
     savedir: str = field(default_factory=lambda: os.path.join(tempfile.gettempdir(), "speechbrain_langid"))
-    batch_size: int = 32
 
     _classifier: Any = field(default=None, init=False, repr=False)
 

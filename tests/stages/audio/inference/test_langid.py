@@ -48,6 +48,24 @@ class TestBaseLangIDPrep:
         assert isinstance(out, torch.Tensor)
         assert out.shape[0] == 16000
 
+    def test_long_waveform_is_truncated(self) -> None:
+        stage = SpeechBrainLangIDStage(min_duration_sec=0.5, max_duration_sec=2.0)
+        out = stage._prepare_audio(_task(np.zeros(48000, dtype=np.float32)))
+        assert out is not None
+        assert out.shape[0] == 32000
+
+    def test_zero_max_duration_disables_truncation(self) -> None:
+        stage = SpeechBrainLangIDStage(min_duration_sec=0.5, max_duration_sec=0)
+        out = stage._prepare_audio(_task(np.zeros(48000, dtype=np.float32)))
+        assert out is not None
+        assert out.shape[0] == 48000
+
+    def test_worker_override_and_defaults(self) -> None:
+        stage = SpeechBrainLangIDStage(max_workers=2)
+        assert stage.batch_size == 16
+        assert stage.max_duration_sec == 10.0
+        assert stage.num_workers() == 2
+
     def test_resampler_is_built_once_and_cached(self) -> None:
         stage = SpeechBrainLangIDStage(min_duration_sec=0.1, target_sr=16000)
         wav = np.zeros(8000, dtype=np.float32)

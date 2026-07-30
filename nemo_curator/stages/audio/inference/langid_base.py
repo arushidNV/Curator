@@ -45,7 +45,9 @@ class BaseLangIDStage(ProcessingStage[AudioTask, AudioTask]):
         output_key: Task data key to write the predicted language.
         confidence_key: Task data key to write prediction confidence.
         min_duration_sec: Minimum segment duration for LangID (skip shorter).
+        max_duration_sec: Maximum audio duration passed to the model.
         batch_size: Number of segments to process at once.
+        max_workers: Optional fixed worker count.
     """
 
     target_sr: int = 16000
@@ -54,10 +56,15 @@ class BaseLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     output_key: str = "language"
     confidence_key: str = "language_confidence"
     min_duration_sec: float = 1.0
-    batch_size: int = 32
+    max_duration_sec: float = 10.0
+    batch_size: int = 16
+    max_workers: int | None = None
     resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=4.0))
 
     _resamplers: dict[tuple[int, int], Any] = field(default_factory=dict, init=False, repr=False)
+
+    def num_workers(self) -> int | None:
+        return self.max_workers
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [self.waveform_key, self.sample_rate_key]
@@ -109,7 +116,10 @@ class BaseLangIDStage(ProcessingStage[AudioTask, AudioTask]):
             self._set_empty(task)
             return None
 
-        return self._resample(waveform, sr)
+        audio = self._resample(waveform, sr)
+        if self.max_duration_sec > 0:
+            audio = audio[..., : int(self.max_duration_sec * self.target_sr)]
+        return audio
 
     def process(self, task: AudioTask) -> AudioTask:
         return self.process_batch([task])[0]
