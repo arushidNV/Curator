@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -71,6 +72,32 @@ def _load_state_module(path: Path) -> ModuleType:
     return module
 
 
+def _create_state_modules(
+    state_module: ModuleType,
+    config: dict[str, Any],
+    learned_silence: torch.Tensor | None,
+) -> object:
+    module_args = {
+        "spkcache_refresh_rate": int(config["spkcache_refresh_rate"]),
+        "spkcache_len": int(config["spkcache_len"]),
+        "fifo_len": int(config["fifo_len"]),
+        "fc_d_model": int(config["emb_dim"]),
+        "num_spks": int(config["num_speakers"]),
+        "dtype": torch.float32,
+    }
+    supports_learned_silence = "learnable_sil_emb" in inspect.signature(state_module.SortformerModules).parameters
+    if supports_learned_silence:
+        module_args["learnable_sil_emb"] = learned_silence
+    modules = state_module.SortformerModules(**module_args)
+    if learned_silence is not None and not supports_learned_silence:
+
+        def learned_silence_profile(embeddings: torch.Tensor, _predictions: torch.Tensor) -> torch.Tensor:
+            return learned_silence.unsqueeze(0).expand(embeddings.shape[0], -1)
+
+        modules._get_silence_profile = learned_silence_profile
+    return modules
+
+
 class TensorRTSortformer:
     """Persistent TensorRT engine and streaming state manager."""
 
@@ -95,19 +122,30 @@ class TensorRTSortformer:
             raise ValueError(msg)
         self.session = TensorRTSession(engine_path)
         state_module = _load_state_module(Path(runtime_module_path))
-        self.modules = state_module.SortformerModules(
-            spkcache_refresh_rate=int(self.config["spkcache_refresh_rate"]),
-            spkcache_len=int(self.config["spkcache_len"]),
-            fifo_len=int(self.config["fifo_len"]),
-            fc_d_model=int(self.config["emb_dim"]),
-            num_spks=int(self.config["num_speakers"]),
-            dtype=torch.float32,
-        )
 
         mel_path = Path(self.config["mel_basis"])
         if not mel_path.is_absolute():
             mel_path = config_file.parent / mel_path
         self.mel_basis = torch.from_numpy(np.load(mel_path)).to(device="cuda", dtype=torch.float32)
+        learned_silence = None
+        learned_silence_path = self.config.get("learnable_sil_emb")
+        if learned_silence_path:
+            learned_silence_path = Path(learned_silence_path)
+            if not learned_silence_path.is_absolute():
+                learned_silence_path = config_file.parent / learned_silence_path
+            if not learned_silence_path.is_file():
+                msg = f"Sortformer learned silence embedding not found: {learned_silence_path}"
+                raise FileNotFoundError(msg)
+            learned_silence_array = np.load(learned_silence_path, allow_pickle=False)
+            expected_shape = (int(self.config["emb_dim"]),)
+            if learned_silence_array.shape != expected_shape:
+                msg = (
+                    f"Invalid Sortformer learned silence embedding shape "
+                    f"{learned_silence_array.shape}; expected {expected_shape}"
+                )
+                raise ValueError(msg)
+            learned_silence = torch.from_numpy(learned_silence_array).to(device="cuda", dtype=torch.float32)
+        self.modules = _create_state_modules(state_module, self.config, learned_silence)
         self.window = torch.hann_window(
             int(self.config["win_length"]),
             periodic=False,
@@ -243,7 +281,6 @@ class TensorRTSortformer:
     ) -> tuple[list[Any], list[torch.Tensor]]:
         chunk_len = int(self.config["chunk_len"])
         subsampling = int(self.config["subsampling_factor"])
-        emb_dim = int(self.config["emb_dim"])
         self.modules.sync_pending_compression_batched(batch_states)
 
         chunks = torch.zeros((len(feature_windows), chunk_len, 128), dtype=torch.float32, device="cuda")
@@ -253,7 +290,15 @@ class TensorRTSortformer:
         embedding_lengths = [(length - 1) // subsampling + 1 for length in chunk_lengths]
 
         speaker_lengths = [state.spkcache_len_cached for state in batch_states]
+        fifo_lengths = [state.fifo_len_cached for state in batch_states]
         max_speaker_length = max(1, *speaker_lengths)
+        max_fifo_length = max(1, *fifo_lengths)
+        fifo = []
+        for state in batch_states:
+            item = state.fifo[0, :max_fifo_length]
+            if item.shape[0] < max_fifo_length:
+                item = torch.nn.functional.pad(item, (0, 0, 0, max_fifo_length - item.shape[0]))
+            fifo.append(item)
         outputs = self.session.infer(
             {
                 "chunk": chunks,
@@ -262,8 +307,8 @@ class TensorRTSortformer:
                     [state.spkcache[0, :max_speaker_length] for state in batch_states],
                 ),
                 "spkcache_lengths": torch.tensor(speaker_lengths, dtype=torch.int64, device="cuda"),
-                "fifo": torch.zeros((len(feature_windows), 1, emb_dim), dtype=torch.float32, device="cuda"),
-                "fifo_lengths": torch.zeros(len(feature_windows), dtype=torch.int64, device="cuda"),
+                "fifo": torch.stack(fifo),
+                "fifo_lengths": torch.tensor(fifo_lengths, dtype=torch.int64, device="cuda"),
             }
         )
         predictions = self.modules.apply_mask_to_preds(outputs["predictions"], outputs["pred_lengths"])
