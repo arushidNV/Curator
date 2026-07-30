@@ -253,13 +253,18 @@ class TensorRTEncoder(torch.nn.Module):
         engine_path: str | Path,
         *,
         subsampling_factor: int,
+        max_batch_size: int | None = None,
         session: TensorRTEncoderSession | None = None,
     ) -> None:
         super().__init__()
+        if max_batch_size is not None and max_batch_size < 1:
+            msg = "TensorRT encoder maximum batch size must be at least 1"
+            raise ValueError(msg)
         if session is None:
             session = TensorRTEncoderSession(engine_path)
         self.session = session
         self.subsampling_factor = int(subsampling_factor)
+        self.max_batch_size = max_batch_size
 
         missing_inputs = _INPUT_NAMES - set(self.session.input_names)
         if missing_inputs:
@@ -280,7 +285,10 @@ class TensorRTEncoder(torch.nn.Module):
         if feature_count != min_shape[1]:
             msg = f"TensorRT encoder expects {min_shape[1]} input features, got {feature_count}"
             raise ValueError(msg)
-        if batch_size > max_shape[0] or feature_frames > max_shape[2]:
+        execution_batch = batch_size
+        if self.max_batch_size is not None:
+            execution_batch = min(execution_batch, self.max_batch_size)
+        if execution_batch > max_shape[0] or feature_frames > max_shape[2]:
             msg = f"TensorRT encoder input shape {tuple(audio_signal.shape)} exceeds profile maximum {max_shape}"
             raise ValueError(msg)
 
@@ -297,10 +305,61 @@ class TensorRTEncoder(torch.nn.Module):
                 value=min_shape[2],
             )
 
-        outputs = self.session.infer({"audio_signal": audio_signal, "length": length})
+        max_rows = padded_batch
+        if self.max_batch_size is not None:
+            max_rows = min(max_rows, self.max_batch_size)
+        if max_rows < padded_batch:
+            if max_rows < min_shape[0]:
+                msg = f"TensorRT encoder batch size {max_rows} is below profile minimum batch {min_shape[0]}"
+                raise ValueError(msg)
+            outputs = self._infer_split(
+                audio_signal,
+                length,
+                max_rows=max_rows,
+                min_shape=min_shape,
+            )
+        else:
+            outputs = self.session.infer({"audio_signal": audio_signal, "length": length})
         if padded_batch == batch_size:
             return outputs["outputs"], outputs["encoded_lengths"]
         return outputs["outputs"][:batch_size], outputs["encoded_lengths"][:batch_size]
+
+    def _infer_split(
+        self,
+        audio_signal: torch.Tensor,
+        length: torch.Tensor,
+        *,
+        max_rows: int,
+        min_shape: tuple[int, ...],
+    ) -> dict[str, torch.Tensor]:
+        outputs: dict[str, torch.Tensor] = {}
+        batch_size = audio_signal.shape[0]
+        for start in range(0, batch_size, max_rows):
+            end = min(start + max_rows, batch_size)
+            group_signal = audio_signal[start:end]
+            group_length = length[start:end]
+            group_rows = end - start
+            if group_rows < min_shape[0]:
+                group_signal = torch.nn.functional.pad(
+                    group_signal,
+                    (0, 0, 0, 0, 0, min_shape[0] - group_rows),
+                )
+                group_length = torch.nn.functional.pad(
+                    group_length,
+                    (0, min_shape[0] - group_rows),
+                    value=min_shape[2],
+                )
+            batch = self.session.infer({"audio_signal": group_signal, "length": group_length})
+            for name, output in batch.items():
+                output_slice = output[:group_rows]
+                if name not in outputs:
+                    outputs[name] = torch.empty(
+                        (batch_size, *output_slice.shape[1:]),
+                        dtype=output_slice.dtype,
+                        device=output_slice.device,
+                    )
+                outputs[name][start:end].copy_(output_slice)
+        return outputs
 
     def freeze(self) -> None:
         self.eval()

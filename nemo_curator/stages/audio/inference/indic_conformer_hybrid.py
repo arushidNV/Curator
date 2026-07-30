@@ -86,6 +86,8 @@ from nemo_curator.tasks import AudioTask
 
 _TARGET_SR = 16000
 _MAX_CHUNK_DURATION_SEC = 40.0
+_TENSORRT_INFERENCE_BATCH_SIZE = 64
+_TENSORRT_ENCODER_BATCH_SIZE = 8
 
 # Set once ``_apply_multisoftmax_patches`` has run.
 _PATCHED = False
@@ -522,6 +524,7 @@ class IndicConformerHybridASR(ModelInterface):
         self._trt_encoder = TensorRTEncoder(
             engine_path,
             subsampling_factor=int(metadata["subsampling_factor"]),
+            max_batch_size=_TENSORRT_ENCODER_BATCH_SIZE,
         )
         max_feature_frames = self._trt_encoder.max_input_shape("audio_signal")[2]
         self._chunk_duration_sec = min(
@@ -653,10 +656,6 @@ class IndicConformerHybridASR(ModelInterface):
         import torch
         import torchaudio.functional as audio_functional
 
-        metadata = self._trt_metadata
-        if metadata is None:
-            msg = "TensorRT metadata is not loaded"
-            raise RuntimeError(msg)
         texts = [""] * len(waveforms)
         langs_out = list(lang_codes)
         prepared: list[tuple[int, torch.Tensor, str]] = []
@@ -674,7 +673,7 @@ class IndicConformerHybridASR(ModelInterface):
 
         prepared.sort(key=lambda item: item[1].shape[0])
 
-        max_batch = min(self.inference_batch_size, int(metadata["profile"]["max"]["batch"]))
+        max_batch = min(self.inference_batch_size, _TENSORRT_INFERENCE_BATCH_SIZE)
         with torch.inference_mode():
             for start in range(0, len(prepared), max_batch):
                 group = prepared[start : start + max_batch]
