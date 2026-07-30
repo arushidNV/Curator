@@ -17,7 +17,20 @@ from unittest.mock import MagicMock
 
 import torch
 
-from nemo_curator.stages.audio.inference.sortformer_tensorrt import TensorRTSortformer
+from nemo_curator.stages.audio.inference.sortformer_tensorrt import (
+    TensorRTSortformer,
+    _create_state_modules,
+)
+
+
+def _state_config() -> dict:
+    return {
+        "spkcache_refresh_rate": 188,
+        "spkcache_len": 264,
+        "fifo_len": 0,
+        "emb_dim": 4,
+        "num_speakers": 8,
+    }
 
 
 def _cpu_feature_runtime() -> TensorRTSortformer:
@@ -49,6 +62,37 @@ def test_streaming_stft_matches_full_stft_across_blocks() -> None:
     actual = torch.cat(list(runtime._waveform_feature_blocks(waveform)))
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_passes_learned_silence_to_updated_runtime_module() -> None:
+    class UpdatedModules:
+        def __init__(self, learnable_sil_emb: torch.Tensor | None = None, **_kwargs) -> None:
+            self.learnable_sil_emb = learnable_sil_emb
+
+    learned_silence = torch.arange(4, dtype=torch.float32)
+    modules = _create_state_modules(
+        SimpleNamespace(SortformerModules=UpdatedModules),
+        _state_config(),
+        learned_silence,
+    )
+
+    assert modules.learnable_sil_emb is learned_silence
+
+
+def test_applies_learned_silence_to_legacy_runtime_module() -> None:
+    class LegacyModules:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+    learned_silence = torch.arange(4, dtype=torch.float32)
+    modules = _create_state_modules(
+        SimpleNamespace(SortformerModules=LegacyModules),
+        _state_config(),
+        learned_silence,
+    )
+
+    actual = modules._get_silence_profile(torch.zeros((3, 2, 4)), torch.zeros((3, 2, 8)))
+    torch.testing.assert_close(actual, learned_silence.expand(3, -1))
 
 
 def test_streaming_inference_preserves_chunk_grid_and_context() -> None:
