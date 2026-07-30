@@ -79,6 +79,7 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     fallback_source_label: str = "fallback"
     reference_text_key: str | None = None
     use_reference_on_hallucination: bool = False
+    force_reference: bool = False
     reference_source_label: str = "reference"
     ground_truth_source_label: str = "ground_truth"
     name: str = "SelectBestPrediction"
@@ -98,6 +99,18 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
         asr_pred = task.data.get(self.asr_text_key, "")
         notes = task.data.get(self.notes_key, {})
         skip_me = str(task.data.get(self.skip_me_key, ""))
+
+        # Forced ground truth: best_prediction is ALWAYS the reference text
+        # (e.g. granary_v1_prediction). Primary/fallback predictions remain
+        # recorded on the task but never influence the final text. Used for
+        # languages where model output is not trusted for the final transcript.
+        if self.force_reference and self.reference_text_key:
+            ref_text = str(task.data.get(self.reference_text_key, "") or "").strip()
+            task.data[self.output_key] = ref_text
+            task.data[self.source_key] = self.ground_truth_source_label
+            task.data[self.skip_me_key] = ""
+            set_note(task.data, self.name, "forced:ground_truth", self.notes_key)
+            return task
 
         notes_dict = notes if isinstance(notes, dict) else {}
         primary_lang_skipped = "lang_not_supported" in str(notes_dict.get(self.primary_text_key, ""))
