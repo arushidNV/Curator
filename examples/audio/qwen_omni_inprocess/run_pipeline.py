@@ -112,10 +112,7 @@ INDIC_CONFORMER_HYBRID_DEFAULT_MODEL_ID = "ai4bharat/indicconformer_stt_{lang}_h
 # faster-whisper alias; equivalent HF openai/whisper-large-v3 in Transformers format.
 WHISPER_DEFAULT_MODEL = "large-v3"
 PARAKEET_V3_DEFAULT_MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
-PARAKEET_RIVA_DEFAULT_MODEL_ID = (
-    "/lustre/fsw/portfolios/llmservice/users/ntadevosyan/projects/granary-v2-asr/"
-    "checkpoints/parakeet_1.1b_indic_multilingual_v1.0_epoch_37.nemo"
-)
+PARAKEET_RIVA_DEFAULT_MODEL_ID = None
 
 # Recommended language codes for each primary inference model (used for auto-selection via --language).
 QWEN_OMNI_RECOMMENDED_LANGS = {
@@ -344,6 +341,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help=(
             "Manifest field to use as reference text when --use_reference_on_hallucination is set. "
             "Typically 'granary_v1_prediction' (the original 'text' field renamed by InitializeFields)."
+        ),
+    )
+    tf.add_argument(
+        "--fallback_record_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the recovery model and record its output in fallback_model_prediction, but EXCLUDE "
+            "that field from best_prediction selection. best_prediction is then decided between the "
+            "primary prediction and --reference_text_key (on hallucination) exactly as if there were "
+            "no recovery model. Skips the recovery hallucination re-check so it cannot clear the "
+            "primary's hallucination flag."
+        ),
+    )
+    tf.add_argument(
+        "--best_prediction_source",
+        type=str,
+        choices=["model", "reference"],
+        default="model",
+        help=(
+            "How best_prediction is chosen. 'model' (default): decide between the primary prediction "
+            "and --reference_text_key on hallucination (normal selection). 'reference': best_prediction "
+            "is ALWAYS --reference_text_key (the ground-truth granary_v1_prediction), so every downstream "
+            "stage (regex, abbreviation) runs on ground truth. Primary/fallback are still recorded as "
+            "fields. Used for languages where model output is not trusted for the final transcript."
         ),
     )
 
@@ -947,9 +969,12 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 num_workers_override=args.fallback_num_workers,
             )
 
-        stages.extend(
-            [
-                recovery_stage,
+        stages.append(recovery_stage)
+        # In record-only mode the recovery output is kept as a field but must NOT
+        # influence selection, so we skip the recovery hallucination re-check (which
+        # would otherwise clear the primary's hallucination flag on a clean fallback).
+        if not args.fallback_record_only:
+            stages.append(
                 WhisperHallucinationStage(
                     name="WhisperHallucination_asr",
                     common_hall_file=args.hall_phrases,
@@ -961,17 +986,24 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                     long_word_threshold=args.long_word_threshold,
                     long_word_rel_threshold=args.long_word_rel_threshold,
                     max_char_rate=args.max_char_rate,
-                ),
-            ]
-        )
+                )
+            )
 
+    # Record-only: point selection at an unused key so the fallback is ignored and
+    # best_prediction is decided purely between primary and the reference text.
+    select_asr_key = "__fallback_recorded_only__" if args.fallback_record_only else "fallback_model_prediction"
+    force_reference = args.best_prediction_source == "reference"
+    if force_reference and not args.reference_text_key:
+        msg = "--best_prediction_source reference requires --reference_text_key."
+        raise SystemExit(msg)
     stages.append(
         SelectBestPredictionStage(
             primary_text_key=primary_text_key,
-            asr_text_key="fallback_model_prediction",
+            asr_text_key=select_asr_key,
             primary_source_label="primary",
             reference_text_key=args.reference_text_key,
             use_reference_on_hallucination=args.use_reference_on_hallucination,
+            force_reference=force_reference,
         )
     )
 
