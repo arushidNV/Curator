@@ -490,13 +490,14 @@ class CanaryEncoder:
 class CanaryDecoding:
     """Transformer decoder TensorRT-LLM engine (C++ static-batch session)."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         engine_dir: Path,
         tokenizer: CanaryTokenizer,
         debug_mode: bool = False,
         device: str = "cuda:0",
-        kv_cache_free_gpu_memory_fraction: float = 0.3,
+        kv_cache_free_gpu_memory_fraction: float = 0.2,
+        cross_kv_cache_fraction: float = 0.2,
     ):
         self.tokenizer = tokenizer
         self.decoder_config = read_config("decoder", engine_dir)
@@ -507,6 +508,7 @@ class CanaryDecoding:
         self.max_input_len = self.decoder_config["max_input_len"]
         self.device = device
         self.kv_cache_free_gpu_memory_fraction = kv_cache_free_gpu_memory_fraction
+        self.cross_kv_cache_fraction = cross_kv_cache_fraction
         self.decoder_generation_session = self._get_cpp_session(engine_dir, debug_mode)
 
     def _get_cpp_session(self, engine_dir: Path, debug_mode: bool = False) -> Any:
@@ -518,12 +520,8 @@ class CanaryDecoding:
             "max_output_len": self.max_seq_len - self.max_input_len,
             "max_beam_width": self.decoder_config["max_beam_width"],
             "debug_mode": debug_mode,
-            # 0.9 assumes Canary owns the whole GPU. In the metadata-extraction pipeline it
-            # co-resides with Sortformer/VAD/SED/SpeechBrain on one GPU, and TRT-LLM's KV-cache
-            # grab is invisible to Ray's gpu_memory_gb scheduler, so 0.9 (~70GB) starves the
-            # other stages -> CUDA OOM. Bound it (configurable) to fit the shared budget.
             "kv_cache_free_gpu_memory_fraction": self.kv_cache_free_gpu_memory_fraction,
-            "cross_kv_cache_fraction": 0.5,
+            "cross_kv_cache_fraction": self.cross_kv_cache_fraction,
         }
         # KVCacheType is imported for parity with the reference runner's config path.
         _ = KVCacheType
@@ -589,7 +587,8 @@ class CanaryTRTLLM:
         engine_dir: str | Path,
         debug_mode: bool = False,
         device: str = "cuda:0",
-        kv_cache_free_gpu_memory_fraction: float = 0.3,
+        kv_cache_free_gpu_memory_fraction: float = 0.2,
+        cross_kv_cache_fraction: float = 0.2,
     ):
         self.device = device
         world_size = 1
@@ -629,6 +628,7 @@ class CanaryTRTLLM:
             debug_mode=debug_mode,
             device=self.device,
             kv_cache_free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+            cross_kv_cache_fraction=cross_kv_cache_fraction,
         )
 
     def process_batch(

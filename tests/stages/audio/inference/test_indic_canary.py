@@ -47,6 +47,26 @@ def _make_task(lang: str, n: int = 8000) -> AudioTask:
     )
 
 
+class TestKvCacheConfig:
+    def test_default_kv_cache_fractions(self) -> None:
+        eng = IndicCanaryTRTLLMASR(engine_dir="canary_engine")
+        stage = InferenceIndicCanaryStage(engine_dir="canary_engine")
+        assert eng.kv_cache_free_gpu_memory_fraction == 0.2
+        assert eng.cross_kv_cache_fraction == 0.2
+        assert stage.kv_cache_free_gpu_memory_fraction == 0.2
+        assert stage.cross_kv_cache_fraction == 0.2
+
+    def test_create_model_forwards_kv_cache_fractions(self) -> None:
+        stage = InferenceIndicCanaryStage(
+            engine_dir="canary_engine",
+            kv_cache_free_gpu_memory_fraction=0.11,
+            cross_kv_cache_fraction=0.22,
+        )
+        model = stage._create_model()
+        assert model.kv_cache_free_gpu_memory_fraction == 0.11
+        assert model.cross_kv_cache_fraction == 0.22
+
+
 class TestStageContract:
     def test_inputs_outputs(self) -> None:
         stage = InferenceIndicCanaryStage(engine_dir="canary_engine")

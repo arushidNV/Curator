@@ -36,7 +36,8 @@ Pipeline:
         -> SqueezeWaveformStage (flatten VAD output shape)
         -> SEDInferenceStage (sound event detection on each segment) [optional]
         -> SEDPostprocessingStage (converts framewise probs to event labels) [optional]
-        -> LangID: AmberNet (NeMo, 20 langs) or SpeechBrain VoxLingua107 (107 langs) or Indic Canary (Indic, 23 langs)
+        -> LangID: AmberNet (NeMo, 20 langs) or SpeechBrain VoxLingua107 (107 langs);
+             with --indic, a second Indic Canary pass + dual-agreement selection
         -> NeMoSpeechWriterStage (encodes to opus at 16kHz)
 """
 
@@ -59,17 +60,6 @@ from nemo_curator.stages.audio.segmentation import VADSegmentationStage
 from nemo_curator.stages.audio.text_filtering.select_best_lid_prediction import SelectBestLIDPredictionStage
 from nemo_curator.stages.resources import Resources
 
-# Per-model LID keys used during two-pass Indic LID. The primary (SpeechBrain/AmberNet)
-# and secondary (Indic Canary) predictions are kept side by side; the final unified
-# result lands in "source_lang" / "source_lid_confidence" (used by all later stages).
-_PRIMARY_LANG_KEY = "primary_lang_pred"
-_PRIMARY_CONF_KEY = "primary_lid_confidence"
-_SECONDARY_LANG_KEY = "secondary_lang_pred"
-_SECONDARY_CONF_KEY = "secondary_lid_confidence"
-# Final unified language ID (SelectBestLIDPrediction output) consumed downstream.
-_FINAL_LANG_KEY = "source_lang"
-_FINAL_CONF_KEY = "source_lid_confidence"
-
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Metadata extraction pipeline for unsegmented audio")
@@ -87,7 +77,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--indic",
         action="store_true",
         default=False,
-        help="Enable two-pass Indic LID: primary LID + Indic Canary secondary + best-prediction selection.",
+        help="Enable two-pass Indic LID: primary LID + Indic Canary secondary with dual-agreement selection.",
     )
     ap.add_argument(
         "--indic_canary_engine_dir",
@@ -96,12 +86,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Path to prebuilt Indic Canary TRT-LLM engine directory. Required when --indic is set.",
     )
     ap.add_argument(
-        "--indic_canary_lid_max_duration_sec",
+        "--indic_canary_kv_cache_free_gpu_memory_fraction",
         type=float,
-        default=15.0,
-        help="Truncate each segment to this many seconds before Indic Canary LID. LID needs only "
-        "a few seconds; the stage default (40s) inflates the padded batch / mel + encoder "
-        "activations and drives GPU OOM. 0 = no truncation.",
+        default=0.2,
+        help="Fraction of free GPU memory the Indic Canary TRT-LLM decoder may claim for KV cache "
+        "(default 0.2; raise toward 0.9 only when Canary owns the GPU).",
+    )
+    ap.add_argument(
+        "--indic_canary_cross_kv_cache_fraction",
+        type=float,
+        default=0.2,
+        help="Fraction of the KV-cache budget reserved for cross-attention "
+        "(default 0.2; keep low when Canary shares a GPU).",
     )
     ap.add_argument(
         "--resampled_output_dir",
@@ -109,34 +105,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory to write resampled 16kHz mono WAV files. The output filename matches the input stem with a .wav extension.",
     )
-    ap.add_argument(
-        "--resampled_subtype",
-        type=str,
-        default="FLOAT",
-        help="soundfile subtype for resampled WAV files. Use FLOAT (lossless) — PCM_16 "
-        "quantization changes streaming-Sortformer diarization output.",
-    )
-
 
     vad = ap.add_argument_group("VAD (Silero)")
     vad.add_argument(
-        "--vad_threshold", type=float, default=0.5,
+        "--vad_threshold",
+        type=float,
+        default=0.5,
         help="VAD confidence threshold (0.5 is Silero's recommended default).",
     )
     vad.add_argument(
-        "--min_duration_sec", type=float, default=0.5,
+        "--min_duration_sec",
+        type=float,
+        default=0.5,
         help="Minimum segment duration (seconds). Segments shorter than this are discarded.",
     )
     vad.add_argument(
-        "--max_duration_sec", type=float, default=40.0,
+        "--max_duration_sec",
+        type=float,
+        default=40.0,
         help="Maximum segment duration (seconds). Longer speech regions are split.",
     )
     vad.add_argument(
-        "--speech_pad_ms", type=int, default=100,
+        "--speech_pad_ms",
+        type=int,
+        default=100,
         help="Silero VAD internal padding (ms) — extends detected speech boundaries to avoid cutting onsets/offsets.",
     )
     vad.add_argument(
-        "--min_interval_ms", type=int, default=500,
+        "--min_interval_ms",
+        type=int,
+        default=500,
         help="Minimum silence gap (ms) between speech segments — higher values merge more, reducing short segments.",
     )
     vad.add_argument("--vad_gpu_memory_gb", type=float, default=4.0, help="GPU memory for VAD stage.")
@@ -148,28 +146,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     sed.add_argument("--sed_batch_size", type=int, default=32, help="SED GPU batch size.")
     sed.add_argument("--sed_gpu_memory_gb", type=float, default=4.0, help="GPU memory for SED stage.")
     sed.add_argument(
-        "--sed_emit_superclasses", type=lambda x: x.lower() not in ("false", "0", "no"),
+        "--sed_emit_superclasses",
+        type=lambda x: x.lower() not in ("false", "0", "no"),
         default=True,
         help="Emit superclass labels only — speech/music/noise (default: True). Set to False for all 527 AudioSet classes.",
     )
 
     lid = ap.add_argument_group("Language ID")
     lid.add_argument(
-        "--langid_backend", type=str, default="speechbrain", choices=["ambernet", "speechbrain"],
+        "--langid_backend",
+        type=str,
+        default="speechbrain",
+        choices=["ambernet", "speechbrain"],
         help="LangID backend: 'speechbrain' (VoxLingua107, 107 languages, default) or 'ambernet' (NeMo, 20 languages).",
     )
     lid.add_argument("--langid_model", type=str, default=None, help="Model name/path (default depends on backend).")
     lid.add_argument("--langid_gpu_memory_gb", type=float, default=4.0, help="GPU memory for LangID stage.")
     lid.add_argument(
-        "--langid_max_workers", type=int, default=2,
+        "--langid_max_workers",
+        type=int,
+        default=2,
         help="Hard cap on concurrent LangID actors per GPU (0/negative = executor autoscales). "
         "Default 2: prevents the autoscaler from packing ~10 actors on one GPU (a common "
         "SpeechBrain OOM cause when co-resident with other GPU stages).",
-    )
-    lid.add_argument(
-        "--langid_max_duration_sec", type=float, default=10.0,
-        help="Truncate each segment to this many seconds before LangID. LangID needs only a few "
-        "seconds; longer segments inflate the padded batch and drive GPU OOM. 0 = no truncation.",
     )
     lid.add_argument("--langid_batch_size", type=int, default=16, help="LangID inference batch size.")
     lid.add_argument("--skip_langid", action="store_true", default=False, help="Skip language ID stage.")
@@ -193,15 +192,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     io = ap.add_argument_group("I/O")
     io.add_argument(
-        "--max_io_threads", type=int, default=8,
+        "--max_io_threads",
+        type=int,
+        default=8,
         help="Max concurrent threads per reader batch for loading audio from S3/object storage (default: 8).",
     )
     io.add_argument(
-        "--read_concurrency", type=int, default=2,
+        "--read_concurrency",
+        type=int,
+        default=2,
         help="Max parallel Ray reader tasks (default: 2). Increase to overlap more S3/AIS reads.",
     )
     io.add_argument(
-        "--writer_concurrency", type=int, default=1,
+        "--writer_concurrency",
+        type=int,
+        default=1,
         help="Parallel Ray writer actors for opus + manifest output (default: 1).",
     )
 
@@ -210,12 +215,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     ex = ap.add_argument_group("Executor")
     ex.add_argument(
-        "--executor", choices=["ray_data", "xenna"], default="ray_data",
+        "--executor",
+        choices=["ray_data", "xenna"],
+        default="ray_data",
         help="Backend executor. 'xenna' (Cosmos-Xenna) supports batch mode where stages run "
         "sequentially so GPU stages never co-reside (avoids single-GPU OOM/contention).",
     )
     ex.add_argument(
-        "--execution_mode", choices=["streaming", "batch"], default="streaming",
+        "--execution_mode",
+        choices=["streaming", "batch"],
+        default="streaming",
         help="Xenna execution mode: 'batch' materializes each stage before the next (one GPU "
         "stage resident at a time); 'streaming' pipelines them. Only used with --executor xenna.",
     )
@@ -235,11 +244,10 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             max_io_threads=args.max_io_threads,
             read_concurrency=args.read_concurrency,
             resampled_output_dir=args.resampled_output_dir,
-            resampled_subtype=args.resampled_subtype,
-            keep_waveform=False if args.resampled_output_dir else True,
+            keep_waveform=not args.resampled_output_dir,
         ),
     ]
-    
+
     if not args.resampled_output_dir:
         stages.append(MonoDownsampleStage(target_sample_rate=args.target_sample_rate))
 
@@ -292,21 +300,22 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             )
         )
 
-
     if not args.skip_langid:
         langid_max_workers = args.langid_max_workers if args.langid_max_workers > 0 else None
+        if args.indic:
+            primary_out_key, primary_conf_key = "primary_lang_pred", "primary_lid_confidence"
+        else:
+            primary_out_key, primary_conf_key = "source_lang", "source_lid_confidence"
+
         if args.langid_backend == "speechbrain":
             from nemo_curator.stages.audio.inference.speechbrain_langid import SpeechBrainLangIDStage
 
             langid_source = args.langid_model or "speechbrain/lang-id-voxlingua107-ecapa"
-            primary_out_key = _PRIMARY_LANG_KEY if args.indic else _FINAL_LANG_KEY
-            primary_conf_key = _PRIMARY_CONF_KEY if args.indic else _FINAL_CONF_KEY
             stages.append(
                 SpeechBrainLangIDStage(
                     source=langid_source,
                     output_key=primary_out_key,
                     confidence_key=primary_conf_key,
-                    max_duration_sec=args.langid_max_duration_sec,
                     batch_size=args.langid_batch_size,
                     max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
@@ -314,14 +323,11 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             )
         else:
             langid_model = args.langid_model or "langid_ambernet"
-            primary_out_key = _PRIMARY_LANG_KEY if args.indic else _FINAL_LANG_KEY
-            primary_conf_key = _PRIMARY_CONF_KEY if args.indic else _FINAL_CONF_KEY
             stages.append(
                 AmberNetLangIDStage(
                     model_name=langid_model,
                     output_key=primary_out_key,
                     confidence_key=primary_conf_key,
-                    max_duration_sec=args.langid_max_duration_sec,
                     batch_size=args.langid_batch_size,
                     max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
@@ -337,20 +343,17 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             stages.append(
                 IndicCanaryLangIDStage(
                     engine_dir=args.indic_canary_engine_dir,
-                    output_key=_SECONDARY_LANG_KEY,
-                    confidence_key=_SECONDARY_CONF_KEY,
-                    max_duration_sec=args.indic_canary_lid_max_duration_sec,
+                    output_key="secondary_lang_pred",
+                    confidence_key="secondary_lid_confidence",
+                    kv_cache_free_gpu_memory_fraction=args.indic_canary_kv_cache_free_gpu_memory_fraction,
+                    cross_kv_cache_fraction=args.indic_canary_cross_kv_cache_fraction,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
             stages.append(
                 SelectBestLIDPredictionStage(
-                    primary_language_key=_PRIMARY_LANG_KEY,
-                    primary_confidence_key=_PRIMARY_CONF_KEY,
-                    secondary_language_key=_SECONDARY_LANG_KEY,
-                    secondary_confidence_key=_SECONDARY_CONF_KEY,
-                    output_key=_FINAL_LANG_KEY,
-                    confidence_key=_FINAL_CONF_KEY,
+                    primary_lid_model_label=args.langid_backend,
+                    secondary_lid_model_label="indic_canary",
                 )
             )
 

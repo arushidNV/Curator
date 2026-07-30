@@ -81,10 +81,6 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
             return
         from speechbrain.inference.classifiers import EncoderClassifier
 
-        # Isolate savedir per actor. SpeechBrain's fetch into a shared savedir is NOT
-        # concurrency-safe: co-located actors race on the same symlinks and one reads a
-        # half-populated dir -> FileNotFoundError: <savedir>/hyperparams.yaml. A per-PID
-        # savedir removes the race; the node-level pre-fetch keeps each copy a cache hit.
         savedir = os.path.join(self.savedir, f"actor_{os.getpid()}")
         logger.info(f"SpeechBrainLangID: loading model from {self.source} (savedir={savedir})")
         self._classifier = EncoderClassifier.from_hparams(
@@ -127,11 +123,6 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
             batch_tensor[j, : len(sig)] = sig
         wav_lens = torch.tensor([length / max_len for length in audio_lengths])
 
-        # inference_mode is essential here: from_hparams only sets .eval() (dropout/BN),
-        # which does NOT stop autograd. Without this, SpeechBrain's classify_batch builds
-        # a full graph and keeps every activation alive for the whole ECAPA-TDNN forward,
-        # inflating peak GPU memory ~2-3x — the usual cause of OOM on long (up to 40s) VAD
-        # segments, especially with multiple actors packed per GPU.
         with torch.inference_mode():
             _out_prob, score, _index, label = self._classifier.classify_batch(batch_tensor, wav_lens)
 

@@ -100,6 +100,8 @@ class IndicCanaryLangIDStage(BaseLangIDStage):
     max_duration_sec: float = _DEFAULT_MAX_DURATION_SEC
     candidate_langs: list[str] | None = None
     batch_size: int = 32
+    kv_cache_free_gpu_memory_fraction: float = 0.2
+    cross_kv_cache_fraction: float = 0.2
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
 
     model: Any = field(default=None, init=False, repr=False)
@@ -120,7 +122,12 @@ class IndicCanaryLangIDStage(BaseLangIDStage):
         from nemo_curator.stages.audio.inference.indic_canary_trtllm_runtime import CanaryTRTLLM
 
         logger.info(f"IndicCanaryLangID: loading TRT-LLM engine from {self.engine_dir}")
-        self.model = CanaryTRTLLM(self.engine_dir, device="cuda:0")
+        self.model = CanaryTRTLLM(
+            self.engine_dir,
+            device="cuda:0",
+            kv_cache_free_gpu_memory_fraction=self.kv_cache_free_gpu_memory_fraction,
+            cross_kv_cache_fraction=self.cross_kv_cache_fraction,
+        )
         self._language_by_token_id = self._collect_language_token_ids()
         if not self._language_by_token_id:
             msg = "Indic Canary tokenizer has no language special tokens matching candidate_langs"
@@ -244,8 +251,8 @@ class IndicCanaryLangIDStage(BaseLangIDStage):
             padded = [pad_or_trim(audio, pad_len) for audio in chunk]
             durations = [min(max(length, _MIN_DURATION_SAMPLES), pad_len) for length in chunk_lengths]
 
-            decoder_input_ids = torch.tensor(prompt_ids, dtype=torch.int64).repeat(len(padded), 1).to(
-                self.model.device
+            decoder_input_ids = (
+                torch.tensor(prompt_ids, dtype=torch.int64).repeat(len(padded), 1).to(self.model.device)
             )
             stream = torch.cuda.current_stream("cuda")
             mel, mel_input_lengths = self.model.preprocessor.get_feats(padded, durations)

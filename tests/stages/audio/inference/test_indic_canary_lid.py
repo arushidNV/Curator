@@ -65,6 +65,55 @@ class TestStageContract:
         assert out.data["language_confidence"] == 1.0
 
 
+class TestKvCacheConfig:
+    def test_default_kv_cache_fractions(self) -> None:
+        stage = IndicCanaryLangIDStage(engine_dir="canary_engine")
+        assert stage.kv_cache_free_gpu_memory_fraction == 0.2
+        assert stage.cross_kv_cache_fraction == 0.2
+
+    def test_setup_forwards_kv_cache_fractions(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # noqa: ANN001
+        import sys
+        import types
+
+        engine_dir = tmp_path / "engine"
+        for rel in (
+            "encoder/encoder.plan",
+            "decoder/config.json",
+            "decoder/vocab.json",
+            "preprocessor/config.json",
+            "preprocessor/mel_basis.pt",
+        ):
+            path = engine_dir / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}")
+
+        captured: dict[str, float] = {}
+
+        class FakeCanaryTRTLLM:
+            def __init__(self, _engine_dir, device="cuda:0", **kwargs):  # noqa: ANN001
+                del device
+                captured.update(kwargs)
+                self.tokenizer = SimpleNamespace(
+                    prompt_format="canary2",
+                    id_to_token={1: "<|hi|>"},
+                )
+
+        fake_runtime = types.ModuleType("nemo_curator.stages.audio.inference.indic_canary_trtllm_runtime")
+        fake_runtime.CanaryTRTLLM = FakeCanaryTRTLLM
+        monkeypatch.setitem(sys.modules, fake_runtime.__name__, fake_runtime)
+
+        stage = IndicCanaryLangIDStage(
+            engine_dir=str(engine_dir),
+            kv_cache_free_gpu_memory_fraction=0.15,
+            cross_kv_cache_fraction=0.25,
+            candidate_langs=["hi"],
+        )
+        stage.setup()
+
+        assert captured["kv_cache_free_gpu_memory_fraction"] == 0.15
+        assert captured["cross_kv_cache_fraction"] == 0.25
+
+
 class TestSetupOnNode:
     def test_missing_engine_dir_arg_raises(self) -> None:
         stage = IndicCanaryLangIDStage(engine_dir="")

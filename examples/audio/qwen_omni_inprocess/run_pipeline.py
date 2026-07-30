@@ -153,17 +153,49 @@ INDIC_MONOLINGUAL_QWEN_RECOVERY_LANGS = frozenset({"ur"})
 # expected list for the current build (currently the same 22 Indic languages as
 # INDIC_CONFORMER_LANGUAGE_CODES). Kept explicit here for reference/validation when
 # selecting indic_canary as a --primary_model/--recovery_model.
-INDIC_CANARY_SUPPORTED_LANGS = frozenset({
-    "as", "bn", "brx", "doi", "gu", "hi", "kn", "kok", "ks", "mai", "ml", "mni",
-    "mr", "ne", "or", "pa", "sa", "sat", "sd", "ta", "te", "ur",
-})
+INDIC_CANARY_SUPPORTED_LANGS = frozenset(
+    {
+        "as",
+        "bn",
+        "brx",
+        "doi",
+        "gu",
+        "hi",
+        "kn",
+        "kok",
+        "ks",
+        "mai",
+        "ml",
+        "mni",
+        "mr",
+        "ne",
+        "or",
+        "pa",
+        "sa",
+        "sat",
+        "sd",
+        "ta",
+        "te",
+        "ur",
+    }
+)
 # Default recovery model paired with each primary (when --recovery_model is not set):
 #   qwen_omni → qwen_asr;  qwen_asr → whisper;  parakeet_v3 → whisper;  whisper → parakeet_v3
 #   parakeet_riva (hi/ta/bn) → indic_monolingual;  indic_monolingual → none (except ur → qwen_omni)
 #   he is whisper primary with recovery none (Whisper Large V3 only)
 
+_PRIMARY_TO_RECOVERY = {
+    "qwen_omni": "qwen_asr",
+    "qwen_asr": "whisper",
+    "parakeet_v3": "whisper",
+    "whisper": "parakeet_v3",
+    "parakeet_riva": "indic_monolingual",
+    "indic_monolingual": "none",
+    "indic_canary": "none",
+}
 
-def _build_arg_parser() -> argparse.ArgumentParser:
+
+def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     ap = argparse.ArgumentParser(description="QwenOmni in-process vLLM pipeline")
     ap.add_argument("--data_config", type=str, required=True, help="Granary YAML data config.")
     ap.add_argument("--corpus", type=str, nargs="*", default=None, help="Process only these corpora.")
@@ -443,6 +475,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Max generated tokens for the Indic Canary TRT-LLM engine.",
     )
     asr.add_argument(
+        "--indic_canary_kv_cache_free_gpu_memory_fraction",
+        type=float,
+        default=0.2,
+        help="Fraction of free GPU memory the Indic Canary TRT-LLM decoder may claim for KV cache.",
+    )
+    asr.add_argument(
+        "--indic_canary_cross_kv_cache_fraction",
+        type=float,
+        default=0.2,
+        help="Fraction of the Indic Canary KV-cache budget reserved for cross-attention.",
+    )
+    asr.add_argument(
         "--whisper_model_size_or_path",
         type=str,
         default=WHISPER_DEFAULT_MODEL,
@@ -514,7 +558,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def _resolve_language_flags(args: argparse.Namespace) -> None:
+def _resolve_language_flags(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912
     """Derive primary_model and recovery_model from --language.
 
     --primary_model and --recovery_model take priority when set explicitly;
@@ -531,10 +575,11 @@ def _resolve_language_flags(args: argparse.Namespace) -> None:
         | INDIC_CANARY_SUPPORTED_LANGS
     )
     if lang not in all_known:
-        raise SystemExit(
+        msg = (
             f"Unknown --language '{lang}'. Supported codes: {sorted(all_known)}. "
             "Or omit --language and set --primary_model / --recovery_model manually."
         )
+        raise SystemExit(msg)
     primary_was_explicit = args.primary_model is not None
     recovery_was_explicit = args.recovery_model is not None
     if not primary_was_explicit:
@@ -598,29 +643,21 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             system_prompt = args.system_prompt
 
     # Auto-derive recovery_model from primary when not set by --recovery_model or --language.
-    _PRIMARY_TO_RECOVERY = {
-        "qwen_omni": "qwen_asr",
-        "qwen_asr": "whisper",
-        "parakeet_v3": "whisper",
-        "whisper": "parakeet_v3",
-        "parakeet_riva": "indic_monolingual",
-        "indic_monolingual": "none",
-        "indic_canary": "none",
-    }
-
     def _resolve_indic_monolingual_model_id() -> str:
         mid = args.indic_monolingual_model_id
         if "{lang}" in mid:
             if not args.language:
-                raise SystemExit("--indic_monolingual_model_id uses '{lang}' but --language is not set.")
+                msg = "--indic_monolingual_model_id uses '{lang}' but --language is not set."
+                raise SystemExit(msg)
             mid = mid.format(lang=args.language.lower().strip())
         return mid
 
     if args.primary_model is None:
-        raise SystemExit(
+        msg = (
             "Either --language <code> or --primary_model "
             "{qwen_omni,qwen_asr,whisper,parakeet_v3,parakeet_riva,indic_monolingual,indic_canary} is required."
         )
+        raise SystemExit(msg)
     if args.recovery_model is None:
         args.recovery_model = _PRIMARY_TO_RECOVERY[args.primary_model]
     has_recovery = args.recovery_model != "none"
@@ -781,13 +818,16 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
 
     elif args.primary_model == "indic_canary":
         if not args.indic_canary_engine_dir:
-            raise SystemExit("--primary_model indic_canary requires --indic_canary_engine_dir.")
+            msg = "--primary_model indic_canary requires --indic_canary_engine_dir."
+            raise SystemExit(msg)
         stages.append(
             InferenceIndicCanaryStage(
                 name="IndicCanary_primary",
                 engine_dir=args.indic_canary_engine_dir,
                 num_beams=args.indic_canary_num_beams,
                 max_new_tokens=args.indic_canary_max_new_tokens,
+                kv_cache_free_gpu_memory_fraction=args.indic_canary_kv_cache_free_gpu_memory_fraction,
+                cross_kv_cache_fraction=args.indic_canary_cross_kv_cache_fraction,
                 source_lang_key=args.source_lang_key,
                 pred_text_key="primary_model_prediction",
                 keep_waveform=has_recovery,
@@ -892,12 +932,15 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             )
         elif args.recovery_model == "indic_canary":
             if not args.indic_canary_engine_dir:
-                raise SystemExit("--recovery_model indic_canary requires --indic_canary_engine_dir.")
+                msg = "--recovery_model indic_canary requires --indic_canary_engine_dir."
+                raise SystemExit(msg)
             recovery_stage = InferenceIndicCanaryStage(
                 name="IndicCanary_recovery",
                 engine_dir=args.indic_canary_engine_dir,
                 num_beams=args.indic_canary_num_beams,
                 max_new_tokens=args.indic_canary_max_new_tokens,
+                kv_cache_free_gpu_memory_fraction=args.indic_canary_kv_cache_free_gpu_memory_fraction,
+                cross_kv_cache_fraction=args.indic_canary_cross_kv_cache_fraction,
                 source_lang_key=args.source_lang_key,
                 pred_text_key="fallback_model_prediction",
                 batch_size=args.asr_batch_size,

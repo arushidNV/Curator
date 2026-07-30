@@ -90,13 +90,15 @@ class IndicCanaryTRTLLMASR(ModelInterface):
         pnc: bool = False,
         max_duration_sec: float = _DEFAULT_MAX_DURATION_SEC,
         min_duration_sec: float = _DEFAULT_MIN_DURATION_SEC,
-        kv_cache_free_gpu_memory_fraction: float = 0.3,
+        kv_cache_free_gpu_memory_fraction: float = 0.2,
+        cross_kv_cache_fraction: float = 0.2,
     ):
         self.engine_dir = engine_dir
         self.num_beams = num_beams
         self.max_new_tokens = max_new_tokens
         self.pnc = pnc
         self.kv_cache_free_gpu_memory_fraction = kv_cache_free_gpu_memory_fraction
+        self.cross_kv_cache_fraction = cross_kv_cache_fraction
         # Window bounds in samples. max clips overly long clips to the encoder's
         # build-time window; min sets the floor the batch is zero-padded up to.
         # min is capped at max so a misconfigured min_duration_sec can never pad
@@ -118,6 +120,7 @@ class IndicCanaryTRTLLMASR(ModelInterface):
             self.engine_dir,
             device="cuda:0",
             kv_cache_free_gpu_memory_fraction=self.kv_cache_free_gpu_memory_fraction,
+            cross_kv_cache_fraction=self.cross_kv_cache_fraction,
         )
         logger.info(
             f"Indic Canary ready: prompt_format={self._model.tokenizer.prompt_format}, "
@@ -271,10 +274,8 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
     pnc: bool = False
     max_duration_sec: float = _DEFAULT_MAX_DURATION_SEC
     min_duration_sec: float = _DEFAULT_MIN_DURATION_SEC
-    # Fraction of free GPU memory TRT-LLM may claim for its KV cache. Keep low
-    # (~0.3) when Canary shares a GPU with other stages (metadata-extraction
-    # pipeline); raise toward 0.9 when it owns the whole GPU (dedicated ASR).
-    kv_cache_free_gpu_memory_fraction: float = 0.3
+    kv_cache_free_gpu_memory_fraction: float = 0.2
+    cross_kv_cache_fraction: float = 0.2
     source_lang_key: str = "source_lang"
     waveform_key: str = "waveform"
     sample_rate_key: str = "sampling_rate"
@@ -306,6 +307,7 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
             max_duration_sec=self.max_duration_sec,
             min_duration_sec=self.min_duration_sec,
             kv_cache_free_gpu_memory_fraction=self.kv_cache_free_gpu_memory_fraction,
+            cross_kv_cache_fraction=self.cross_kv_cache_fraction,
         )
 
     def setup_on_node(
@@ -365,7 +367,7 @@ class InferenceIndicCanaryStage(ProcessingStage[AudioTask, AudioTask]):
                 set_note(task.data, self.name, f"skipped (unsupported language: {lang})", self.notes_key)
         return eligible
 
-    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:  # noqa: C901
         if len(tasks) == 0:
             return []
         if self._model is None:
