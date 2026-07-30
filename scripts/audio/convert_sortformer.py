@@ -89,6 +89,13 @@ def tar_member_bytes(archive: Path, accepted_names: set[str]) -> bytes:
     )
 
 
+def _optional_tar_member_bytes(archive: Path, accepted_names: set[str]) -> bytes | None:
+    try:
+        return tar_member_bytes(archive, accepted_names)
+    except FileNotFoundError:
+        return None
+
+
 def add_bytes(bundle: tarfile.TarFile, name: str, data: bytes):
     info = tarfile.TarInfo(name)
     info.size = len(data)
@@ -324,6 +331,26 @@ def riva_to_trt(riva_path: Path, engine_path: Path, args):
     )
     model_config = yaml.safe_load(config_bytes)
     parameters = model_parameters(model_config, args)
+    learned_silence_bytes = _optional_tar_member_bytes(
+        riva_path,
+        {"artifacts/learnable_sil_emb.npy", "learnable_sil_emb.npy"},
+    )
+    uses_learned_silence = bool(
+        nested(model_config, "sortformer_modules", "use_learnable_sil_emb", default=False)
+    )
+    if uses_learned_silence and learned_silence_bytes is None:
+        msg = f"{riva_path} enables use_learnable_sil_emb but does not contain learnable_sil_emb.npy"
+        raise FileNotFoundError(msg)
+    if learned_silence_bytes is not None:
+        learned_silence = np.load(io.BytesIO(learned_silence_bytes), allow_pickle=False)
+        expected_shape = (parameters["emb_dim"],)
+        if learned_silence.dtype != np.float32 or learned_silence.shape != expected_shape:
+            msg = (
+                "Invalid learnable_sil_emb.npy: "
+                f"dtype={learned_silence.dtype}, shape={learned_silence.shape}; "
+                f"expected dtype=float32, shape={expected_shape}"
+            )
+            raise ValueError(msg)
 
     with tempfile.TemporaryDirectory(prefix="sortformer-trt-") as temporary:
         onnx_path = Path(temporary) / "model_graph.onnx"
@@ -351,6 +378,10 @@ def riva_to_trt(riva_path: Path, engine_path: Path, args):
     ).astype(np.float32)
     mel_path = engine_path.parent / "mel_basis.npy"
     np.save(mel_path, mel_basis)
+    learned_silence_path = None
+    if learned_silence_bytes is not None:
+        learned_silence_path = engine_path.parent / "learnable_sil_emb.npy"
+        learned_silence_path.write_bytes(learned_silence_bytes)
 
     copy_runtime_module(engine_path.parent, args.runtime_modules)
     runtime_config = {
@@ -361,6 +392,8 @@ def riva_to_trt(riva_path: Path, engine_path: Path, args):
         "source_riva_sha256": sha256(riva_path),
         "engine_sha256": sha256(engine_path),
     }
+    if learned_silence_path is not None:
+        runtime_config["learnable_sil_emb"] = learned_silence_path.name
     config_path = engine_path.with_suffix(".json")
     config_path.write_text(json.dumps(runtime_config, indent=2) + "\n")
     print(
@@ -368,6 +401,8 @@ def riva_to_trt(riva_path: Path, engine_path: Path, args):
         f"Wrote {config_path}\n"
         f"Wrote {mel_path}"
     )
+    if learned_silence_path is not None:
+        print(f"Wrote {learned_silence_path}")
 
 
 def add_trt_arguments(parser):
