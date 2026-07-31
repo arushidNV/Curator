@@ -378,9 +378,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             manifest_entry["offset"] = task.data["start_ms"] / 1000.0
         if "end_ms" in task.data:
             manifest_entry["original_end"] = task.data["end_ms"] / 1000.0
-        # Final unified language (SelectBestLIDPrediction). Fall back to the catalogued
-        # original_language when LID was skipped so downstream always has source_lang.
-        source_lang = task.data.get("source_lang") or task.data.get("original_language")
+        source_lang = task.data.get("source_lang")
         if source_lang:
             manifest_entry["source_lang"] = source_lang
         if "source_lid_confidence" in task.data:

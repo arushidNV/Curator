@@ -117,7 +117,7 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
                 )
 
     def process(self, task: AudioTask) -> AudioTask:  # noqa: C901
-        lid_entries = task.data.get(self.lid_key, [])
+        lid_entries = task.data.pop(self.lid_key, [])
         if not lid_entries:
             task.data[self.skip_me_key] = "skipped due to missing langID predictions."
             set_note(task.data, self.name, "skipped (missing predictions)", self.notes_key)
@@ -136,7 +136,7 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
                 elif model_name == "IndicCanaryLangID":
                     canary_result = result
 
-        if sb_result is None:
+        if sb_result is None or len(sb_result.language)==0:
             task.data[self.skip_me_key] = "skipped due to missing primary langID prediction."
             set_note(task.data, self.name, "skipped (missing primary)", self.notes_key)
             return task
@@ -153,8 +153,8 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
                 )
                 return task
             if canary_result.language == sb_result.language:
-                task.data[self.output_key] = sb_result.language
-                task.data[self.confidence_key] = float(sb_result.confidence)
+                task.data[self.output_key] = canary_result.language
+                task.data[self.confidence_key] = float(canary_result.confidence)
                 set_note(
                     task.data,
                     self.name,
