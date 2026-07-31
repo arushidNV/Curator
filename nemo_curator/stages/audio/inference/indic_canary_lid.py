@@ -30,7 +30,7 @@ from nemo_curator.stages.audio.inference.indic_canary import (
     _MIN_DURATION_SAMPLES,
     _TARGET_SR,
 )
-from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage
+from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage, LangIDResult
 from nemo_curator.stages.resources import Resources
 
 if TYPE_CHECKING:
@@ -176,8 +176,8 @@ class IndicCanaryLangIDStage(BaseLangIDStage):
 
         for task_idx, lang, confidence in zip(valid_indices, languages, confidences, strict=True):
             task = tasks[task_idx]
-            task.data[self.output_key] = lang
-            task.data[self.confidence_key] = confidence
+            lid_result = LangIDResult(language=lang, confidence=confidence, tag=self.tag)
+            task.data.setdefault(self.lid_key, []).append({self.name: lid_result})
 
         return tasks
 

@@ -26,14 +26,17 @@ import torch
 
 from nemo_curator.stages.audio.inference import indic_canary as indic_canary_mod
 from nemo_curator.stages.audio.inference.indic_canary import (
-    _MAX_SAMPLES,
+    _DEFAULT_MAX_DURATION_SEC,
+    _DEFAULT_MIN_DURATION_SEC,
     _MIN_DURATION_SAMPLES,
-    _MIN_SAMPLES,
     _TARGET_SR,
     IndicCanaryTRTLLMASR,
     InferenceIndicCanaryStage,
 )
 from nemo_curator.tasks import AudioTask
+
+_MIN_SAMPLES = int(_DEFAULT_MIN_DURATION_SEC * _TARGET_SR)
+_MAX_SAMPLES = int(_DEFAULT_MAX_DURATION_SEC * _TARGET_SR)
 
 
 def _make_task(lang: str, n: int = 8000) -> AudioTask:

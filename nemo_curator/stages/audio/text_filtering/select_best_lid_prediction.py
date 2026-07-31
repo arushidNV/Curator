@@ -12,101 +12,170 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dual-agreement language-ID selection between a primary model and Indic Canary.
+"""Select the best language-ID prediction from SpeechBrain/AmberNet and Indic Canary.
 
-Assigns ``source_lang`` only when both models predict the same language code.
-On disagreement, sets ``_skipme`` and records both predictions in ``additional_notes``.
+Reads ``LangIDResult`` entries from ``task.data[lid_key]`` (tagged ``primary`` /
+``secondary``). Routing:
+
+- SpeechBrain predicted a **non-Indic** language → keep the SpeechBrain prediction.
+- SpeechBrain predicted an **Indic** language → use Indic Canary as ``source_lang``.
+  If both models agree on the language code, record an agreement note; otherwise
+  record disagreement and set ``_skipme``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from nemo_curator.stages.audio.inference.langid_base import LangIDResult
 from nemo_curator.stages.audio.pipeline_utils import set_note
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
 
-_DISAGREEMENT_SKIP_REASON = "skipped due to disagreement between primary and secondary langID model."
+_DEFAULT_INDIC_LANGUAGES: frozenset[str] = frozenset(
+    {
+        "hi",
+        "ta",
+        "bn",
+        "ur",
+        "gu",
+        "mr",
+        "ml",
+        "kn",
+        "te",
+        "or",
+        "as",
+        "pa",
+        "ne",
+        "sa",
+        "sd",
+        "si",
+        "kok",
+        "mai",
+        "doi",
+        "ks",
+        "mni",
+        "sat",
+        "brx",
+        "bo",
+    }
+)
+
+_MODEL_LABELS = {
+    "SpeechBrainLangID": "speechbrain",
+    "AmberNetLangID": "ambernet",
+    "IndicCanaryLangID": "indic_canary",
+}
 
 
-def _normalize_lang_code(raw: object) -> str:
-    """Normalize a LID prediction to a lowercase ISO code.
-
-    SpeechBrain may return ``"ta: Tamil"`` — keep only the code before the colon.
-    """
-    text = str(raw or "").strip()
-    if not text:
-        return ""
-    return text.split(":", 1)[0].strip().lower()
+def _model_label(model_name: str) -> str:
+    return _MODEL_LABELS.get(model_name, model_name)
 
 
 @dataclass
 class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
-    """Keep ``source_lang`` only when primary and secondary LID predictions agree.
-
-    Intermediate primary/secondary task keys are removed from the output. Model
-    identity and per-model predictions are recorded in ``additional_notes``,
-    mirroring how ASR records ``primary_model`` / ``recovery_model`` /
-    ``SelectBestPrediction``.
+    """Route LID using primary Indic detection, with agreement notes vs Canary.
 
     Args:
-        primary_language_key: Task data key holding the primary (SpeechBrain/AmberNet) language prediction.
-        primary_confidence_key: Task data key holding the primary model's confidence score.
-        secondary_language_key: Task data key holding the secondary (Indic Canary) language prediction.
-        secondary_confidence_key: Task data key holding the secondary model's confidence score.
+        lid_key: Task data key holding the list of LID results.
         output_key: Task data key for the finalized language (default ``source_lang``).
-        confidence_key: Task data key for the finalized confidence score (default ``source_lid_confidence``).
+        confidence_key: Task data key for the finalized confidence score.
         skip_me_key: Task data key for the shared skip flag.
         notes_key: Task data key for pipeline notes.
-        primary_lid_model_label: Value written to ``additional_notes["primary_lid_model"]``.
-        secondary_lid_model_label: Value written to ``additional_notes["secondary_lid_model"]``.
+        indic_languages: Language codes treated as Indic (route to Canary).
     """
 
-    primary_language_key: str = "primary_lang_pred"
-    primary_confidence_key: str = "primary_lid_confidence"
-    secondary_language_key: str = "secondary_lang_pred"
-    secondary_confidence_key: str = "secondary_lid_confidence"
+    lid_key: str = "lid"
     output_key: str = "source_lang"
     confidence_key: str = "source_lid_confidence"
     skip_me_key: str = "_skipme"
     notes_key: str = "additional_notes"
-    primary_lid_model_label: str = "speechbrain"
-    secondary_lid_model_label: str = "indic_canary"
+    indic_languages: frozenset[str] = field(default_factory=lambda: _DEFAULT_INDIC_LANGUAGES)
     name: str = "SelectBestLIDPrediction"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return [], [
-            self.primary_language_key,
-            self.secondary_language_key,
-        ]
+        return [], [self.lid_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.output_key, self.confidence_key, self.notes_key, self.skip_me_key]
 
-    def process(self, task: AudioTask) -> AudioTask:
-        primary_raw = task.data.pop(self.primary_language_key, "")
-        primary_confidence = float(task.data.pop(self.primary_confidence_key, 0.0) or 0.0)
-        secondary_raw = task.data.pop(self.secondary_language_key, "")
-        secondary_confidence = float(task.data.pop(self.secondary_confidence_key, 0.0) or 0.0)
+    def _add_notes(self, task: AudioTask, lid_entries: list[dict[str, LangIDResult]]) -> None:
+        for entry in lid_entries:
+            for model_name, result in entry.items():
+                if not isinstance(result, LangIDResult):
+                    continue
+                tag = result.tag
+                set_note(task.data, f"{tag}_lid_model", _model_label(model_name), self.notes_key)
+                set_note(task.data, f"{tag}_lid_prediction", result.language, self.notes_key)
+                set_note(
+                    task.data,
+                    f"{tag}_lid_confidence",
+                    f"{float(result.confidence):.3f}",
+                    self.notes_key,
+                )
 
-        primary_lang = _normalize_lang_code(primary_raw)
-        secondary_lang = _normalize_lang_code(secondary_raw)
-
-        set_note(task.data, "primary_lid_model", self.primary_lid_model_label, self.notes_key)
-        set_note(task.data, "secondary_lid_model", self.secondary_lid_model_label, self.notes_key)
-        set_note(task.data, "primary_lid_prediction", primary_lang, self.notes_key)
-        set_note(task.data, "primary_lid_confidence", f"{primary_confidence:.3f}", self.notes_key)
-        set_note(task.data, "secondary_lid_prediction", secondary_lang, self.notes_key)
-        set_note(task.data, "secondary_lid_confidence", f"{secondary_confidence:.3f}", self.notes_key)
-
-        if primary_lang and primary_lang == secondary_lang:
-            task.data[self.output_key] = primary_lang
-            task.data[self.confidence_key] = primary_confidence
-            set_note(task.data, self.name, f"agreement (lang={primary_lang})", self.notes_key)
+    def process(self, task: AudioTask) -> AudioTask:  # noqa: C901
+        lid_entries = task.data.get(self.lid_key, [])
+        if not lid_entries:
+            task.data[self.skip_me_key] = "skipped due to missing langID predictions."
+            set_note(task.data, self.name, "skipped (missing predictions)", self.notes_key)
             return task
 
-        task.data[self.skip_me_key] = _DISAGREEMENT_SKIP_REASON
-        set_note(task.data, self.name, "skipped (disagreement)", self.notes_key)
+        self._add_notes(task, lid_entries)
+
+        sb_result: LangIDResult | None = None
+        canary_result: LangIDResult | None = None
+        for entry in lid_entries:
+            for model_name, result in entry.items():
+                if not isinstance(result, LangIDResult):
+                    continue
+                if model_name in {"SpeechBrainLangID", "AmberNetLangID"}:
+                    sb_result = result
+                elif model_name == "IndicCanaryLangID":
+                    canary_result = result
+
+        if sb_result is None:
+            task.data[self.skip_me_key] = "skipped due to missing primary langID prediction."
+            set_note(task.data, self.name, "skipped (missing primary)", self.notes_key)
+            return task
+
+        if sb_result.language in self.indic_languages:
+            if canary_result is None:
+                task.data[self.output_key] = sb_result.language
+                task.data[self.confidence_key] = float(sb_result.confidence)
+                set_note(
+                    task.data,
+                    self.name,
+                    f"used {sb_result.tag}, Indic language.",
+                    self.notes_key,
+                )
+                return task
+            if canary_result.language == sb_result.language:
+                task.data[self.output_key] = sb_result.language
+                task.data[self.confidence_key] = float(sb_result.confidence)
+                set_note(
+                    task.data,
+                    self.name,
+                    f"used {canary_result.tag}, agreement between SpeechBrain and Indic Canary langID model.",
+                    self.notes_key,
+                )
+                return task
+            task.data[self.output_key] = canary_result.language
+            task.data[self.confidence_key] = float(canary_result.confidence)
+            set_note(
+                task.data,
+                self.name,
+                f"used {canary_result.tag}, disagreement between {sb_result.tag} and {canary_result.tag}",
+                self.notes_key,
+            )
+            task.data[self.skip_me_key] = (
+                f"skipped due to disagreement between {sb_result.tag} and {canary_result.tag} langID models."
+            )
+            return task
+
+        task.data[self.output_key] = sb_result.language
+        task.data[self.confidence_key] = float(sb_result.confidence)
+        set_note(task.data, self.name, f"used {sb_result.tag}, non-Indic language.", self.notes_key)
         return task

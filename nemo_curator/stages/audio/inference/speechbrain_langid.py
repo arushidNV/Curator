@@ -33,7 +33,18 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
     from nemo_curator.tasks import AudioTask
 
-from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage
+from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage, LangIDResult
+
+
+def _normalize_lang_code(raw: object) -> str:
+    """Normalize a LID prediction to a lowercase ISO code.
+
+    SpeechBrain may return ``"ta: Tamil"`` — keep only the code before the colon.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    return text.split(":", 1)[0].strip().lower()
 
 
 @dataclass
@@ -132,7 +143,9 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
 
         for j, task_idx in enumerate(valid_indices):
             task = tasks[task_idx]
-            task.data[self.output_key] = label[j]
-            task.data[self.confidence_key] = confidence[j].item()
+            lid_result = LangIDResult(
+                language=_normalize_lang_code(label[j]), confidence=confidence[j].item(), tag=self.tag
+            )
+            task.data.setdefault(self.lid_key, []).append({self.name: lid_result})
 
         return tasks

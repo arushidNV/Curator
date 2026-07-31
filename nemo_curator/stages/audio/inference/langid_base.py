@@ -31,6 +31,14 @@ from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
 
 
+# lang id dataclass result
+@dataclass
+class LangIDResult:
+    language: str
+    confidence: float
+    tag: str
+
+
 @dataclass
 class BaseLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     """Common config + waveform preprocessing for LangID stages.
@@ -39,11 +47,11 @@ class BaseLangIDStage(ProcessingStage[AudioTask, AudioTask]):
     ``process_batch`` that runs inference on prepared waveforms.
 
     Args:
+        tag: Tag for the language identification model. Values like "primary", "secondary", "tertiary", etc.
         target_sr: Target sample rate for the model (default 16000).
         waveform_key: Task data key for the audio waveform.
         sample_rate_key: Task data key for the sample rate.
-        output_key: Task data key to write the predicted language.
-        confidence_key: Task data key to write prediction confidence.
+        lid_key: Task data key for the language identification results.
         min_duration_sec: Minimum segment duration for LangID (skip shorter).
         max_duration_sec: Max seconds fed to the model; longer segments are truncated.
             Language ID needs only a few seconds of speech (VoxLingua107 is trained on
@@ -58,11 +66,11 @@ class BaseLangIDStage(ProcessingStage[AudioTask, AudioTask]):
             shared with Canary/Sortformer. Capping the pool is the primary OOM guard.
     """
 
+    tag: str
     target_sr: int = 16000
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
-    output_key: str = "language"
-    confidence_key: str = "language_confidence"
+    lid_key: str = "lid"
     min_duration_sec: float = 1.0
     max_duration_sec: float = 10.0
     batch_size: int = 16
@@ -79,11 +87,12 @@ class BaseLangIDStage(ProcessingStage[AudioTask, AudioTask]):
         return ["data"], [self.waveform_key, self.sample_rate_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.output_key, self.confidence_key]
+        return ["data"], [self.lid_key]
 
     def _set_empty(self, task: AudioTask) -> None:
-        task.data[self.output_key] = ""
-        task.data[self.confidence_key] = 0.0
+        empty = LangIDResult(language="", confidence=0.0, tag=self.tag)
+        model_name = getattr(self, "name", self.__class__.__name__)
+        task.data.setdefault(self.lid_key, []).append({model_name: empty})
 
     def _resample(self, waveform: np.ndarray, sr: int) -> torch.Tensor:
         """Resample a 1-D float32 array to ``target_sr`` using a cached transform."""

@@ -63,8 +63,6 @@ _TARGET_SR = 16000
 # these are just the defaults.
 _DEFAULT_MAX_DURATION_SEC = 40.0
 _DEFAULT_MIN_DURATION_SEC = 0.5
-_MAX_SAMPLES = int(_DEFAULT_MAX_DURATION_SEC * _TARGET_SR)
-_MIN_SAMPLES = int(_DEFAULT_MIN_DURATION_SEC * _TARGET_SR)
 # `per_feature` normalization computes std over the valid frames; a single mel
 # frame makes torch.std() return NaN and raises inside the preprocessor. Floor the
 # reported valid duration so degenerate/near-empty clips (< ~10 ms) still yield

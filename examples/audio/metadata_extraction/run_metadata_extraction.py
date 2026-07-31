@@ -302,11 +302,6 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
 
     if not args.skip_langid:
         langid_max_workers = args.langid_max_workers if args.langid_max_workers > 0 else None
-        if args.indic:
-            primary_out_key, primary_conf_key = "primary_lang_pred", "primary_lid_confidence"
-        else:
-            primary_out_key, primary_conf_key = "source_lang", "source_lid_confidence"
-
         if args.langid_backend == "speechbrain":
             from nemo_curator.stages.audio.inference.speechbrain_langid import SpeechBrainLangIDStage
 
@@ -314,8 +309,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             stages.append(
                 SpeechBrainLangIDStage(
                     source=langid_source,
-                    output_key=primary_out_key,
-                    confidence_key=primary_conf_key,
+                    tag="primary",
                     batch_size=args.langid_batch_size,
                     max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
@@ -326,8 +320,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             stages.append(
                 AmberNetLangIDStage(
                     model_name=langid_model,
-                    output_key=primary_out_key,
-                    confidence_key=primary_conf_key,
+                    tag="primary",
                     batch_size=args.langid_batch_size,
                     max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
@@ -343,19 +336,13 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             stages.append(
                 IndicCanaryLangIDStage(
                     engine_dir=args.indic_canary_engine_dir,
-                    output_key="secondary_lang_pred",
-                    confidence_key="secondary_lid_confidence",
+                    tag="secondary",
                     kv_cache_free_gpu_memory_fraction=args.indic_canary_kv_cache_free_gpu_memory_fraction,
                     cross_kv_cache_fraction=args.indic_canary_cross_kv_cache_fraction,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
-            stages.append(
-                SelectBestLIDPredictionStage(
-                    primary_lid_model_label=args.langid_backend,
-                    secondary_lid_model_label="indic_canary",
-                )
-            )
+        stages.append(SelectBestLIDPredictionStage())
 
     stages.append(
         NeMoSpeechWriterStage(
