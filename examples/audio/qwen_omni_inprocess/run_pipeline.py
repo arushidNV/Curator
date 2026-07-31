@@ -29,22 +29,24 @@ Model selection:
                          recommended: pl cs ro hu el fi da sv
         whisper        → InferenceFasterWhisperStage   (Whisper Large V3, ``--whisper_model_size_or_path``)
                          recommended: lt lv hr et bg sk sl mt uk (he: recovery none, Whisper only)
-        parakeet_riva  → InferenceParakeetStage        (local Riva Parakeet ``.nemo``, ``--parakeet_riva_model_id``)
-                         recommended: hi ta bn (recovery: indic_monolingual)
-        indic_monolingual → InferenceIndicConformerHybridStage (AI4Bharat per-language hybrid CTC+RNNT
-                         ``.nemo``, ``--indic_monolingual_model_id``)
-                         recommended: other Indic ISO codes (ur recovery: qwen_omni; others: none)
         indic_canary   → InferenceIndicCanaryStage      (prebuilt TensorRT-LLM (Indic) Canary engine,
                          ``--indic_canary_engine_dir``; needs tensorrt_llm)
+                         primary for all Indic langs; recovery: hi → parakeet_riva (Riva Indic),
+                         other Indic → indic_monolingual (Indic Conformer)
+        parakeet_riva  → InferenceParakeetStage        (local Riva Indic Parakeet ``.nemo``, ``--parakeet_riva_model_id``)
+                         recovery for Indic Canary on hi
+        indic_monolingual → InferenceIndicConformerHybridStage (AI4Bharat per-language hybrid CTC+RNNT
+                         ``.nemo``, ``--indic_monolingual_model_id``)
+                         recovery for Indic Canary on other Indic langs
 
-    ``--recovery_model``  (optional; auto-derived from primary when omitted)
+    ``--recovery_model``  (optional; auto-derived from primary / --language when omitted)
         qwen_asr           → InferenceQwenASRStage        (default recovery for qwen_omni primary)
         whisper            → InferenceFasterWhisperStage   (default recovery for parakeet_v3 primary)
         parakeet_v3        → InferenceParakeetStage        (Parakeet-TDT v3; default recovery for whisper primary)
-        indic_monolingual  → InferenceIndicConformerHybridStage (default recovery for parakeet_riva primary on hi/ta/bn)
+        parakeet_riva      → InferenceParakeetStage        (Riva Indic recovery for Canary on hi)
+        indic_monolingual  → InferenceIndicConformerHybridStage (Indic Conformer recovery for other Indic)
         indic_canary       → InferenceIndicCanaryStage      (prebuilt TensorRT-LLM (Indic) Canary engine)
-        qwen_omni          → InferenceQwenOmniStage       (recovery for indic_monolingual primary on ur)
-        none               → skip recovery (default for indic_monolingual primary, except ur)
+        none               → skip recovery
 
 Architecture:
     NemoTarredAudioReader (CPU)
@@ -95,7 +97,6 @@ from nemo_curator.stages.audio.inference.parakeet import InferenceParakeetStage
 from nemo_curator.stages.audio.inference.qwen_asr import InferenceQwenASRStage
 from nemo_curator.stages.audio.inference.qwen_omni import InferenceQwenOmniStage
 from nemo_curator.stages.audio.io.nemo_speech_reader import NeMoSpeechAudioReader
-from nemo_curator.stages.audio.pipeline_utils import INDIC_CONFORMER_LANGUAGE_CODES
 from nemo_curator.stages.audio.text_filtering import (
     AbbreviationConcatStage,
     DisfluencyWerGuardStage,
@@ -139,12 +140,10 @@ QWEN_ASR_PRIMARY_LANGS = frozenset({"th", "fil", "fa"})
 # Whisper-primary languages that take NO recovery model (Whisper Large V3 only). Hebrew has no
 # suitable second model, so it runs Whisper alone.
 WHISPER_NO_RECOVERY_LANGS = frozenset({"he"})
-PARAKEET_RIVA_PRIMARY_LANGS = frozenset({"hi", "ta", "bn"})  # languages covered by the local Riva Parakeet .nemo
-# Indic languages handled directly by a per-language IndicConformer hybrid monolingual
-# model (every Indic language except the hi/ta/bn covered by the Riva Parakeet primary).
-INDIC_MONOLINGUAL_PRIMARY_LANGS = INDIC_CONFORMER_LANGUAGE_CODES - PARAKEET_RIVA_PRIMARY_LANGS
-# Urdu uses indic_monolingual as primary but needs qwen_omni as recovery (not none).
-INDIC_MONOLINGUAL_QWEN_RECOVERY_LANGS = frozenset({"ur"})
+# Languages recovered with the local Riva Indic Parakeet .nemo (hi).
+PARAKEET_RIVA_RECOVERY_LANGS = frozenset({"hi"})
+# Alias kept for Parakeet stage ``supported_langs`` (model covers the same set).
+PARAKEET_RIVA_PRIMARY_LANGS = PARAKEET_RIVA_RECOVERY_LANGS
 # Languages supported by the (Indic) Canary TRT-LLM engine (InferenceIndicCanaryStage).
 # The engine derives its supported set from the tokenizer at runtime; this is the
 # expected list for the current build (currently the same 22 Indic languages as
@@ -178,7 +177,8 @@ INDIC_CANARY_SUPPORTED_LANGS = frozenset(
 )
 # Default recovery model paired with each primary (when --recovery_model is not set):
 #   qwen_omni → qwen_asr;  qwen_asr → whisper;  parakeet_v3 → whisper;  whisper → parakeet_v3
-#   parakeet_riva (hi/ta/bn) → indic_monolingual;  indic_monolingual → none (except ur → qwen_omni)
+#   parakeet_riva → indic_monolingual;  indic_monolingual → none
+#   indic_canary → language-dependent (hi → parakeet_riva; other Indic → indic_monolingual)
 #   he is whisper primary with recovery none (Whisper Large V3 only)
 
 _PRIMARY_TO_RECOVERY = {
@@ -190,6 +190,13 @@ _PRIMARY_TO_RECOVERY = {
     "indic_monolingual": "none",
     "indic_canary": "none",
 }
+
+
+def _indic_recovery_for_language(lang: str) -> str:
+    """Recovery model for an Indic Canary primary language."""
+    if lang in PARAKEET_RIVA_RECOVERY_LANGS:
+        return "parakeet_riva"
+    return "indic_monolingual"
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
@@ -259,9 +266,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help=(
             "ISO 639-1 language code for this pipeline invocation. "
             "Auto-selects --primary_model and --recovery_model when they are not set explicitly: "
-            f"{sorted(PARAKEET_RIVA_PRIMARY_LANGS)} → primary=indic_canary, recovery=parakeet_riva; "
-            f"{sorted(INDIC_CANARY_SUPPORTED_LANGS - PARAKEET_RIVA_PRIMARY_LANGS)} "
-            "→ primary=indic_canary, recovery=indic_monolingual; "
+            f"{sorted(PARAKEET_RIVA_RECOVERY_LANGS)} → primary=indic_canary, recovery=parakeet_riva (Riva Indic); "
+            f"{sorted(INDIC_CANARY_SUPPORTED_LANGS - PARAKEET_RIVA_RECOVERY_LANGS)} "
+            "→ primary=indic_canary, recovery=indic_monolingual (Indic Conformer); "
             f"{sorted(QWEN_OMNI_RECOMMENDED_LANGS)} → primary=qwen_omni, recovery=qwen_asr; "
             f"{sorted(QWEN_ASR_PRIMARY_LANGS)} → primary=qwen_asr, recovery=whisper; "
             f"{sorted(PARAKEET_V3_PRIMARY_LANGS)} → primary=parakeet_v3, recovery=whisper; "
@@ -288,7 +295,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "qwen_asr: Qwen3-ASR vLLM (--asr_model_id), used for th/fil/fa; "
             "parakeet_v3: Parakeet-TDT v3 (--parakeet_v3_model_id), for European Group B; "
             "whisper: Faster-Whisper Large V3 (--whisper_model_size_or_path); "
-            "parakeet_riva: local Indic Riva Parakeet .nemo (--parakeet_riva_model_id), used for hi/ta/bn; "
+            "parakeet_riva: local Indic Riva Parakeet .nemo (--parakeet_riva_model_id), used for hi; "
             "indic_monolingual: AI4Bharat IndicConformer hybrid CTC+RNNT per-language .nemo (--indic_monolingual_model_id), "
             "used for the other Indic languages; "
             "indic_canary: prebuilt TensorRT-LLM (Indic) Canary engine (--indic_canary_engine_dir). "
@@ -408,12 +415,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     asr = ap.add_argument_group(
         "recovery ASR (secondary inference)",
         "Use --recovery_model to pick the fallback model explicitly, or let --language set it automatically. "
-        "With --language, hi/ta/bn → indic_canary primary + parakeet_riva recovery, and the other "
-        "Indic Canary languages → indic_canary primary + indic_monolingual recovery. "
+        "With --language, hi → indic_canary primary + parakeet_riva (Riva Indic) recovery, and all other "
+        "Indic languages (including ta and bn) → indic_canary primary + indic_monolingual (Indic Conformer) recovery. "
         "Default auto-pairing (when neither --recovery_model nor --language is given): "
         "primary=qwen_omni → qwen_asr; primary=parakeet_v3 → whisper; primary=whisper → parakeet_v3; "
         "primary=parakeet_riva → indic_monolingual; primary=indic_monolingual → none; "
-        "primary=indic_canary → none.",
+        "primary=indic_canary → requires --language (or set --recovery_model).",
     )
     asr.add_argument(
         "--recovery_model",
@@ -436,9 +443,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "whisper: Faster-Whisper Large V3 (--whisper_model_size_or_path); "
             "parakeet_v3: Parakeet-TDT v3 (--parakeet_v3_model_id); "
             "parakeet_riva: local Indic Riva Parakeet .nemo (--parakeet_riva_model_id), "
-            "fallback for the hi/ta/bn Indic Canary primary; "
+            "fallback for hi Indic Canary primary; "
             "indic_monolingual: AI4Bharat IndicConformer hybrid per-language .nemo (--indic_monolingual_model_id), "
-            "fallback for the other Indic Canary primary languages; "
+            "fallback for all other Indic Canary primary languages, including ta and bn; "
             "indic_canary: prebuilt TensorRT-LLM (Indic) Canary engine (--indic_canary_engine_dir); "
             "none: skip recovery entirely. "
             "Auto-derived from --primary_model or --language when omitted."
@@ -550,7 +557,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help=(
             f"Local Indic Riva Parakeet NeMo checkpoint (default: {PARAKEET_RIVA_DEFAULT_MODEL_ID}). "
             "Not on HuggingFace — must be a reachable ``.nemo`` path on the compute nodes. "
-            "Indic hi/ta/bn model used as the primary for --primary_model parakeet. "
+            "Hindi Riva recovery model for --recovery_model parakeet_riva "
+            "(with --primary_model indic_canary). "
             "Distinct model from --parakeet_v3_model_id."
         ),
     )
@@ -580,7 +588,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     return ap
 
 
-def _resolve_language_flags(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912
+def _resolve_language_flags(args: argparse.Namespace) -> None:  # noqa: C901
     """Derive primary_model and recovery_model from --language.
 
     --primary_model and --recovery_model take priority when set explicitly;
@@ -617,12 +625,9 @@ def _resolve_language_flags(args: argparse.Namespace) -> None:  # noqa: C901, PL
         else:
             args.primary_model = "whisper"
     if not recovery_was_explicit:
-        # For Indic Canary primary: hi/ta/bn recover with the Riva Parakeet .nemo,
-        # every other supported Indic language recovers with IndicConformer (monolingual).
-        if lang in PARAKEET_RIVA_PRIMARY_LANGS:
-            args.recovery_model = "parakeet_riva"
-        elif lang in INDIC_MONOLINGUAL_PRIMARY_LANGS:
-            args.recovery_model = "indic_monolingual"
+        # Indic Canary primary: hi → Riva Indic Parakeet; all other Indic → Indic Conformer.
+        if lang in INDIC_CANARY_SUPPORTED_LANGS:
+            args.recovery_model = _indic_recovery_for_language(lang)
         elif lang in QWEN_ASR_PRIMARY_LANGS:
             args.recovery_model = "whisper"
         elif lang in WHISPER_NO_RECOVERY_LANGS:
@@ -681,7 +686,16 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         )
         raise SystemExit(msg)
     if args.recovery_model is None:
-        args.recovery_model = _PRIMARY_TO_RECOVERY[args.primary_model]
+        if args.primary_model == "indic_canary":
+            if not args.language:
+                msg = (
+                    "--primary_model indic_canary requires --language (to pick Riva vs Indic Conformer "
+                    "recovery) or an explicit --recovery_model."
+                )
+                raise SystemExit(msg)
+            args.recovery_model = _indic_recovery_for_language(args.language.lower().strip())
+        else:
+            args.recovery_model = _PRIMARY_TO_RECOVERY[args.primary_model]
     has_recovery = args.recovery_model != "none"
     if args.tensor_parallel_size is None:
         args.tensor_parallel_size = 2 if args.primary_model == "qwen_omni" else 1
