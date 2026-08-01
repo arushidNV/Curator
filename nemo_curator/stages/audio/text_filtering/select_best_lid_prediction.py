@@ -99,7 +99,7 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.lid_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.output_key, self.confidence_key, self.notes_key, self.skip_me_key]
+        return [], [self.output_key, self.notes_key, self.skip_me_key]
 
     def _add_notes(self, task: AudioTask, lid_entries: list[dict[str, LangIDResult]]) -> None:
         for entry in lid_entries:
@@ -130,21 +130,25 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
         for entry in lid_entries:
             for model_name, result in entry.items():
                 if not isinstance(result, LangIDResult):
-                    continue
+                    raise ValueError(f"Invalid LID result: {result}")
                 if model_name in {"SpeechBrainLangID", "AmberNetLangID"}:
                     sb_result = result
                 elif model_name == "IndicCanaryLangID":
                     canary_result = result
+                else:
+                    raise ValueError(f"Invalid model name: {model_name}")
 
         if sb_result is None or len(sb_result.language)==0:
-            task.data[self.skip_me_key] = "skipped due to missing primary langID prediction."
-            set_note(task.data, self.name, "skipped (missing primary)", self.notes_key)
+            task.data[self.output_key] = ""
+            task.data[self.notes_key][self.confidence_key] = 0.0
+            task.data[self.skip_me_key] = "skipped due to missing or empty primary langID prediction."
+            set_note(task.data, self.name, "skipped (missing or empty primary langID prediction)", self.notes_key)
             return task
 
         if sb_result.language in self.indic_languages:
             if canary_result is None:
                 task.data[self.output_key] = sb_result.language
-                task.data[self.confidence_key] = float(sb_result.confidence)
+                task.data[self.notes_key][self.confidence_key] = float(sb_result.confidence)
                 set_note(
                     task.data,
                     self.name,
@@ -154,7 +158,7 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
                 return task
             if canary_result.language == sb_result.language:
                 task.data[self.output_key] = canary_result.language
-                task.data[self.confidence_key] = float(canary_result.confidence)
+                task.data[self.notes_key][self.confidence_key] = float(canary_result.confidence)
                 set_note(
                     task.data,
                     self.name,
@@ -163,7 +167,7 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
                 )
                 return task
             task.data[self.output_key] = canary_result.language
-            task.data[self.confidence_key] = float(canary_result.confidence)
+            task.data[self.notes_key][self.confidence_key] = float(canary_result.confidence)
             set_note(
                 task.data,
                 self.name,
@@ -176,6 +180,6 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
             return task
 
         task.data[self.output_key] = sb_result.language
-        task.data[self.confidence_key] = float(sb_result.confidence)
+        task.data[self.notes_key][self.confidence_key] = float(sb_result.confidence)
         set_note(task.data, self.name, f"used {sb_result.tag}, non-Indic language.", self.notes_key)
         return task

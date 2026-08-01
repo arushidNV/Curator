@@ -299,7 +299,6 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
                 manifest_entry["source_duration"] = round(float(source_duration), 4)
             for key in (
                 "source_lang",
-                "source_lid_confidence",
                 "original_language",
                 "original_language_source",
                 "sed_events",
@@ -381,8 +380,6 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         source_lang = task.data.get("source_lang")
         if source_lang:
             manifest_entry["source_lang"] = source_lang
-        if "source_lid_confidence" in task.data:
-            manifest_entry["source_lid_confidence"] = round(task.data["source_lid_confidence"], 4)
         if "sed_events" in task.data:
             manifest_entry["sed_events"] = task.data["sed_events"]
         if "num_speakers" in task.data:
@@ -406,7 +403,6 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             "start_ms",
             "end_ms",
             "source_lang",
-            "source_lid_confidence",
             "sed_events",
             "num_speakers",
             "rttm_filepath",
