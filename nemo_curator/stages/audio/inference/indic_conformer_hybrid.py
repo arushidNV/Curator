@@ -63,16 +63,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-import nemo.collections.asr as nemo_asr
 import numpy as np
-import torch
-import torchaudio.functional as audio_functional
-from huggingface_hub import HfApi, hf_hub_download
 from loguru import logger
-from nemo.collections.asr.modules import conv_asr, rnnt
-from nemo.collections.asr.parts.mixins.mixins import ASRBPEMixin
 
-from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.models.base import ModelInterface
 from nemo_curator.stages.audio.inference.audio_chunking import (
     engine_chunk_duration,
@@ -84,6 +77,9 @@ from nemo_curator.stages.audio.pipeline_utils import set_note
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
+
+if TYPE_CHECKING:
+    from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
 _TARGET_SR = 16000
 _MAX_CHUNK_DURATION_SEC = 40.0
@@ -154,6 +150,10 @@ def _apply_multisoftmax_patches() -> None:  # noqa: C901, PLR0915
     global _PATCHED
     if _PATCHED:
         return
+
+    import torch
+    from nemo.collections.asr.modules import conv_asr, rnnt
+    from nemo.collections.asr.parts.mixins.mixins import ASRBPEMixin
 
     # ------------------------------------------------------------------
     # Tokenizer routing: the fork tags the aggregate tokenizer ``type:
@@ -393,6 +393,8 @@ class IndicConformerHybridASR(ModelInterface):
         if cls._offline():
             # Offline: rely on the pre-populated cache (no network listing/download).
             return cls._resolve_nemo_path(model_id)
+        from huggingface_hub import HfApi, hf_hub_download
+
         files = [f for f in HfApi().list_repo_files(model_id) if f.endswith(".nemo")]
         if not files:
             msg = f"No .nemo file found in HuggingFace repo '{model_id}'"
@@ -423,10 +425,12 @@ class IndicConformerHybridASR(ModelInterface):
             cached = [f for f in os.listdir(snap_dir) if f.endswith(".nemo")]
             if cached:
                 return os.path.join(snap_dir, cached[0])
-        except Exception:  # noqa: BLE001 — fall through to the online path below.
+        except Exception:  # noqa: BLE001, S110
             pass
 
         # 3. Online fallback (needs egress; gated repos need HF_TOKEN).
+        from huggingface_hub import HfApi, hf_hub_download
+
         files = [f for f in HfApi().list_repo_files(model_id) if f.endswith(".nemo")]
         if not files:
             msg = f"No .nemo file found in HuggingFace repo '{model_id}'"
@@ -434,6 +438,9 @@ class IndicConformerHybridASR(ModelInterface):
         return hf_hub_download(model_id, files[0])
 
     def setup(self) -> None:
+        import nemo.collections.asr as nemo_asr
+        import torch
+
         _apply_multisoftmax_patches()
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.tensorrt_engine_dir is None:
@@ -629,6 +636,8 @@ class IndicConformerHybridASR(ModelInterface):
     ) -> tuple[list[str], list[str]]:
         if self._trt_encoder is not None:
             return self._generate_tensorrt(waveforms, sample_rates, lang_codes, mode)
+        import torch
+        import torchaudio.functional as audio_functional
 
         texts: list[str] = [""] * len(waveforms)
         langs_out: list[str] = [str(lang).strip().lower() for lang in lang_codes]
