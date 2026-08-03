@@ -12,6 +12,7 @@ log-Mel preprocessor remains outside the graph, matching the recovered artifact.
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from omegaconf import open_dict
@@ -221,6 +222,19 @@ def round_model_tensors_through_bf16(model: torch.nn.Module) -> None:
                 tensor.copy_(tensor.to(torch.bfloat16).to(torch.float32))
 
 
+def save_learnable_silence(model: SortformerEncLabelModel, output_path: Path) -> bool:
+    learned_silence = getattr(model.sortformer_modules, "learnable_sil_emb", None)
+    if learned_silence is None:
+        return False
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(
+        output_path,
+        learned_silence.detach().cpu().float().numpy(),
+        allow_pickle=False,
+    )
+    return True
+
+
 def promote_constant_nodes_to_initializers(onnx_path: Path) -> None:
     """Replace tensor-valued Constant nodes with graph initializers.
 
@@ -306,6 +320,11 @@ def parse_args():
         action="store_true",
         help="Skip the new-checkpoint native versus export-lowered numerical check",
     )
+    parser.add_argument(
+        "--learnable-silence-output",
+        type=Path,
+        help="Optional destination for the checkpoint's learned silence embedding",
+    )
     return parser.parse_args()
 
 
@@ -316,6 +335,9 @@ def main():
         map_location=args.device,
     )
     model.eval().float()
+
+    if args.learnable_silence_output is not None:
+        save_learnable_silence(model, args.learnable_silence_output)
 
     if not args.no_bf16_roundtrip:
         round_model_tensors_through_bf16(model)
