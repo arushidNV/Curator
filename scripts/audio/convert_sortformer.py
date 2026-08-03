@@ -66,6 +66,14 @@ RIVA_MANIFEST = {
     },
 }
 
+LEARNABLE_SILENCE_ARTIFACT = {
+    "artifact_type": "File",
+    "content_callback": "BinaryContentCallback",
+    "description": "Learned Sortformer silence embedding for streaming speaker cache",
+    "encryption": False,
+    "path_type": "TAR_PATH",
+}
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -120,6 +128,7 @@ def nemo_to_riva(
 
     with tempfile.TemporaryDirectory(prefix="sortformer-export-") as temp_directory:
         temporary_onnx = Path(temp_directory) / "model_graph.onnx"
+        temporary_learned_silence = Path(temp_directory) / "learnable_sil_emb.npy"
         command = [
             sys.executable,
             str(exporter),
@@ -127,6 +136,8 @@ def nemo_to_riva(
             str(temporary_onnx),
             "--device",
             device,
+            "--learnable-silence-output",
+            str(temporary_learned_silence),
         ]
         if no_bf16_roundtrip:
             command.append("--no-bf16-roundtrip")
@@ -134,12 +145,31 @@ def nemo_to_riva(
         subprocess.run(command, check=True)
 
         model_config = tar_member_bytes(nemo_path, {"model_config.yaml"})
+        parsed_config = yaml.safe_load(model_config)
+        uses_learned_silence = bool(
+            parsed_config.get("sortformer_modules", {}).get("use_learnable_sil_emb", False)
+        )
+        if uses_learned_silence and not temporary_learned_silence.is_file():
+            msg = f"{nemo_path} enables use_learnable_sil_emb but the checkpoint parameter was not exported"
+            raise RuntimeError(msg)
+        manifest_data = {
+            **RIVA_MANIFEST,
+            "artifacts": dict(RIVA_MANIFEST["artifacts"]),
+        }
+        if temporary_learned_silence.is_file():
+            manifest_data["artifacts"]["learnable_sil_emb.npy"] = LEARNABLE_SILENCE_ARTIFACT
         manifest = yaml.safe_dump(
-            RIVA_MANIFEST, sort_keys=False, default_flow_style=False
+            manifest_data, sort_keys=False, default_flow_style=False
         ).encode()
         with tarfile.open(riva_path, "w:gz", compresslevel=9) as bundle:
             add_bytes(bundle, "artifacts/model_config.yaml", model_config)
             bundle.add(temporary_onnx, "artifacts/model_graph.onnx", recursive=False)
+            if temporary_learned_silence.is_file():
+                bundle.add(
+                    temporary_learned_silence,
+                    "artifacts/learnable_sil_emb.npy",
+                    recursive=False,
+                )
             add_bytes(bundle, "manifest.yaml", manifest)
 
         if keep_onnx is not None:
