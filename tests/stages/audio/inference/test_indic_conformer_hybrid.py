@@ -13,9 +13,10 @@
 # limitations under the License.
 
 from typing import ClassVar
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 
 from nemo_curator.stages.audio.inference.indic_conformer_hybrid import (
@@ -27,7 +28,7 @@ from nemo_curator.tasks import AudioTask
 
 
 class _Tokenizer:
-    token_id_offset: ClassVar[dict[str, int]] = {"hi": 0}
+    token_id_offset: ClassVar[dict[str, int]] = {"hi": 0, "ta": 0}
 
     def ids_to_text(self, ids: list[int]) -> str:
         table = {0: "a", 1: "b", 2: "c"}
@@ -63,9 +64,17 @@ class _CtcModel:
         return encoded, input_signal_length
 
 
-class _RnntDecoder:
+class _RnntDecoder(torch.nn.Module):
+    blank_idx = 3
+    blank_as_pad = True
+
     def __init__(self) -> None:
+        super().__init__()
         self.batch_sizes: list[int] = []
+        self.labels: list[torch.Tensor] = []
+
+    def initialize_state(self, y: torch.Tensor) -> list[torch.Tensor]:
+        return [torch.zeros((1, y.shape[0], 1))]
 
     def predict(
         self,
@@ -78,12 +87,30 @@ class _RnntDecoder:
         _ = (state, add_sos)
         batch = int(batch_size if y is None else y.shape[0])
         self.batch_sizes.append(batch)
+        if y is not None:
+            self.labels.append(y.clone())
         return torch.zeros((batch, 1, 1)), [torch.zeros((1, batch, 1))]
 
+    @classmethod
+    def batch_replace_states_mask(
+        cls,
+        src_states: list[torch.Tensor],
+        dst_states: list[torch.Tensor],
+        mask: torch.Tensor,
+    ) -> None:
+        torch.where(mask.view(1, -1, 1), src_states[0], dst_states[0], out=dst_states[0])
 
-class _RnntJoint:
+    @classmethod
+    def batch_split_states(cls, states: list[torch.Tensor]) -> list[list[torch.Tensor]]:
+        return [[state[:, index : index + 1] for state in states] for index in range(states[0].shape[1])]
+
+
+class _RnntJoint(torch.nn.Module):
     def __init__(self) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(1, 1)
         self.counts: dict[int, int] = {}
+        self.language_ids: list[list[str]] = []
 
     def enc(self, x: torch.Tensor) -> torch.Tensor:
         return x
@@ -98,7 +125,8 @@ class _RnntJoint:
         *,
         language_ids: list[str],
     ) -> torch.Tensor:
-        _ = (g, language_ids)
+        _ = g
+        self.language_ids.append(list(language_ids))
         batch = f.shape[0]
         log_probs = torch.full((batch, 1, 1, 3), -100.0)
         for idx in range(batch):
@@ -130,6 +158,7 @@ def _asr(model: object, *, decode_mode: str, batch_size: int) -> IndicConformerH
     asr._model = model
     asr._device = torch.device("cpu")
     asr._per_lang_classes = 3 if decode_mode == "ctc" else 2
+    asr._chunk_duration_sec = 30.0
     return asr
 
 
@@ -146,7 +175,7 @@ def test_ctc_generate_batches_encoder_calls_and_preserves_order() -> None:
     texts, langs = asr.generate(waveforms, [_TARGET_SR] * 4, ["hi"] * 4)
 
     assert [call["shape"][0] for call in model.calls] == [2, 1]
-    assert [call["lengths"] for call in model.calls] == [[10, 15], [7]]
+    assert [call["lengths"] for call in model.calls] == [[1600, 1600], [1600]]
     assert texts == ["ab", "c", "", "ab"]
     assert langs == ["hi", "hi", "hi", "hi"]
 
@@ -159,16 +188,58 @@ def test_rnnt_generate_decodes_active_rows_as_batches() -> None:
     texts, _ = asr.generate(waveforms, [_TARGET_SR, _TARGET_SR], ["hi", "hi"])
 
     assert [call["shape"][0] for call in model.calls] == [2]
-    assert 2 in model.decoder.batch_sizes
+    assert set(model.decoder.batch_sizes) == {2}
+    assert all(language_ids == ["hi", "hi"] for language_ids in model.joint.language_ids)
+    assert model.decoder.labels[0].tolist() == [[model.decoder.blank_idx], [model.decoder.blank_idx]]
     assert texts == ["a", "b"]
 
 
-def test_stage_passes_batch_size_to_model_wrapper() -> None:
-    stage = InferenceIndicConformerHybridStage(model_id="dummy.nemo", batch_size=4)
+def test_rnnt_decode_groups_languages_and_preserves_order() -> None:
+    model = _RnntModel()
+    asr = _asr(model, decode_mode="rnnt", batch_size=2)
+    encoded = torch.tensor([[[0.0, 0.0]], [[1.0, 1.0]]])
+
+    texts = asr._decode_rnnt_batch(encoded, torch.tensor([2, 2]), ["hi", "ta"])
+
+    assert set(model.decoder.batch_sizes) == {1}
+    assert {tuple(language_ids) for language_ids in model.joint.language_ids} == {("hi",), ("ta",)}
+    assert texts == ["a", "b"]
+
+
+def test_stage_passes_inference_batch_size_to_model_wrapper() -> None:
+    default_stage = InferenceIndicConformerHybridStage(model_id="dummy.nemo", batch_size=8)
+    stage = InferenceIndicConformerHybridStage(
+        model_id="dummy.nemo",
+        batch_size=8,
+        inference_batch_size=4,
+    )
+
+    default_model = default_stage._create_model()
+    model = stage._create_model()
+
+    assert default_model.inference_batch_size == 8
+    assert model.inference_batch_size == 4
+
+
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+def test_stage_passes_rnnt_precision_to_model_wrapper(precision: str) -> None:
+    stage = InferenceIndicConformerHybridStage(model_id="dummy.nemo", rnnt_precision=precision)
 
     model = stage._create_model()
 
-    assert model.inference_batch_size == 4
+    assert model.rnnt_precision == precision
+
+
+def test_bf16_precision_configures_decoder_and_joint() -> None:
+    model = IndicConformerHybridASR("dummy.nemo", rnnt_precision="bf16")
+    model._device = torch.device("cuda")
+    model._model = MagicMock()
+
+    with patch("torch.cuda.is_bf16_supported", return_value=True):
+        model._configure_rnnt_precision()
+
+    model._model.decoder.to.assert_called_once_with(dtype=torch.bfloat16)
+    model._model.joint.to.assert_called_once_with(dtype=torch.bfloat16)
 
 
 def test_stage_process_batch_calls_generate_once_for_eligible_batch() -> None:
