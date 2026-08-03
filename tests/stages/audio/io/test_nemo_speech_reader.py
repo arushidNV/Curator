@@ -14,7 +14,17 @@
 
 from __future__ import annotations
 
-from nemo_curator.stages.audio.io.nemo_speech_reader import _dedup_entries_by_stem
+from typing import ClassVar
+
+import pytest
+
+from nemo_curator.stages.audio.io.nemo_speech_reader import (
+    NeMoSpeechAudioReader,
+    NeMoSpeechDiscoveryStage,
+    _dedup_entries_by_stem,
+    _load_input_cfg,
+    _parse_input_cfg,
+)
 
 
 class TestDedupEntriesByStem:
@@ -88,3 +98,69 @@ class TestDedupEntriesByStem:
         result = _dedup_entries_by_stem(entries, "shard")
         assert len(result) == 1
         assert result[0]["audio_filepath"] == "s3://b/set_a/utt_001.opus"
+
+
+class TestInlineInputCfg:
+    """The reader accepts an inline ``input_cfg`` so no separate wrapper YAML is needed."""
+
+    _INLINE: ClassVar[list] = [
+        {
+            "input_cfg": [
+                {"corpus": "hi", "language": "hi", "type": "nemo", "manifest_filepath": "/data/hi/m.jsonl"},
+            ]
+        }
+    ]
+
+    def test_load_from_yaml_file(self, tmp_path) -> None:  # noqa: ANN001
+        import yaml
+
+        p = tmp_path / "data_config.yaml"
+        p.write_text(yaml.safe_dump(self._INLINE), encoding="utf-8")
+        assert _load_input_cfg(str(p), None) == self._INLINE
+
+    def test_inline_takes_precedence_over_yaml(self) -> None:
+        # yaml_path is a bogus path; inline is used, so no file read happens.
+        assert _load_input_cfg("/does/not/exist.yaml", self._INLINE) == self._INLINE
+
+    def test_neither_source_raises(self) -> None:
+        with pytest.raises(ValueError, match="input_cfg or yaml_path"):
+            _load_input_cfg(None, None)
+
+    def test_parse_inline_produces_shard_descriptor(self) -> None:
+        shards = _parse_input_cfg(self._INLINE, corpus_filter=None)
+        assert shards == [{"corpus": "hi", "manifest_path": "/data/hi/m.jsonl", "language": "hi"}]
+
+    def test_parse_rejects_non_list(self) -> None:
+        with pytest.raises(ValueError, match="input_cfg list"):
+            _parse_input_cfg({"not": "a list"}, corpus_filter=None)
+
+    def test_omegaconf_interpolation_is_resolved(self) -> None:
+        from omegaconf import OmegaConf
+
+        cfg = OmegaConf.create(
+            {
+                "input_manifest": "/data/hi/m.jsonl",
+                "data_config": [
+                    {"input_cfg": [{"corpus": "hi", "language": "hi", "manifest_filepath": "${input_manifest}"}]}
+                ],
+            }
+        )
+        resolved = _load_input_cfg(None, cfg.data_config)
+        shards = _parse_input_cfg(resolved, corpus_filter=None)
+        assert shards[0]["manifest_path"] == "/data/hi/m.jsonl"
+
+    def test_flat_cfg_without_input_cfg_key(self) -> None:
+        # A plain list of cfg dicts (no wrapping ``input_cfg`` key) is also accepted.
+        flat = [{"corpus": "hi", "language": "hi", "manifest_filepath": "/data/hi/m.jsonl"}]
+        shards = _parse_input_cfg(flat, corpus_filter=None)
+        assert shards == [{"corpus": "hi", "manifest_path": "/data/hi/m.jsonl", "language": "hi"}]
+
+    def test_reader_requires_a_source(self) -> None:
+        with pytest.raises(ValueError, match="input_cfg or yaml_path"):
+            NeMoSpeechAudioReader()
+
+    def test_reader_accepts_inline_cfg(self) -> None:
+        reader = NeMoSpeechAudioReader(input_cfg=self._INLINE)
+        discovery = reader.decompose()[0]
+        assert isinstance(discovery, NeMoSpeechDiscoveryStage)
+        assert discovery.input_cfg == self._INLINE

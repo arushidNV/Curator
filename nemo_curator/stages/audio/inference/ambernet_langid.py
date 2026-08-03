@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
     from nemo_curator.tasks import AudioTask
 
-from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage
+from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage, LangIDResult
 
 
 @dataclass
@@ -125,7 +125,7 @@ class AmberNetLangIDStage(BaseLangIDStage):
         for j, task_idx in enumerate(valid_indices):
             task = tasks[task_idx]
             pred_label = labels[pred_indices[j].item()]
-            task.data[self.output_key] = pred_label
-            task.data[self.confidence_key] = confidences[j].item()
+            lid_result = LangIDResult(language=pred_label, confidence=confidences[j].item(), tag=self.tag)
+            task.data.setdefault(self.lid_key, []).append({self.name: lid_result})
 
         return tasks

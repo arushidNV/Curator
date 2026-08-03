@@ -21,6 +21,8 @@ See: https://huggingface.co/speechbrain/lang-id-voxlingua107-ecapa
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -31,7 +33,18 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
     from nemo_curator.tasks import AudioTask
 
-from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage
+from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage, LangIDResult
+
+
+def _normalize_lang_code(raw: object) -> str:
+    """Normalize a LID prediction to a lowercase ISO code.
+
+    SpeechBrain may return ``"ta: Tamil"`` — keep only the code before the colon.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    return text.split(":", 1)[0].strip().lower()
 
 
 @dataclass
@@ -51,7 +64,11 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
 
     name: str = "SpeechBrainLangID"
     source: str = "speechbrain/lang-id-voxlingua107-ecapa"
-    savedir: str = "/tmp/speechbrain_langid"
+    savedir: str = field(default_factory=lambda: os.path.join(tempfile.gettempdir(), "speechbrain_langid"))
+    # batch_size / max_duration_sec / max_workers inherited from BaseLangIDStage
+    # (16 / 10s / None). These bound the padded-batch activation footprint of the
+    # ECAPA-TDNN forward, which is the usual OOM source when this stage co-resides on a
+    # shared GPU.
 
     _classifier: Any = field(default=None, init=False, repr=False)
 
@@ -60,17 +77,26 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
         _node_info: NodeInfo | None = None,
         _worker_metadata: WorkerMetadata | None = None,
     ) -> None:
-        pass
+        # Pre-fetch the model once per node so the per-actor setup() below is a HF
+        # cache hit instead of N concurrent downloads. Best-effort: if it fails
+        # (e.g. offline / non-HF source), actors still fetch individually in setup().
+        try:
+            from huggingface_hub import snapshot_download
+
+            snapshot_download(repo_id=self.source)
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"SpeechBrainLangID: could not pre-cache {self.source} on node ({exc})")
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         if self._classifier is not None:
             return
         from speechbrain.inference.classifiers import EncoderClassifier
 
-        logger.info(f"SpeechBrainLangID: loading model from {self.source}")
+        savedir = os.path.join(self.savedir, f"actor_{os.getpid()}")
+        logger.info(f"SpeechBrainLangID: loading model from {self.source} (savedir={savedir})")
         self._classifier = EncoderClassifier.from_hparams(
             source=self.source,
-            savedir=self.savedir,
+            savedir=savedir,
             run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
         )
         logger.info("SpeechBrainLangID: model ready")
@@ -108,7 +134,8 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
             batch_tensor[j, : len(sig)] = sig
         wav_lens = torch.tensor([length / max_len for length in audio_lengths])
 
-        _out_prob, score, _index, label = self._classifier.classify_batch(batch_tensor, wav_lens)
+        with torch.inference_mode():
+            _out_prob, score, _index, label = self._classifier.classify_batch(batch_tensor, wav_lens)
 
         # The model's final layer is Softmax(apply_log=True), so `score` is a log-probability
         # (<= 0). Exponentiate to a linear 0-1 confidence.
@@ -116,7 +143,9 @@ class SpeechBrainLangIDStage(BaseLangIDStage):
 
         for j, task_idx in enumerate(valid_indices):
             task = tasks[task_idx]
-            task.data[self.output_key] = label[j]
-            task.data[self.confidence_key] = confidence[j].item()
+            lid_result = LangIDResult(
+                language=_normalize_lang_code(label[j]), confidence=confidence[j].item(), tag=self.tag
+            )
+            task.data.setdefault(self.lid_key, []).append({self.name: lid_result})
 
         return tasks

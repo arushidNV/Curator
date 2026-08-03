@@ -47,6 +47,7 @@ from loguru import logger
 from silero_vad import get_speech_timestamps, load_silero_vad
 
 from nemo_curator.backends.base import WorkerMetadata
+
 try:
     from nemo_curator.backends.utils import RayStageSpecKeys
 except ImportError:
@@ -79,6 +80,9 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         speech_pad_ms: Padding in ms to add before/after speech segments.
         waveform_key: Key to get waveform data.
         sample_rate_key: Key to get sample rate.
+        filepath_key: Key for the audio file path used as fallback when
+            waveform is not in memory. Defaults to ``"audio_filepath"``.
+            Set to ``"resampled_audio_filepath"`` to read pre-resampled WAVs.
 
     Note:
         Default resources: cpus=1.0, gpus=0.0 (CPU). Silero VAD is lightweight.
@@ -92,11 +96,12 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
     speech_pad_ms: int = 300
     waveform_key: str = "waveform"
     sample_rate_key: str = "sample_rate"
+    filepath_key: str = "audio_filepath"
     nested: bool = False
 
     name: str = "VADSegmentation"
-    batch_size: int = 1
-    resources: Resources = field(default_factory=lambda: Resources(cpus=1.0, gpus=0.0))
+    batch_size: int = 8
+    resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=4.0))
 
     def __post_init__(self):
         super().__init__()
@@ -207,11 +212,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         if diar_segments is not None:
             seg_start = segment["start"]
             seg_end = segment["end"]
-            speakers = {
-                s["speaker"]
-                for s in diar_segments
-                if s["end"] > seg_start and s["start"] < seg_end
-            }
+            speakers = {s["speaker"] for s in diar_segments if s["end"] > seg_start and s["start"] < seg_end}
             segment_data["num_speakers"] = len(speakers)
 
         return segment_data
@@ -222,7 +223,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         sample_rate = item.get(self.sample_rate_key)
 
         if waveform is None:
-            audio_filepath = item.get("audio_filepath")
+            audio_filepath = item.get(self.filepath_key)
             if audio_filepath and os.path.exists(audio_filepath):
                 try:
                     waveform, sample_rate = load_audio_file(audio_filepath)
@@ -232,7 +233,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
                     logger.error(f"Failed to load audio file {audio_filepath}: {e}")
                     return None
             else:
-                logger.error("Missing waveform and no valid audio_filepath provided")
+                logger.error(f"Missing waveform and no valid '{self.filepath_key}' provided")
                 return None
         elif sample_rate is None:
             logger.warning("Waveform present but sample_rate missing - task skipped")
@@ -250,7 +251,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         task.data.pop(self.waveform_key, None)
         return task
 
-    def process(self, task: AudioTask) -> AudioTask | list[AudioTask]:
+    def process(self, task: AudioTask) -> AudioTask | list[AudioTask]:  # noqa: C901, PLR0911
         """
         Process a single AudioTask.
 

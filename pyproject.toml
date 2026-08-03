@@ -115,6 +115,8 @@ audio_cuda12 = [
     "nvidia-cudnn-cu12",
     "onnxruntime-gpu>=1.20.1,<1.24; platform_machine == 'x86_64'",
     "torchcodec",
+    "torchlibrosa",  # SED (PANNs CNN14) mel front end
+    "speechbrain",   # VoxLingua107 language-ID backend
 ]
 
 image_cpu = [
@@ -325,6 +327,13 @@ source = ["nemo_curator", "/opt/Curator/nemo_curator", "/home/runner/work/Curato
 
 [tool.ruff]
 line-length = 119
+# Third-party TRT-LLM Canary build scripts kept verbatim; not linted/formatted.
+# force-exclude so these stay excluded even when pre-commit passes file paths explicitly.
+force-exclude = true
+extend-exclude = [
+    "scripts/audio/indic_canary_trtllm_conversion/convert_checkpoint.py",
+    "scripts/audio/indic_canary_trtllm_conversion/conformer_onnx_trt.py",
+]
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [

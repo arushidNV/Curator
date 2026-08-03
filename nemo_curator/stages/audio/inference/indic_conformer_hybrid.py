@@ -53,20 +53,25 @@ so importing this module does not change ordinary NeMo usage.
 from __future__ import annotations
 
 import gc
+import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
+import nemo.collections.asr as nemo_asr
 import numpy as np
+import torch
+import torchaudio.functional as audio_functional
+from huggingface_hub import HfApi, hf_hub_download
 from loguru import logger
+from nemo.collections.asr.modules import conv_asr, rnnt
+from nemo.collections.asr.parts.mixins.mixins import ASRBPEMixin
 
+from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.models.base import ModelInterface
 from nemo_curator.stages.audio.pipeline_utils import set_note
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
-
-if TYPE_CHECKING:
-    from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 
 _TARGET_SR = 16000
 
@@ -90,10 +95,6 @@ def _apply_multisoftmax_patches() -> None:  # noqa: C901, PLR0915
     global _PATCHED
     if _PATCHED:
         return
-
-    import torch
-    from nemo.collections.asr.modules import conv_asr, rnnt
-    from nemo.collections.asr.parts.mixins.mixins import ASRBPEMixin
 
     # ------------------------------------------------------------------
     # Tokenizer routing: the fork tags the aggregate tokenizer ``type:
@@ -279,10 +280,12 @@ class IndicConformerHybridASR(ModelInterface):
         decode_mode: Literal["ctc", "rnnt"] = "rnnt",
         *,
         max_symbols_per_step: int = 10,
+        inference_batch_size: int = 128,
     ):
         self.model_id = model_id
         self.decode_mode = decode_mode
         self.max_symbols_per_step = max_symbols_per_step
+        self.inference_batch_size = max(1, int(inference_batch_size))
         self._model: Any = None
         self._device: Any = None
         self._num_langs: int = 0
@@ -293,19 +296,58 @@ class IndicConformerHybridASR(ModelInterface):
         return [self.model_id]
 
     @staticmethod
-    def _resolve_nemo_path(model_id: str) -> str:
-        """Resolve ``model_id`` to a local ``.nemo`` path.
+    def _offline() -> bool:
+        return os.environ.get("HF_HUB_OFFLINE", "0").strip().lower() not in ("0", "", "false", "no")
 
-        Accepts a local ``.nemo`` file, or a HuggingFace repo id like
-        ``ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large`` (downloads the
-        single ``.nemo`` it contains). The HF repos are gated — set ``HF_TOKEN``.
+    @classmethod
+    def download_to_cache(cls, model_id: str) -> str:
+        """Download the repo's ``.nemo`` into the HF cache **once** (online).
+
+        Meant to be called from :meth:`InferenceIndicConformerHybridStage.setup_on_node`
+        so exactly one download happens per node — workers then resolve it from the
+        cache in :meth:`setup` without each re-downloading. No-op for a local path or
+        when ``HF_HUB_OFFLINE=1`` (the cache is assumed pre-populated). Returns the
+        resolved local ``.nemo`` path.
         """
-        import os
-
         if model_id.endswith(".nemo") or os.path.exists(model_id):
             return model_id
-        from huggingface_hub import HfApi, hf_hub_download
+        if cls._offline():
+            # Offline: rely on the pre-populated cache (no network listing/download).
+            return cls._resolve_nemo_path(model_id)
+        files = [f for f in HfApi().list_repo_files(model_id) if f.endswith(".nemo")]
+        if not files:
+            msg = f"No .nemo file found in HuggingFace repo '{model_id}'"
+            raise RuntimeError(msg)
+        return hf_hub_download(model_id, files[0])
 
+    @staticmethod
+    def _resolve_nemo_path(model_id: str) -> str:
+        """Resolve ``model_id`` to a local ``.nemo`` path — **cache-first, no download**.
+
+        Accepts a local ``.nemo`` file, or a HuggingFace repo id like
+        ``ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large``.
+
+        Resolution order (so a pre-populated HF cache works offline, i.e. without
+        compute-node egress or ``HF_TOKEN``, when ``HF_HUB_OFFLINE=1``):
+          1. a literal local ``.nemo`` path,
+          2. the ``.nemo`` inside the repo's **cached** snapshot (``local_files_only``),
+          3. an online listing + download (only reached when the cache is empty AND
+             :meth:`download_to_cache` was not run first; gated repos need ``HF_TOKEN``).
+        """
+        if model_id.endswith(".nemo") or os.path.exists(model_id):
+            return model_id
+
+        # 2. Cache-only lookup: reads $HF_HOME/hub without any network call.
+        from huggingface_hub import snapshot_download
+        try:
+            snap_dir = snapshot_download(model_id, local_files_only=True)
+            cached = [f for f in os.listdir(snap_dir) if f.endswith(".nemo")]
+            if cached:
+                return os.path.join(snap_dir, cached[0])
+        except Exception:  # noqa: BLE001 — fall through to the online path below.
+            pass
+
+        # 3. Online fallback (needs egress; gated repos need HF_TOKEN).
         files = [f for f in HfApi().list_repo_files(model_id) if f.endswith(".nemo")]
         if not files:
             msg = f"No .nemo file found in HuggingFace repo '{model_id}'"
@@ -313,9 +355,6 @@ class IndicConformerHybridASR(ModelInterface):
         return hf_hub_download(model_id, files[0])
 
     def setup(self) -> None:
-        import torch
-        import nemo.collections.asr as nemo_asr
-
         _apply_multisoftmax_patches()
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         nemo_path = self._resolve_nemo_path(self.model_id)
@@ -350,8 +389,6 @@ class IndicConformerHybridASR(ModelInterface):
         self._device = None
         gc.collect()
         try:
-            import torch
-
             torch.cuda.empty_cache()
         except Exception:  # noqa: BLE001, S110
             pass
@@ -370,32 +407,45 @@ class IndicConformerHybridASR(ModelInterface):
             msg = "Model not initialized. Call setup() first."
             raise RuntimeError(msg)
         mode = (decode_mode or self.decode_mode).lower()
-        import torch
-        import torchaudio.functional as AF
 
-        texts: list[str] = []
-        langs_out: list[str] = []
+        texts: list[str] = [""] * len(waveforms)
+        langs_out: list[str] = [str(lang).strip().lower() for lang in lang_codes]
+        prepared: list[Any] = []
+        lengths: list[int] = []
+        prepared_langs: list[str] = []
+        original_indices: list[int] = []
         with torch.inference_mode():
-            for w, sr, lang in zip(waveforms, sample_rates, lang_codes, strict=True):
+            for idx, (w, sr, lang) in enumerate(zip(waveforms, sample_rates, langs_out, strict=True)):
                 if w is None or np.asarray(w).size == 0:
-                    texts.append("")
-                    langs_out.append(lang)
                     continue
                 wav = torch.from_numpy(np.ascontiguousarray(w, dtype=np.float32)).to(self._device)
                 if wav.ndim > 1:
-                    wav = wav.mean(dim=-1)
+                    # Curator readers produce channels-first arrays; also handle
+                    # the common channels-last layout without changing 1-D input.
+                    wav = wav.mean(dim=0) if wav.shape[0] <= wav.shape[-1] else wav.mean(dim=-1)
+                wav = wav.reshape(-1)
                 if int(sr) != _TARGET_SR:
-                    wav = AF.resample(wav, orig_freq=int(sr), new_freq=_TARGET_SR)
-                length = torch.tensor([wav.shape[0]], device=self._device)
-                encoded, encoded_len = self._model(
-                    input_signal=wav.unsqueeze(0), input_signal_length=length
-                )  # encoded: [B, D, T]
+                    wav = audio_functional.resample(wav, orig_freq=int(sr), new_freq=_TARGET_SR)
+                prepared.append(wav.contiguous())
+                lengths.append(int(wav.shape[0]))
+                prepared_langs.append(lang)
+                original_indices.append(idx)
+
+            for start in range(0, len(prepared), self.inference_batch_size):
+                end = start + self.inference_batch_size
+                chunk = prepared[start:end]
+                chunk_lengths = lengths[start:end]
+                chunk_langs = prepared_langs[start:end]
+                chunk_indices = original_indices[start:end]
+                padded = torch.nn.utils.rnn.pad_sequence(chunk, batch_first=True)
+                length_tensor = torch.tensor(chunk_lengths, dtype=torch.long, device=self._device)
+                encoded, encoded_len = self._model(input_signal=padded, input_signal_length=length_tensor)
                 if mode == "ctc":
-                    text = self._decode_ctc(encoded, encoded_len, lang)
+                    batch_texts = self._decode_ctc_batch(encoded, encoded_len, chunk_langs)
                 else:
-                    text = self._decode_rnnt(encoded, int(encoded_len[0].item()), lang)
-                texts.append(text)
-                langs_out.append(lang)
+                    batch_texts = self._decode_rnnt_batch(encoded, encoded_len, chunk_langs)
+                for original_idx, text in zip(chunk_indices, batch_texts, strict=True):
+                    texts[original_idx] = text
         return texts, langs_out
 
     def _ids_to_text(self, local_ids: list[int], lang: str) -> str:
@@ -409,7 +459,17 @@ class IndicConformerHybridASR(ModelInterface):
     def _decode_ctc(self, encoded: Any, encoded_len: Any, lang: str) -> str:
         log_probs = self._model.ctc_decoder(encoder_output=encoded, language_ids=[lang])  # [1, T, per_lang+1]
         elen = int(encoded_len[0].item())
-        preds = log_probs[0, :elen].argmax(dim=-1).tolist()
+        return self._decode_ctc_row(log_probs[0], elen, lang)
+
+    def _decode_ctc_batch(self, encoded: Any, encoded_len: Any, lang_codes: list[str]) -> list[str]:
+        log_probs = self._model.ctc_decoder(encoder_output=encoded, language_ids=lang_codes)
+        return [
+            self._decode_ctc_row(log_probs[i], int(encoded_len[i].item()), lang)
+            for i, lang in enumerate(lang_codes)
+        ]
+
+    def _decode_ctc_row(self, log_probs: Any, encoded_len: int, lang: str) -> str:
+        preds = log_probs[:encoded_len].argmax(dim=-1).tolist()
         blank = self._per_lang_classes  # per-language blank sits at the last index
         out: list[int] = []
         prev = None
@@ -422,8 +482,6 @@ class IndicConformerHybridASR(ModelInterface):
     def _decode_rnnt(self, encoded: Any, enc_len: int, lang: str) -> str:
         # Compact greedy transducer decode mirroring the fork's single-sample path:
         # per-language joint head, blank index = V/num_langs, local-id feedback.
-        import torch
-
         joint = self._model.joint
         decoder = self._model.decoder
         blank = self._per_lang_classes
@@ -454,6 +512,101 @@ class IndicConformerHybridASR(ModelInterface):
                     state = new_state
                 symbols += 1
         return self._ids_to_text(hyp, lang)
+
+    def _decode_rnnt_batch(self, encoded: Any, encoded_len: Any, lang_codes: list[str]) -> list[str]:
+        batch_size = len(lang_codes)
+        if batch_size == 0:
+            return []
+        joint = self._model.joint
+        decoder = self._model.decoder
+        blank = self._per_lang_classes
+        x = encoded.transpose(1, 2)  # [B, T, D_enc]
+        f_enc = joint.enc(x)  # [B, T, H]
+        enc_lens = [int(length.item()) for length in encoded_len]
+        max_time = max(enc_lens, default=0)
+
+        hyps: list[list[int]] = [[] for _ in range(batch_size)]
+        last_tokens: list[int | None] = [None] * batch_size
+        states: list[Any | None] = [None] * batch_size
+
+        for t in range(max_time):
+            emitting = [idx for idx, enc_len in enumerate(enc_lens) if t < enc_len]
+            symbols = 0
+            while emitting and symbols < self.max_symbols_per_step:
+                next_emitting: list[int] = []
+                no_state = [idx for idx in emitting if last_tokens[idx] is None and states[idx] is None]
+                with_state = [idx for idx in emitting if idx not in no_state]
+
+                if no_state:
+                    g, new_state = decoder.predict(None, state=None, add_sos=False, batch_size=len(no_state))
+                    g = joint.pred(g)
+                    logp = joint.joint_after_projection(
+                        f_enc[no_state, t : t + 1, :],
+                        g,
+                        language_ids=[lang_codes[idx] for idx in no_state],
+                    )[:, 0, 0, :]
+                    pred_ids = logp.argmax(dim=-1).tolist()
+                    split_state = self._split_decoder_state(new_state, len(no_state))
+                    for idx, pred_id, state_i in zip(no_state, pred_ids, split_state, strict=True):
+                        token = int(pred_id)
+                        if token != blank:
+                            hyps[idx].append(token)
+                            last_tokens[idx] = token
+                            states[idx] = state_i
+                            next_emitting.append(idx)
+
+                if with_state:
+                    labels = torch.tensor(
+                        [[int(last_tokens[idx])] for idx in with_state],
+                        dtype=torch.long,
+                        device=self._device,
+                    )
+                    packed_state = self._pack_decoder_states([states[idx] for idx in with_state])
+                    g, new_state = decoder.predict(
+                        labels,
+                        state=packed_state,
+                        add_sos=False,
+                        batch_size=len(with_state),
+                    )
+                    g = joint.pred(g)
+                    logp = joint.joint_after_projection(
+                        f_enc[with_state, t : t + 1, :],
+                        g,
+                        language_ids=[lang_codes[idx] for idx in with_state],
+                    )[:, 0, 0, :]
+                    pred_ids = logp.argmax(dim=-1).tolist()
+                    split_state = self._split_decoder_state(new_state, len(with_state))
+                    for idx, pred_id, state_i in zip(with_state, pred_ids, split_state, strict=True):
+                        token = int(pred_id)
+                        if token != blank:
+                            hyps[idx].append(token)
+                            last_tokens[idx] = token
+                            states[idx] = state_i
+                            next_emitting.append(idx)
+
+                emitting = next_emitting
+                symbols += 1
+
+        return [self._ids_to_text(hyp, lang) for hyp, lang in zip(hyps, lang_codes, strict=True)]
+
+    @staticmethod
+    def _pack_decoder_states(states: list[Any | None]) -> Any:
+        first_state = next((state for state in states if state is not None), None)
+        if first_state is None:
+            return None
+        return [
+            torch.cat([state[layer_idx] for state in states], dim=1).contiguous()
+            for layer_idx in range(len(first_state))
+        ]
+
+    @staticmethod
+    def _split_decoder_state(state: Any, batch_size: int) -> list[Any | None]:
+        if state is None:
+            return [None] * batch_size
+        return [
+            [state_part[:, idx : idx + 1, :].contiguous() for state_part in state]
+            for idx in range(batch_size)
+        ]
 
 
 @dataclass
@@ -497,15 +650,21 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         return spec
 
     def _create_model(self) -> IndicConformerHybridASR:
-        return IndicConformerHybridASR(model_id=self.model_id, decode_mode=self.decode_mode)
+        return IndicConformerHybridASR(
+            model_id=self.model_id,
+            decode_mode=self.decode_mode,
+            inference_batch_size=self.batch_size,
+        )
 
     def setup_on_node(
         self,
         _node_info: NodeInfo | None = None,
         _worker_metadata: WorkerMetadata | None = None,
     ) -> None:
-        # Pre-download the checkpoint onto the node (HF repo -> local .nemo).
-        IndicConformerHybridASR._resolve_nemo_path(self.model_id)
+        # Download the checkpoint into the shared HF cache exactly ONCE per node
+        # (online). Per-worker setup() then resolves it from cache without each
+        # re-downloading. No-op for a local path or when HF_HUB_OFFLINE=1.
+        IndicConformerHybridASR.download_to_cache(self.model_id)
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         if self._model is None:
