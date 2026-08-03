@@ -76,6 +76,7 @@ from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.models.base import ModelInterface
 from nemo_curator.stages.audio.inference.audio_chunking import (
     engine_chunk_duration,
+    has_audio_longer_than,
     merge_chunk_texts,
     split_waveforms,
 )
@@ -527,10 +528,14 @@ class IndicConformerHybridASR(ModelInterface):
             max_batch_size=_TENSORRT_ENCODER_BATCH_SIZE,
         )
         max_feature_frames = self._trt_encoder.max_input_shape("audio_signal")[2]
-        self._chunk_duration_sec = min(
-            _MAX_CHUNK_DURATION_SEC,
-            engine_chunk_duration(self._model, max_feature_frames),
-        )
+        engine_duration = engine_chunk_duration(self._model, max_feature_frames)
+        if engine_duration < _MAX_CHUNK_DURATION_SEC:
+            msg = (
+                "IndicConformer TensorRT engine does not support 40-second audio: "
+                f"max_feature_frames={max_feature_frames}; rebuild with --max-frames 4001"
+            )
+            raise ValueError(msg)
+        self._chunk_duration_sec = _MAX_CHUNK_DURATION_SEC
         self._model.encoder = self._trt_encoder
         logger.info(f"IndicConformer TensorRT encoder loaded: {engine_path}")
 
@@ -573,6 +578,7 @@ class IndicConformerHybridASR(ModelInterface):
         if len(lang_codes) != len(waveforms):
             msg = "waveforms and lang_codes must have the same length"
             raise ValueError(msg)
+        requires_merge = has_audio_longer_than(waveforms, sample_rates, self._chunk_duration_sec)
 
         chunks, chunk_sample_rates, owners = split_waveforms(
             waveforms,
@@ -588,6 +594,11 @@ class IndicConformerHybridASR(ModelInterface):
             chunk_langs,
             mode,
         )
+        if not requires_merge:
+            texts = [""] * len(waveforms)
+            for text, owner in zip(chunk_texts, owners, strict=True):
+                texts[owner] = text
+            return texts, list(lang_codes)
         return merge_chunk_texts(chunk_texts, owners, len(waveforms)), list(lang_codes)
 
     def _generate_chunks(

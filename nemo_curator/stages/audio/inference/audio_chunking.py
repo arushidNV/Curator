@@ -62,6 +62,35 @@ def engine_chunk_duration(model: object, max_feature_frames: int) -> float:
     return (max_feature_frames * hop_samples - 1) / sample_rate
 
 
+def has_audio_longer_than(
+    waveforms: list[np.ndarray],
+    sample_rates: list[int],
+    max_duration_sec: float,
+) -> bool:
+    """Return whether any waveform exceeds the configured duration boundary."""
+    if not math.isfinite(max_duration_sec) or max_duration_sec <= 0:
+        msg = f"Maximum chunk duration must be positive and finite, got {max_duration_sec!r}"
+        raise ValueError(msg)
+    for waveform, sample_rate in zip(waveforms, sample_rates, strict=True):
+        arr = np.asarray(waveform)
+        if arr.size == 0:
+            continue
+        if arr.ndim == 1:
+            num_samples = arr.shape[0]
+        elif arr.ndim == 2:  # noqa: PLR2004
+            num_samples = max(arr.shape)
+        else:
+            msg = f"Audio waveform must be one- or two-dimensional, got shape {arr.shape}"
+            raise ValueError(msg)
+        rate = int(sample_rate)
+        if rate <= 0:
+            msg = f"Audio sample rate must be positive, got {sample_rate!r}"
+            raise ValueError(msg)
+        if num_samples > int(max_duration_sec * rate):
+            return True
+    return False
+
+
 def split_waveforms(
     waveforms: list[np.ndarray],
     sample_rates: list[int],

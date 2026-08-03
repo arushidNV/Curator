@@ -48,7 +48,7 @@ def _metadata() -> dict[str, object]:
         "profile": {
             "min": {"batch": 1, "feature_frames": 8},
             "opt": {"batch": 8, "feature_frames": 800},
-            "max": {"batch": 16, "feature_frames": 3000},
+            "max": {"batch": 16, "feature_frames": 4001},
         },
     }
 
@@ -164,7 +164,7 @@ def test_tensorrt_wrapper_replaces_only_encoder(tmp_path: Path) -> None:
     )
     wrapper.asr_model = model
     optimized_encoder = MagicMock()
-    optimized_encoder.max_input_shape.return_value = (16, 80, 3000)
+    optimized_encoder.max_input_shape.return_value = (16, 80, 4001)
 
     with (
         patch.object(NemoASRModel, "setup"),
@@ -183,7 +183,40 @@ def test_tensorrt_wrapper_replaces_only_encoder(tmp_path: Path) -> None:
     assert model.joint._vocab_size == 958
     model.to.assert_called_once_with(dtype=torch.float16)
     model.change_decoding_strategy.assert_called_once()
-    assert wrapper._chunk_duration_sec == 479999 / 16000
+    assert wrapper._chunk_duration_sec == 40.0
+
+
+def test_tensorrt_wrapper_rejects_engine_shorter_than_40_seconds(tmp_path: Path) -> None:
+    wrapper = TensorRTParakeetRNNTModel(_engine_bundle(tmp_path))
+    wrapper.asr_model = SimpleNamespace(
+        cfg=OmegaConf.create(
+            {
+                "encoder": {"feat_in": 80},
+                "preprocessor": {"sample_rate": 16000, "window_stride": 0.01},
+                "joint": {"num_classes": 958},
+                "decoding": {"strategy": "greedy", "greedy": {}},
+            }
+        ),
+        encoder=SimpleNamespace(subsampling_factor=8, _feat_in=80),
+        decoder=object(),
+        joint=SimpleNamespace(_vocab_size=958),
+        to=MagicMock(),
+        change_decoding_strategy=MagicMock(),
+    )
+    optimized_encoder = MagicMock()
+    optimized_encoder.max_input_shape.return_value = (16, 80, 4000)
+
+    with (
+        patch.object(NemoASRModel, "setup"),
+        patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.empty_cache"),
+        patch(
+            "nemo_curator.stages.audio.inference.indic_parakeet_rnnt_tensorrt.TensorRTEncoder",
+            return_value=optimized_encoder,
+        ),
+        pytest.raises(ValueError, match="--max-frames 4001"),
+    ):
+        wrapper.setup()
 
 
 def test_tensorrt_wrapper_chunks_long_audio_without_overlap(tmp_path: Path) -> None:

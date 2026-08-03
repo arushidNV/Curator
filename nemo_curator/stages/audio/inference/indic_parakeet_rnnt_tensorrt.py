@@ -26,6 +26,7 @@ from loguru import logger
 from nemo_curator.stages.audio.inference.asr_nemo import NemoASRModel
 from nemo_curator.stages.audio.inference.audio_chunking import (
     engine_chunk_duration,
+    has_audio_longer_than,
     merge_chunk_texts,
     split_waveforms,
 )
@@ -40,6 +41,8 @@ from nemo_curator.stages.audio.inference.tensorrt_encoder import (
 
 if TYPE_CHECKING:
     import numpy as np
+
+_MAX_CHUNK_DURATION_SEC = 40.0
 
 
 def load_engine_metadata(engine_dir: str | Path) -> dict[str, Any]:
@@ -122,7 +125,14 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
         self.inference_batch_size = min(self.inference_batch_size, max_input_shape[0])
         max_feature_frames = max_input_shape[2]
         if self.chunking_mode == "engine":
-            self._chunk_duration_sec = engine_chunk_duration(self.asr_model, max_feature_frames)
+            engine_duration = engine_chunk_duration(self.asr_model, max_feature_frames)
+            if engine_duration < _MAX_CHUNK_DURATION_SEC:
+                msg = (
+                    "Indic Parakeet TensorRT engine does not support 40-second audio: "
+                    f"max_feature_frames={max_feature_frames}; rebuild with --max-frames 4001"
+                )
+                raise ValueError(msg)
+            self._chunk_duration_sec = _MAX_CHUNK_DURATION_SEC
         self.asr_model.encoder = self._trt_encoder
         logger.info(f"Indic Parakeet TensorRT encoder loaded: {self._engine_path}")
 
@@ -206,6 +216,7 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
         if self._chunk_duration_sec is None:
             msg = "Indic Parakeet chunk duration was not initialized from the model"
             raise RuntimeError(msg)
+        requires_merge = has_audio_longer_than(waveforms, sample_rates, self._chunk_duration_sec)
 
         chunks, chunk_sample_rates, owners = split_waveforms(
             waveforms,
@@ -224,6 +235,11 @@ class TensorRTParakeetRNNTModel(NemoASRModel):
         chunk_texts = [""] * len(chunks)
         for original_index, text in zip(duration_order, ordered_texts, strict=True):
             chunk_texts[original_index] = text
+        if not requires_merge:
+            texts = [""] * len(waveforms)
+            for text, owner in zip(chunk_texts, owners, strict=True):
+                texts[owner] = text
+            return texts
         return merge_chunk_texts(chunk_texts, owners, len(waveforms))
 
     def teardown(self) -> None:

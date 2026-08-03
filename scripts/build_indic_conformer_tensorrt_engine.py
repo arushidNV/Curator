@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-batch", type=int, default=16)
     parser.add_argument("--min-frames", type=int, default=8, help="Minimum input feature frames")
     parser.add_argument("--opt-frames", type=int, default=800, help="Optimization input feature frames")
-    parser.add_argument("--max-frames", type=int, default=3000, help="Maximum input feature frames")
+    parser.add_argument("--max-frames", type=int, default=4001, help="Maximum input feature frames")
     parser.add_argument("--workspace-gb", type=int, default=8)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -97,6 +97,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("batch profile must satisfy 1 <= min-batch <= opt-batch <= max-batch")
     if not 1 <= args.min_frames <= args.opt_frames <= args.max_frames:
         parser.error("frame profile must satisfy 1 <= min-frames <= opt-frames <= max-frames")
+    if args.max_frames < 4001:  # noqa: PLR2004
+        parser.error("max-frames must be at least 4001 to support 40-second audio")
     if args.workspace_gb < 1:
         parser.error("workspace-gb must be at least 1")
     return args

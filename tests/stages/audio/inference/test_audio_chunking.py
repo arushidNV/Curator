@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from nemo_curator.stages.audio.inference.audio_chunking import (
+    has_audio_longer_than,
     merge_chunk_texts,
     model_chunk_duration,
     model_training_max_duration,
@@ -38,6 +39,16 @@ def test_model_chunk_duration_respects_actual_encoder_shape() -> None:
         )
     )
     assert model_chunk_duration(model, max_feature_frames=3000) == 479999 / 16000
+
+
+def test_has_audio_longer_than_uses_strict_40_second_boundary() -> None:
+    waveforms = [
+        np.zeros(40, dtype=np.float32),
+        np.zeros((2, 41), dtype=np.float32),
+    ]
+
+    assert not has_audio_longer_than(waveforms[:1], [1], 40.0)
+    assert has_audio_longer_than(waveforms, [1, 1], 40.0)
 
 
 def test_split_waveforms_uses_consecutive_non_overlapping_windows() -> None:
