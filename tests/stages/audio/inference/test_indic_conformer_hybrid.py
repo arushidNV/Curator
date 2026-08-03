@@ -13,9 +13,10 @@
 # limitations under the License.
 
 from typing import ClassVar
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 
 from nemo_curator.stages.audio.inference.indic_conformer_hybrid import (
@@ -220,12 +221,25 @@ def test_stage_passes_inference_batch_size_to_model_wrapper() -> None:
     assert model.inference_batch_size == 4
 
 
-def test_stage_passes_rnnt_precision_to_model_wrapper() -> None:
-    stage = InferenceIndicConformerHybridStage(model_id="dummy.nemo", rnnt_precision="fp16")
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+def test_stage_passes_rnnt_precision_to_model_wrapper(precision: str) -> None:
+    stage = InferenceIndicConformerHybridStage(model_id="dummy.nemo", rnnt_precision=precision)
 
     model = stage._create_model()
 
-    assert model.rnnt_precision == "fp16"
+    assert model.rnnt_precision == precision
+
+
+def test_bf16_precision_configures_decoder_and_joint() -> None:
+    model = IndicConformerHybridASR("dummy.nemo", rnnt_precision="bf16")
+    model._device = torch.device("cuda")
+    model._model = MagicMock()
+
+    with patch("torch.cuda.is_bf16_supported", return_value=True):
+        model._configure_rnnt_precision()
+
+    model._model.decoder.to.assert_called_once_with(dtype=torch.bfloat16)
+    model._model.joint.to.assert_called_once_with(dtype=torch.bfloat16)
 
 
 def test_stage_process_batch_calls_generate_once_for_eligible_batch() -> None:

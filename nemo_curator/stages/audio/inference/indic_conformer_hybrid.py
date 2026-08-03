@@ -341,12 +341,12 @@ class IndicConformerHybridASR(ModelInterface):
         max_symbols_per_step: int = 10,
         inference_batch_size: int = 128,
         tensorrt_engine_dir: str | None = None,
-        rnnt_precision: Literal["fp32", "fp16"] = "fp32",
+        rnnt_precision: Literal["fp32", "fp16", "bf16"] = "fp32",
     ):
         if decode_mode not in {"ctc", "rnnt"}:
             msg = f"Unsupported IndicConformer decode mode: {decode_mode!r}"
             raise ValueError(msg)
-        if rnnt_precision not in {"fp32", "fp16"}:
+        if rnnt_precision not in {"fp32", "fp16", "bf16"}:
             msg = f"Unsupported IndicConformer RNNT precision: {rnnt_precision!r}"
             raise ValueError(msg)
         if max_symbols_per_step < 1:
@@ -461,12 +461,7 @@ class IndicConformerHybridASR(ModelInterface):
         self._model.to(self._device)
         self._model.eval()
         self._chunk_duration_sec = _MAX_CHUNK_DURATION_SEC
-        if self.rnnt_precision == "fp16":
-            if self._device.type != "cuda":
-                msg = "IndicConformer FP16 RNNT inference requires CUDA"
-                raise RuntimeError(msg)
-            self._model.decoder.to(dtype=torch.float16)
-            self._model.joint.to(dtype=torch.float16)
+        self._configure_rnnt_precision()
 
         if self._trt_metadata is not None:
             self._enable_tensorrt_encoder(engine_path)
@@ -561,6 +556,30 @@ class IndicConformerHybridASR(ModelInterface):
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
+    def _rnnt_dtype(self) -> Any:
+        import torch
+
+        return {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[self.rnnt_precision]
+
+    def _configure_rnnt_precision(self) -> None:
+        if self.rnnt_precision == "fp32":
+            return
+        import torch
+
+        if self._device.type != "cuda":
+            msg = f"IndicConformer {self.rnnt_precision.upper()} RNNT inference requires CUDA"
+            raise RuntimeError(msg)
+        if self.rnnt_precision == "bf16" and not torch.cuda.is_bf16_supported():
+            msg = "IndicConformer BF16 RNNT inference is not supported by this GPU"
+            raise RuntimeError(msg)
+        rnnt_dtype = self._rnnt_dtype()
+        self._model.decoder.to(dtype=rnnt_dtype)
+        self._model.joint.to(dtype=rnnt_dtype)
+
     def generate(
         self,
         waveforms: list[np.ndarray],
@@ -652,6 +671,7 @@ class IndicConformerHybridASR(ModelInterface):
                 if mode == "ctc":
                     batch_texts = self._decode_ctc_batch(encoded, encoded_len, chunk_langs)
                 else:
+                    encoded = encoded.to(dtype=self._rnnt_dtype())
                     batch_texts = self._decode_rnnt_batch(encoded, encoded_len, chunk_langs)
                 for original_idx, text in zip(chunk_indices, batch_texts, strict=True):
                     texts[original_idx] = text
@@ -701,11 +721,11 @@ class IndicConformerHybridASR(ModelInterface):
                     audio_signal=features.to(dtype=torch.float16),
                     length=feature_lengths,
                 )
-                encoded = encoded.float()
                 group_langs = [lang for _, _, lang in group]
                 if mode == "ctc":
-                    batch_texts = self._decode_ctc_batch(encoded, encoded_lengths, group_langs)
+                    batch_texts = self._decode_ctc_batch(encoded.float(), encoded_lengths, group_langs)
                 else:
+                    encoded = encoded.to(dtype=self._rnnt_dtype())
                     batch_texts = self._decode_rnnt_batch(encoded, encoded_lengths, group_langs)
                 for (output_index, _, _), text in zip(group, batch_texts, strict=True):
                     texts[output_index] = text
@@ -816,7 +836,7 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         tensorrt_engine_dir: Directory containing ``encoder.plan``, ``model.nemo``,
             and ``metadata.json``. Required when ``backend="tensorrt"``.
         rnnt_precision: Precision for the RNNT prediction and joint networks.
-            Defaults to ``"fp32"``; ``"fp16"`` requires CUDA.
+            Defaults to ``"fp32"``; ``"fp16"`` and ``"bf16"`` require CUDA.
         inference_batch_size: Maximum NeMo inference batch size. When unset, uses
             ``batch_size``. TensorRT remains capped by the engine profile.
         source_lang_key: Task key holding the per-sample ISO language code.
@@ -828,7 +848,7 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
     decode_mode: Literal["ctc", "rnnt"] = "rnnt"
     backend: Literal["nemo", "tensorrt"] = "nemo"
     tensorrt_engine_dir: str | None = None
-    rnnt_precision: Literal["fp32", "fp16"] = "fp32"
+    rnnt_precision: Literal["fp32", "fp16", "bf16"] = "fp32"
     source_lang_key: str = "source_lang"
     waveform_key: str = "waveform"
     sample_rate_key: str = "sampling_rate"
@@ -849,7 +869,7 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         if self.backend not in {"nemo", "tensorrt"}:
             msg = f"Unsupported IndicConformer inference backend: {self.backend!r}"
             raise ValueError(msg)
-        if self.rnnt_precision not in {"fp32", "fp16"}:
+        if self.rnnt_precision not in {"fp32", "fp16", "bf16"}:
             msg = f"Unsupported IndicConformer RNNT precision: {self.rnnt_precision!r}"
             raise ValueError(msg)
         if self.backend == "tensorrt" and not self.tensorrt_engine_dir:

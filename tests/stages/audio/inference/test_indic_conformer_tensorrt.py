@@ -79,7 +79,7 @@ def test_stage_preserves_nemo_default() -> None:
 
 def test_stage_rejects_unknown_rnnt_precision() -> None:
     with pytest.raises(ValueError, match="RNNT precision"):
-        InferenceIndicConformerHybridStage(rnnt_precision="bf16")
+        InferenceIndicConformerHybridStage(rnnt_precision="int8")
 
 
 def test_stage_requires_engine_directory() -> None:
