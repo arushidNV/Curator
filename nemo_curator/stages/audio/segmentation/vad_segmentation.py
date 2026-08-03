@@ -105,6 +105,7 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
         filepath_key: Key for the audio file path used as fallback when
             waveform is not in memory. Defaults to ``"audio_filepath"``.
             Set to ``"resampled_audio_filepath"`` to read pre-resampled WAVs.
+        num_workers_override: Optional fixed worker count for the executor.
 
     Note:
         Default resources: cpus=1.0, gpus=0.0 (CPU). Silero VAD is lightweight.
@@ -126,7 +127,11 @@ class VADSegmentationStage(ProcessingStage[AudioTask, AudioTask]):
 
     name: str = "VADSegmentation"
     batch_size: int = 8
+    num_workers_override: int | None = None
     resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=4.0))
+
+    def num_workers(self) -> int | None:
+        return self.num_workers_override
 
     def __post_init__(self):
         super().__init__()

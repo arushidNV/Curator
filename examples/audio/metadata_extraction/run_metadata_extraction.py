@@ -88,6 +88,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Path to prebuilt Indic Canary TRT-LLM engine directory. Required when --indic is set.",
     )
     ap.add_argument(
+        "--indic_canary_lid_max_duration_sec",
+        type=float,
+        default=15.0,
+        help="Maximum audio duration passed to Indic Canary LID.",
+    )
+    ap.add_argument("--indic_canary_batch_size", type=int, default=16, help="Indic Canary LID batch size.")
+    ap.add_argument(
+        "--indic_canary_num_workers",
+        type=int,
+        default=1,
+        help="Fixed Indic Canary worker count; use 0 to let the executor decide.",
+    )
+    ap.add_argument(
         "--indic_canary_kv_cache_free_gpu_memory_fraction",
         type=float,
         default=0.2,
@@ -106,6 +119,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Directory to write resampled 16kHz mono WAV files. The output filename matches the input stem with a .wav extension.",
+    )
+    ap.add_argument(
+        "--resampled_subtype",
+        type=str,
+        default="FLOAT",
+        help=(
+            "soundfile subtype for resampled WAV files. "
+            "Use FLOAT to avoid quantization changes in diarization output."
+        ),
     )
 
     vad = ap.add_argument_group("VAD (Silero)")
@@ -163,6 +185,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="GPU memory in GB for each TensorRT VAD worker.",
     )
+    vad.add_argument(
+        "--vad_num_workers",
+        type=int,
+        default=None,
+        help="Fixed VAD worker count; unset or non-positive lets the executor decide.",
+    )
 
     sed = ap.add_argument_group("SED (Sound Event Detection)")
     sed.add_argument("--sed_checkpoint", type=str, default=None, help="Path to PANNs CNN14 checkpoint. Enables SED.")
@@ -187,6 +215,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     sed.add_argument("--sed_gpu_memory_gb", type=float, default=4.0, help="GPU memory for SED stage.")
     sed.add_argument(
+        "--sed_num_workers",
+        type=int,
+        default=None,
+        help="Fixed SED worker count; unset or non-positive lets the executor decide.",
+    )
+    sed.add_argument(
         "--sed_emit_superclasses",
         type=lambda x: x.lower() not in ("false", "0", "no"),
         default=True,
@@ -203,6 +237,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     lid.add_argument("--langid_model", type=str, default=None, help="Model name/path (default depends on backend).")
     lid.add_argument("--langid_gpu_memory_gb", type=float, default=4.0, help="GPU memory for LangID stage.")
+    lid.add_argument(
+        "--langid_max_duration_sec",
+        type=float,
+        default=10.0,
+        help="Maximum audio duration passed to the primary LangID model; use 0 for no truncation.",
+    )
     lid.add_argument(
         "--langid_max_workers",
         type=int,
@@ -229,6 +269,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="GPUs per Sortformer actor (e.g. 1.0 for one full GPU). Overrides sortformer_gpu_memory_gb.",
     )
     diar.add_argument("--sortformer_batch_size", type=int, default=1, help="Sortformer inference batch size.")
+    diar.add_argument(
+        "--sortformer_batch_window",
+        type=int,
+        default=None,
+        help="Recordings supplied to each stage call; defaults to four inference batches.",
+    )
+    diar.add_argument(
+        "--sortformer_num_workers",
+        type=int,
+        default=None,
+        help="Fixed Sortformer worker count; unset or non-positive lets the executor decide.",
+    )
     diar.add_argument(
         "--sortformer_backend",
         choices=["nemo", "tensorrt"],
@@ -313,6 +365,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             max_io_threads=args.max_io_threads,
             read_concurrency=args.read_concurrency,
             resampled_output_dir=args.resampled_output_dir,
+            resampled_subtype=args.resampled_subtype,
             keep_waveform=not args.resampled_output_dir,
         ),
     ]
@@ -325,6 +378,12 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             args.sortformer_model if args.sortformer_model and args.sortformer_model.endswith(".nemo") else None
         )
         model_name = args.sortformer_model or "nvidia/diar_streaming_sortformer_4spk-v2"
+        sortformer_batch_window = args.sortformer_batch_window
+        if sortformer_batch_window is None:
+            sortformer_batch_window = args.sortformer_batch_size * _SORTFORMER_BATCH_WINDOW_MULTIPLIER
+        if sortformer_batch_window < 1:
+            msg = f"--sortformer_batch_window must be positive, got {sortformer_batch_window}"
+            raise ValueError(msg)
         if args.sortformer_gpus is not None:
             sortformer_resources = Resources(gpus=args.sortformer_gpus)
         else:
@@ -334,7 +393,12 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 model_name=model_name,
                 model_path=model_path,
                 inference_batch_size=args.sortformer_batch_size,
-                batch_size=args.sortformer_batch_size * _SORTFORMER_BATCH_WINDOW_MULTIPLIER,
+                batch_size=sortformer_batch_window,
+                num_workers_override=(
+                    args.sortformer_num_workers
+                    if args.sortformer_num_workers is not None and args.sortformer_num_workers > 0
+                    else None
+                ),
                 backend=args.sortformer_backend,
                 tensorrt_engine_path=args.sortformer_tensorrt_engine,
                 tensorrt_config_path=args.sortformer_tensorrt_config,
@@ -360,6 +424,9 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             nested=False,
             filepath_key="resampled_audio_filepath" if args.resampled_output_dir else "audio_filepath",
             resources=vad_resources,
+            num_workers_override=(
+                args.vad_num_workers if args.vad_num_workers is not None and args.vad_num_workers > 0 else None
+            ),
         )
     )
     stages.append(SqueezeWaveformStage())
@@ -371,6 +438,9 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 backend=args.sed_backend,
                 tensorrt_engine_path=args.sed_tensorrt_engine,
                 batch_size=args.sed_batch_size,
+                num_workers_override=(
+                    args.sed_num_workers if args.sed_num_workers is not None and args.sed_num_workers > 0 else None
+                ),
                 resources=Resources(gpu_memory_gb=args.sed_gpu_memory_gb),
             )
         )
@@ -380,6 +450,10 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 emit_superclasses=args.sed_emit_superclasses,
             )
         )
+
+    if args.indic and args.skip_langid:
+        msg = "--indic cannot be combined with --skip_langid"
+        raise ValueError(msg)
 
     if not args.skip_langid:
         langid_max_workers = args.langid_max_workers if args.langid_max_workers > 0 else None
@@ -392,6 +466,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                     source=langid_source,
                     tag="primary",
                     batch_size=args.langid_batch_size,
+                    max_duration_sec=args.langid_max_duration_sec,
                     max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
@@ -403,6 +478,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                     model_name=langid_model,
                     tag="primary",
                     batch_size=args.langid_batch_size,
+                    max_duration_sec=args.langid_max_duration_sec,
                     max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
@@ -414,10 +490,16 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             if not args.indic_canary_engine_dir:
                 msg = "--indic_canary_engine_dir is required when --indic is set"
                 raise ValueError(msg)
+            if args.indic_canary_lid_max_duration_sec <= 0:
+                msg = "--indic_canary_lid_max_duration_sec must be positive"
+                raise ValueError(msg)
             stages.append(
                 IndicCanaryLangIDStage(
                     engine_dir=args.indic_canary_engine_dir,
                     tag="secondary",
+                    max_duration_sec=args.indic_canary_lid_max_duration_sec,
+                    batch_size=args.indic_canary_batch_size,
+                    max_workers=args.indic_canary_num_workers if args.indic_canary_num_workers > 0 else None,
                     kv_cache_free_gpu_memory_fraction=args.indic_canary_kv_cache_free_gpu_memory_fraction,
                     cross_kv_cache_fraction=args.indic_canary_cross_kv_cache_fraction,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
@@ -471,18 +553,26 @@ def main() -> None:
             else f"gpu_memory_gb={args.sortformer_gpu_memory_gb}"
         )
         model = args.sortformer_tensorrt_engine if args.sortformer_backend == "tensorrt" else args.sortformer_model
-        logger.info(f"  Sortformer: {model} ({sf_desc}, on full audio before VAD)")
+        batch_window = args.sortformer_batch_window
+        if batch_window is None:
+            batch_window = args.sortformer_batch_size * _SORTFORMER_BATCH_WINDOW_MULTIPLIER
+        logger.info(
+            f"  Sortformer: {model} ({sf_desc}, inference_batch_size={args.sortformer_batch_size}, "
+            f"batch_window={batch_window}, workers={args.sortformer_num_workers or 'auto'}, "
+            "on full audio before VAD)"
+        )
     logger.info(
         f"  VAD: backend={args.vad_backend}, threshold={args.vad_threshold}, "
         f"min_interval_ms={args.min_interval_ms}, "
-        f"speech_pad_ms={args.speech_pad_ms}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s"
+        f"speech_pad_ms={args.speech_pad_ms}, duration=[{args.min_duration_sec}, {args.max_duration_sec}]s, "
+        f"batch_size={args.vad_batch_size}, workers={args.vad_num_workers or 'auto'}"
     )
     if args.vad_backend == "tensorrt":
         logger.info(f"  VAD GPU memory: {args.vad_gpu_memory_gb} GB/worker")
     if args.sed_checkpoint:
         logger.info(
             f"  SED: backend={args.sed_backend}, checkpoint={args.sed_checkpoint}, "
-            f"batch_size={args.sed_batch_size}"
+            f"batch_size={args.sed_batch_size}, workers={args.sed_num_workers or 'auto'}"
         )
         if args.sed_backend == "tensorrt":
             logger.info(f"  SED TensorRT engine: {args.sed_tensorrt_engine}")
@@ -493,7 +583,8 @@ def main() -> None:
         if args.indic:
             logger.info(
                 f"  LangID: two-pass Indic mode — primary={args.langid_backend} ({langid_desc})"
-                f" + Indic Canary ({args.indic_canary_engine_dir}) -> SelectBestLIDPrediction"
+                f" + Indic Canary ({args.indic_canary_engine_dir}, batch_size={args.indic_canary_batch_size}, "
+                f"workers={args.indic_canary_num_workers or 'auto'}) -> SelectBestLIDPrediction"
             )
         else:
             logger.info(f"  LangID: {args.langid_backend} ({langid_desc})")
