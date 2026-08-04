@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
+from types import MethodType
 from typing import TYPE_CHECKING, Any, Literal
 
 from huggingface_hub import snapshot_download
@@ -23,13 +25,96 @@ from loguru import logger
 from nemo.collections.asr.models import SortformerEncLabelModel
 
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.resources import Resources
+from nemo_curator.tasks import AudioTask
 
 if TYPE_CHECKING:
     import numpy as np
+    import torch
+    from nemo.collections.asr.modules import AudioToMelSpectrogramPreprocessor
 
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
-from nemo_curator.stages.resources import Resources
-from nemo_curator.tasks import AudioTask
+
+
+_NEMO_STFT_BLOCK_SECONDS = 60 * 60
+
+
+def _extract_nemo_features_in_blocks(
+    preprocessor: AudioToMelSpectrogramPreprocessor,
+    waveform: torch.Tensor,
+    sample_count: int,
+) -> torch.Tensor:
+    """Run the streaming Sortformer preprocessor in hour-long STFT blocks."""
+    import torch
+
+    featurizer = preprocessor.featurizer
+    hop_length = featurizer.hop_length
+    context_hops = math.ceil((featurizer.n_fft / 2) / hop_length)
+    block_samples = int(_NEMO_STFT_BLOCK_SECONDS * preprocessor._sample_rate)
+    block_samples -= block_samples % hop_length
+    sample_count = min(int(sample_count), int(waveform.numel()))
+    expected_frames = sample_count // hop_length
+    if expected_frames == 0:
+        return torch.empty((featurizer.nfilt, 0), dtype=torch.float32)
+
+    context_samples = context_hops * hop_length
+    blocks: list[torch.Tensor] = []
+    for start in range(0, sample_count, block_samples):
+        end = min(start + block_samples, sample_count)
+        logical_frames = end // hop_length - start // hop_length
+        if logical_frames == 0:
+            continue
+
+        read_start = max(0, start - context_samples)
+        read_end = min(sample_count, end + context_samples)
+        signal = waveform.reshape(-1)[read_start:read_end]
+        if start < context_samples:
+            signal = torch.nn.functional.pad(signal, (context_samples - start, 0))
+
+        device = next(preprocessor.buffers()).device
+        signal = signal.reshape(1, -1).to(device=device, dtype=torch.float32, non_blocking=True)
+        signal_length = torch.tensor([signal.shape[1]], dtype=torch.long, device=device)
+        processed, _ = preprocessor(input_signal=signal, length=signal_length)
+        block = processed[0, :, context_hops : context_hops + logical_frames]
+        blocks.append(block.to(device="cpu"))
+
+    features = torch.cat(blocks, dim=1)
+    if features.shape[1] != expected_frames:
+        msg = f"Bounded NeMo STFT produced {features.shape[1]} frames; expected {expected_frames}"
+        raise RuntimeError(msg)
+    return features
+
+
+def _bounded_nemo_process_signal(
+    model: SortformerEncLabelModel,
+    audio_signal: torch.Tensor,
+    audio_signal_length: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Replacement for NeMo ``process_signal`` that runs bounded STFTs."""
+    import torch
+
+    source = audio_signal.detach().to(device="cpu")
+    lengths = audio_signal_length.detach().to(device="cpu", dtype=torch.long)
+    feature_list = [
+        _extract_nemo_features_in_blocks(
+            model.preprocessor,
+            source[index],
+            int(lengths[index].item()),
+        )
+        for index in range(source.shape[0])
+    ]
+    feature_lengths = torch.tensor([item.shape[1] for item in feature_list], dtype=torch.long)
+    max_feature_length = int(feature_lengths.max().item())
+    feature_dim = feature_list[0].shape[0]
+    pad_value = float(getattr(model.preprocessor.featurizer, "pad_value", 0.0))
+    processed = torch.full(
+        (len(feature_list), feature_dim, max_feature_length),
+        pad_value,
+        dtype=feature_list[0].dtype,
+    )
+    for index, item in enumerate(feature_list):
+        processed[index, :, : item.shape[1]] = item
+    return processed.to(model.device), feature_lengths.to(model.device)
 
 
 def _parse_sortformer_segments(raw_segments: list) -> list[dict[str, Any]]:
@@ -242,6 +327,7 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
         if self.diar_model is not None:
             self.diar_model.eval()
             self._configure_streaming()
+            self._enable_bounded_nemo_stft()
             self._compile_encoder()
             return
 
@@ -263,12 +349,16 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
         self.diar_model.eval()
         self._configure_streaming()
+        self._enable_bounded_nemo_stft()
         self._compile_encoder()
 
     def teardown(self) -> None:
         if self._tensorrt_model is not None:
             self._tensorrt_model.close()
             self._tensorrt_model = None
+        if self.diar_model is not None and hasattr(self.diar_model, "_curator_original_process_signal"):
+            self.diar_model.process_signal = self.diar_model._curator_original_process_signal
+            del self.diar_model._curator_original_process_signal
 
     def _configure_streaming(self) -> None:
         """Apply explicit streaming overrides to the loaded model."""
@@ -294,6 +384,17 @@ class InferenceSortformerStage(ProcessingStage[AudioTask, AudioTask]):
 
         self.diar_model.encoder = torch.compile(self.diar_model.encoder, dynamic=False)
         logger.info("Sortformer: compiled encoder")
+
+    def _enable_bounded_nemo_stft(self) -> None:
+        """Use bounded STFT extraction for the standard streaming NeMo model."""
+        if (
+            not isinstance(self.diar_model, SortformerEncLabelModel)
+            or not self.diar_model.streaming_mode
+            or hasattr(self.diar_model, "_curator_original_process_signal")
+        ):
+            return
+        self.diar_model._curator_original_process_signal = self.diar_model.process_signal
+        self.diar_model.process_signal = MethodType(_bounded_nemo_process_signal, self.diar_model)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
