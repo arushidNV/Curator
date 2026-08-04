@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Select the best language-ID prediction from SpeechBrain/AmberNet and Indic Canary.
+"""Select the best language-ID prediction from SpeechBrain/AmberNet, Whisper, and Indic Canary.
 
 Reads ``LangIDResult`` entries from ``task.data[lid_key]`` (tagged ``primary`` /
 ``secondary``). Routing:
 
-- SpeechBrain predicted a **non-Indic** language → keep the SpeechBrain prediction.
+- SpeechBrain predicted a **non-Indic** language → cross-check with Whisper (if present).
+  If both agree, record an agreement note; if they disagree, set ``_skipme`` and a
+  disagreement note.
 - SpeechBrain predicted an **Indic** language → use Indic Canary as ``source_lang``.
   If both models agree on the language code, record an agreement note; otherwise
   record disagreement and set ``_skipme``.
@@ -66,6 +68,7 @@ _MODEL_LABELS = {
     "SpeechBrainLangID": "speechbrain",
     "AmberNetLangID": "ambernet",
     "IndicCanaryLangID": "indic_canary",
+    "WhisperLangID": "whisper",
 }
 
 
@@ -127,6 +130,7 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
 
         sb_result: LangIDResult | None = None
         canary_result: LangIDResult | None = None
+        whisper_result: LangIDResult | None = None
         for entry in lid_entries:
             for model_name, result in entry.items():
                 if not isinstance(result, LangIDResult):
@@ -135,6 +139,8 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
                     sb_result = result
                 elif model_name == "IndicCanaryLangID":
                     canary_result = result
+                elif model_name == "WhisperLangID":
+                    whisper_result = result
                 else:
                     raise ValueError(f"Invalid model name: {model_name}")
 
@@ -176,6 +182,31 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
             )
             task.data[self.skip_me_key] = (
                 f"skipped due to disagreement between {sb_result.tag} and {canary_result.tag} langID models."
+            )
+            return task
+
+        # Non-Indic: cross-check with Whisper when available.
+        if whisper_result is not None:
+            if whisper_result.language == sb_result.language:
+                task.data[self.output_key] = sb_result.language
+                task.data[self.notes_key][self.confidence_key] = float(sb_result.confidence)
+                set_note(
+                    task.data,
+                    self.name,
+                    f"used {sb_result.tag}, agreement between {sb_result.tag} and {whisper_result.tag} langID models.",
+                    self.notes_key,
+                )
+                return task
+            task.data[self.output_key] = sb_result.language
+            task.data[self.notes_key][self.confidence_key] = float(sb_result.confidence)
+            set_note(
+                task.data,
+                self.name,
+                f"used {sb_result.tag}, disagreement between {sb_result.tag} and {whisper_result.tag}",
+                self.notes_key,
+            )
+            task.data[self.skip_me_key] = (
+                f"skipped due to disagreement between {sb_result.tag} and {whisper_result.tag} langID models."
             )
             return task
 
