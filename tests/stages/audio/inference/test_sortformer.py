@@ -18,9 +18,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from nemo.collections.asr.modules import AudioToMelSpectrogramPreprocessor
 
 from nemo_curator.stages.audio.inference.sortformer import (
     InferenceSortformerStage,
+    _extract_nemo_features_in_blocks,
     _parse_sortformer_segments,
     _write_rttm,
 )
@@ -63,6 +65,37 @@ class TestParseSortformerSegments:
     def test_unrecognised_format_warns(self) -> None:
         out = _parse_sortformer_segments([42])
         assert out == []
+
+
+class TestNemoStreamingStft:
+    @staticmethod
+    def _make_preprocessor(normalize: str = "NA") -> AudioToMelSpectrogramPreprocessor:
+        return AudioToMelSpectrogramPreprocessor(
+            sample_rate=1600,
+            window_size=None,
+            window_stride=None,
+            n_window_size=16,
+            n_window_stride=8,
+            n_fft=16,
+            features=8,
+            normalize=normalize,
+            dither=0.0,
+            pad_to=0,
+        ).eval()
+
+    def test_bounded_nemo_stft_matches_full_preprocessor(self) -> None:
+        preprocessor = self._make_preprocessor()
+        waveform = torch.sin(torch.arange(103, dtype=torch.float32) * 0.2)
+        expected, expected_length = preprocessor(
+            input_signal=waveform.unsqueeze(0),
+            length=torch.tensor([waveform.numel()]),
+        )
+
+        with patch("nemo_curator.stages.audio.inference.sortformer._NEMO_STFT_BLOCK_SECONDS", 0.02):
+            actual = _extract_nemo_features_in_blocks(preprocessor, waveform, waveform.numel())
+
+        assert actual.shape[1] == expected_length.item()
+        torch.testing.assert_close(actual, expected[0, :, : expected_length.item()])
 
 
 class TestWriteRttm:
