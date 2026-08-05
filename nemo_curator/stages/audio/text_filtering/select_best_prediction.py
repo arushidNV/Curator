@@ -35,36 +35,36 @@ def _normalize_for_wer(text: str) -> str:
 class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     """Select the best available prediction and write it to ``best_prediction``.
 
-      Selection priority:
+    Selection priority (applied in order, first match wins):
 
-      1. **ASR recovery** -- if ``notes_key`` contains "Recovered" and
-         ``asr_text_key`` is non-empty, the ASR prediction is used.
-      2. **Cross-model agreement** -- if *both* omni and ASR were flagged as
-         hallucinated yet their texts agree (WER between them ≤
-         ``100 - min_agreement_pct``), the omni prediction is kept and the
-         sample is marked recovered because two independent models producing
-         near-identical output is strong evidence the text is correct.
-      3. **Fallback** -- the primary (omni) prediction is used as-is.
+    0. **Short-audio ground truth** -- if ``use_ground_truth_for_short_audio``
+       is ``True`` (default), ``duration_key`` parses to a valid float > 0,
+       and that duration is below ``short_audio_threshold`` (default 1.0 s),
+       the text at ``reference_text_key`` is used directly. This avoids
+       hallucinations that ASR models produce on very short clips. Missing,
+       non-numeric, or non-positive duration values are ignored and fall
+       through to the normal selection logic.
+    1. **Forced ground truth** -- if ``force_reference`` is ``True``, the text
+       at ``reference_text_key`` is always used, regardless of model output.
+       Intended for languages where model output is not trusted at all.
+    2. **ASR recovery** -- if ``notes_key`` contains "Recovered" and
+       ``asr_text_key`` is non-empty, the ASR prediction is used.
+    3. **Cross-model agreement** -- if *both* omni and ASR were flagged as
+       hallucinated yet their texts agree (WER ≤ ``100 - min_agreement_pct``),
+       the omni prediction is kept and the sample is marked recovered.
+    4. **Fallback** -- the primary (omni) prediction is used as-is.
 
-      When ``use_reference_on_hallucination`` is enabled and the primary
-    output is flagged as a hallucination, the text at
-    ``reference_text_key`` (e.g. the dataset's original transcript) is
-    used instead, if non-empty.
+    When ``use_reference_on_hallucination`` is enabled and the primary output
+    is flagged as a hallucination, the text at ``reference_text_key`` is used
+    instead, if non-empty.
 
-      When the primary model does not support the sample's language and no
-      fallback/recovery model produced a usable transcription, the text at
-      ``reference_text_key`` (the original manifest ground truth) is used
-      instead, if non-empty, and ``source_key`` is set to
-      ``ground_truth_source_label``.
+    When the primary model does not support the sample's language and no
+    fallback/recovery model produced a usable transcription, the text at
+    ``reference_text_key`` is used instead, if non-empty, and ``source_key``
+    is set to ``ground_truth_source_label``.
 
-      This allows downstream stages (FastTextLID, RegexSubstitution) to
-      always read from ``best_prediction`` regardless of which model
-      produced the final text.
-
-      The model that produced the final text is recorded in
-      ``source_key`` (default ``best_prediction_source``): ``"primary"``
-      when the primary model's prediction is kept, or ``"fallback"``
-      when the recovery model's prediction is chosen.
+    The source of the final text is recorded in ``source_key``
+    (default ``best_prediction_source``).
     """
 
     primary_text_key: str = "primary_model_prediction"
