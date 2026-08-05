@@ -375,6 +375,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "fields. Used for languages where model output is not trusted for the final transcript."
         ),
     )
+    tf.add_argument(
+        "--no_ground_truth_for_short_audio",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable automatic ground truth fallback for audio shorter than "
+            "--short_audio_threshold seconds (default 1.0s). By default this fallback "
+            "is ON because models like Qwen Omni hallucinate on very short clips."
+        ),
+    )
+    tf.add_argument(
+        "--short_audio_threshold",
+        type=float,
+        default=1.0,
+        metavar="SECONDS",
+        help="Duration threshold in seconds below which ground truth is always used (default: 1.0).",
+    )
 
     sed = ap.add_argument_group("SED (sound event detection)")
     sed.add_argument(
@@ -1018,6 +1035,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             reference_text_key=args.reference_text_key,
             use_reference_on_hallucination=args.use_reference_on_hallucination,
             force_reference=force_reference,
+            use_ground_truth_for_short_audio=not args.no_ground_truth_for_short_audio,
+            short_audio_threshold=args.short_audio_threshold,
         )
     )
 

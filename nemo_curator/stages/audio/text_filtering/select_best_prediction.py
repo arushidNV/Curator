@@ -73,6 +73,7 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     source_key: str = "best_prediction_source"
     notes_key: str = "additional_notes"
     skip_me_key: str = "_skipme"
+    duration_key: str = "duration"
     min_agreement_pct: float = 80.0
     agreement_wer_key: str = "omni_asr_agreement_wer"
     primary_source_label: str = "primary"
@@ -80,6 +81,8 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     reference_text_key: str | None = None
     use_reference_on_hallucination: bool = False
     force_reference: bool = False
+    use_ground_truth_for_short_audio: bool = True
+    short_audio_threshold: float = 1.0
     reference_source_label: str = "reference"
     ground_truth_source_label: str = "ground_truth"
     name: str = "SelectBestPrediction"
@@ -95,6 +98,18 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.output_key, self.skip_me_key, self.agreement_wer_key, self.source_key]
 
     def process(self, task: AudioTask) -> AudioTask:  # noqa: C901, PLR0911, PLR0915
+        # Short audio: model hallucinates on <1s clips — always use ground truth if available
+        if self.use_ground_truth_for_short_audio and self.reference_text_key:
+            duration = float(task.data.get(self.duration_key, 0.0) or 0.0)
+            if duration < self.short_audio_threshold:
+                ref_text = str(task.data.get(self.reference_text_key, "") or "").strip()
+                if ref_text:
+                    task.data[self.output_key] = ref_text
+                    task.data[self.source_key] = self.ground_truth_source_label
+                    task.data[self.skip_me_key] = ""
+                    set_note(task.data, self.name, f"Ground Truth (short audio {duration:.2f}s < {self.short_audio_threshold}s)", self.notes_key)
+                    return task
+
         primary_pred = task.data.get(self.primary_text_key, "")
         asr_pred = task.data.get(self.asr_text_key, "")
         notes = task.data.get(self.notes_key, {})
