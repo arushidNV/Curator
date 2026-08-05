@@ -91,6 +91,7 @@ class TestNeMoSpeechWriterStage:
             dataset_name="test",
             data={
                 "read_error": True,
+                "audio_too_long": True,
                 "original_file": "s3://bucket/audio/broken.m4a",
                 "audio_filepath": "s3://bucket/audio/broken.m4a",
             },
@@ -102,6 +103,7 @@ class TestNeMoSpeechWriterStage:
         manifest_path = output_dir / "shard_b.jsonl"
         entry = json.loads(manifest_path.read_text(encoding="utf-8").strip())
         assert entry["read_error"] is True
+        assert entry["audio_too_long"] is True
         assert not (output_dir / "shard_b.jsonl.done").is_file()
 
         task2 = AudioTask(
