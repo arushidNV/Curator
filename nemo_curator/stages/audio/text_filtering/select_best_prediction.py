@@ -100,14 +100,23 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     def process(self, task: AudioTask) -> AudioTask:  # noqa: C901, PLR0911, PLR0915
         # Short audio: model hallucinates on <1s clips — always use ground truth if available
         if self.use_ground_truth_for_short_audio and self.reference_text_key:
-            duration = float(task.data.get(self.duration_key, 0.0) or 0.0)
-            if duration < self.short_audio_threshold:
+            duration_raw = task.data.get(self.duration_key)
+            try:
+                duration = float(duration_raw)
+            except (TypeError, ValueError):
+                duration = None
+            if duration is not None and 0.0 < duration < self.short_audio_threshold:
                 ref_text = str(task.data.get(self.reference_text_key, "") or "").strip()
                 if ref_text:
                     task.data[self.output_key] = ref_text
                     task.data[self.source_key] = self.ground_truth_source_label
                     task.data[self.skip_me_key] = ""
-                    set_note(task.data, self.name, f"Ground Truth (short audio {duration:.2f}s < {self.short_audio_threshold}s)", self.notes_key)
+                    set_note(
+                        task.data,
+                        self.name,
+                        f"Ground Truth (short audio {duration:.2f}s < {self.short_audio_threshold}s)",
+                        self.notes_key,
+                    )
                     return task
 
         primary_pred = task.data.get(self.primary_text_key, "")
