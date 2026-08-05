@@ -826,8 +826,6 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 {
                     "read_error": True,
                     "audio_too_long": True,
-                    "sampling_rate": cut.recording.sampling_rate,
-                    "sample_rate": cut.recording.sampling_rate,
                     "duration": cut.duration,
                     "num_channels": 1,
                     "corpus": corpus,

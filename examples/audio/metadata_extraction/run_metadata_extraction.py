@@ -346,12 +346,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     out = ap.add_argument_group("Output")
     out.add_argument("--target_sample_rate", type=int, default=16000, help="Output sample rate.")
-    out.add_argument(
-        "--save_audio",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Write segmented opus files alongside the JSONL manifest (default: enabled).",
-    )
 
     ex = ap.add_argument_group("Executor")
     ex.add_argument(
@@ -548,7 +542,6 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             output_dir=args.output_dir,
             target_sample_rate=args.target_sample_rate,
             writer_concurrency=args.writer_concurrency,
-            save_audio=args.save_audio,
         )
     )
     return stages
