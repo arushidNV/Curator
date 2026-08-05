@@ -1038,6 +1038,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             force_reference=force_reference,
             use_ground_truth_for_short_audio=short_audio_gt,
             short_audio_threshold=args.short_audio_threshold,
+            primary_model_type=args.primary_model,
         )
     )
 
