@@ -1027,6 +1027,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     if force_reference and not args.reference_text_key:
         msg = "--best_prediction_source reference requires --reference_text_key."
         raise SystemExit(msg)
+    short_audio_gt = not args.no_ground_truth_for_short_audio
     stages.append(
         SelectBestPredictionStage(
             primary_text_key=primary_text_key,
@@ -1035,7 +1036,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             reference_text_key=args.reference_text_key,
             use_reference_on_hallucination=args.use_reference_on_hallucination,
             force_reference=force_reference,
-            use_ground_truth_for_short_audio=not args.no_ground_truth_for_short_audio,
+            use_ground_truth_for_short_audio=short_audio_gt,
             short_audio_threshold=args.short_audio_threshold,
         )
     )

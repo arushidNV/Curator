@@ -40,10 +40,11 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     0. **Short-audio ground truth** -- if ``use_ground_truth_for_short_audio``
        is ``True`` (default), ``duration_key`` parses to a valid float > 0,
        and that duration is below ``short_audio_threshold`` (default 1.0 s),
-       the text at ``reference_text_key`` is used directly. This avoids
-       hallucinations that ASR models produce on very short clips. Missing,
-       non-numeric, or non-positive duration values are ignored and fall
-       through to the normal selection logic.
+       the non-empty text at ``reference_text_key`` is used as the best
+       prediction. If the reference text is empty or the duration is missing,
+       non-numeric, or non-positive, the fallback is skipped and normal
+       selection logic applies. This avoids hallucinations that ASR models
+       produce on very short clips.
     1. **Forced ground truth** -- if ``force_reference`` is ``True``, the text
        at ``reference_text_key`` is always used, regardless of model output.
        Intended for languages where model output is not trusted at all.
@@ -78,7 +79,7 @@ class SelectBestPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     agreement_wer_key: str = "omni_asr_agreement_wer"
     primary_source_label: str = "primary"
     fallback_source_label: str = "fallback"
-    reference_text_key: str | None = None
+    reference_text_key: str | None = "granary_v1_prediction"
     use_reference_on_hallucination: bool = False
     force_reference: bool = False
     use_ground_truth_for_short_audio: bool = True
