@@ -131,6 +131,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Use FLOAT to avoid quantization changes in diarization output."
         ),
     )
+    ap.add_argument(
+        "--max_audio_duration_sec",
+        type=float,
+        default=12 * 60 * 60,
+        help="Maximum source-audio duration to process (default: 12 hours; 0 disables the limit).",
+    )
 
     vad = ap.add_argument_group("VAD (Silero)")
     vad.add_argument(
@@ -386,6 +392,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             read_concurrency=args.read_concurrency,
             resampled_output_dir=args.resampled_output_dir,
             resampled_subtype=args.resampled_subtype,
+            max_audio_duration_sec=args.max_audio_duration_sec,
             keep_waveform=not args.resampled_output_dir,
         ),
     ]

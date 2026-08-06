@@ -317,11 +317,13 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         if task.data.get("read_error"):
             manifest_entry = {
                 "audio_filepath": "",
-                "duration": 0.0,
+                "duration": task.data.get("duration", 0.0),
                 "sample_rate": self.target_sample_rate,
                 "sampling_rate": self.target_sample_rate,
                 "read_error": True,
             }
+            if task.data.get("audio_too_long"):
+                manifest_entry["audio_too_long"] = True
             if original_file:
                 manifest_entry["original_audio_filepath"] = original_file
             for key in ("corpus", "shard_id", "source_lang"):

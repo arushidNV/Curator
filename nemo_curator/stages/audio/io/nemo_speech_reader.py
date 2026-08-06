@@ -405,6 +405,10 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         max_io_threads: Maximum number of concurrent I/O threads for
             loading audio files in ``process_batch``. Only applies to
             single-entry (non-tarred) tasks. Defaults to 8.
+        max_audio_duration_sec: Maximum source-audio duration to process.
+            Recordings longer than this are emitted as ``read_error`` audit
+            rows with ``audio_too_long=True`` rather than being decoded.
+            Defaults to 12 hours; set to 0 or ``None`` to disable the limit.
         resampled_output_dir: If set, write resampled 16 kHz mono WAV files
             to this directory. The output filename matches the input stem
             with a ``.wav`` extension.
@@ -419,6 +423,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     # Max shards read in parallel. Caps in-flight waveforms so the object store
     # doesn't overflow (without it, Ray launches up to one reader task per CPU).
     read_concurrency: int = 2
+    max_audio_duration_sec: float | None = 12 * 60 * 60
     resampled_output_dir: str | None = None
     resampled_subtype: str = "FLOAT"
     keep_waveform: bool = True
@@ -689,7 +694,16 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         for stale in ("language_pred", "language_pred_source", "language_pred_prob"):
             entry_data.pop(stale, None)
 
-    def _read_error_task(self, task: FileGroupTask) -> AudioTask:
+    def _duration_exceeds_limit(self, duration: Any) -> bool:  # noqa: ANN401
+        """Return whether a known duration exceeds the configured limit."""
+        if self.max_audio_duration_sec is None or self.max_audio_duration_sec <= 0:
+            return False
+        try:
+            return float(duration) > self.max_audio_duration_sec
+        except (TypeError, ValueError):
+            return False
+
+    def _read_error_task(self, task: FileGroupTask, *, audio_too_long: bool = False) -> AudioTask:
         """Build a read_error placeholder AudioTask for a source that could not be read.
 
         Emitting a placeholder (rather than dropping the task) is what lets a shard
@@ -712,6 +726,8 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 "original_file": audio_path,
             }
         )
+        if audio_too_long:
+            entry_data["audio_too_long"] = True
         if language and "source_lang" not in entry_data:
             entry_data["source_lang"] = language
         shard_total = task.reader_config.get("shard_total", 0)
@@ -728,6 +744,14 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         audio_path = task.data[0]
         hint_sr = entry.get("sampling_rate") or entry.get("sample_rate")
 
+        # Prefer actual duration when the source manifest provides it.  This
+        # prevents a multi-hour recording from being decoded into memory just
+        # to discover that it exceeds the reader's safety limit.
+        source_duration = entry.get("actual_duration", entry.get("duration", entry.get("proposed_duration")))
+        if self._duration_exceeds_limit(source_duration):
+            logger.warning(f"Audio exceeds duration limit, emitting read-error placeholder: {audio_path}")
+            return [self._read_error_task(task, audio_too_long=True)]
+
         try:
             audio, sr, duration = self._load_audio(
                 audio_path,
@@ -737,6 +761,10 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Unreadable audio, emitting read-error placeholder: {audio_path} ({exc})")
             return [self._read_error_task(task)]
+
+        if self._duration_exceeds_limit(duration):
+            logger.warning(f"Audio exceeds duration limit after decode, emitting read-error placeholder: {audio_path}")
+            return [self._read_error_task(task, audio_too_long=True)]
 
         # When the manifest entry describes a sub-segment of the source recording
         # (segment-level input, e.g. Granary ASR reading metadata_extraction output),
@@ -784,6 +812,31 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
     def _build_cut_entry(self, cut: Any, corpus: str, language: str) -> dict[str, Any]:  # noqa: ANN401
         """Decode a single cut and return an entry_data dict (or raise on failure)."""
+        entry_data = dict(cut.custom) if cut.custom else {}
+        self._normalize_lang_fields(entry_data)
+        audio_filepath = ""
+        if cut.recording and cut.recording.sources:
+            src = cut.recording.sources[0].source
+            audio_filepath = src if isinstance(src, str) else cut.id
+
+        # CutSet inputs expose their duration before audio loading, so apply
+        # the same guard without materialising a potentially huge waveform.
+        if self._duration_exceeds_limit(cut.duration):
+            entry_data.update(
+                {
+                    "read_error": True,
+                    "audio_too_long": True,
+                    "duration": cut.duration,
+                    "num_channels": 1,
+                    "corpus": corpus,
+                    "audio_filepath": audio_filepath or cut.id,
+                    "original_file": audio_filepath or cut.id,
+                }
+            )
+            if language and "source_lang" not in entry_data:
+                entry_data["source_lang"] = language
+            return entry_data
+
         audio = cut.load_audio().squeeze()
         if audio.ndim > 1:
             audio = audio.mean(axis=0)
@@ -797,8 +850,6 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 audio = librosa.resample(audio, orig_sr=actual_sr, target_sr=target_sr)
 
         audio = np.asarray(audio, dtype=np.float32)
-        entry_data = dict(cut.custom) if cut.custom else {}
-        self._normalize_lang_fields(entry_data)
         entry_data.update(
             {
                 "sampling_rate": target_sr,
@@ -808,11 +859,6 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
                 "corpus": corpus,
             }
         )
-
-        audio_filepath = ""
-        if cut.recording and cut.recording.sources:
-            src = cut.recording.sources[0].source
-            audio_filepath = src if isinstance(src, str) else cut.id
 
         if self.resampled_output_dir:
             source_name = audio_filepath or cut.id
@@ -943,6 +989,10 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
         max_io_threads: Maximum concurrent threads for loading audio
             from S3/object storage. Higher values overlap more network
             latency but use more memory. Defaults to 8.
+        max_audio_duration_sec: Maximum source-audio duration to process.
+            Longer recordings become ``read_error`` audit rows marked
+            ``audio_too_long``. Defaults to 12 hours; 0 or ``None`` disables
+            the guard.
         resampled_output_dir: If set, write resampled 16 kHz mono WAV files
             to this directory. The output filename matches the input stem
             with a ``.wav`` extension.
@@ -959,6 +1009,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
     output_dir: str | None = None
     max_io_threads: int = 8
     read_concurrency: int = 2
+    max_audio_duration_sec: float | None = 12 * 60 * 60
     resampled_output_dir: str | None = None
     resampled_subtype: str = "FLOAT"
     keep_waveform: bool = True
@@ -979,6 +1030,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
             NeMoSpeechReaderStage(
                 max_io_threads=self.max_io_threads,
                 read_concurrency=self.read_concurrency,
+                max_audio_duration_sec=self.max_audio_duration_sec,
                 resampled_output_dir=self.resampled_output_dir,
                 resampled_subtype=self.resampled_subtype,
                 keep_waveform=self.keep_waveform,
