@@ -340,6 +340,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     out = ap.add_argument_group("Output")
     out.add_argument("--target_sample_rate", type=int, default=16000, help="Output sample rate.")
+    out.add_argument(
+        "--no_save_audio",
+        dest="save_audio",
+        action="store_false",
+        default=True,
+        help="Write only the JSONL manifest — skip encoding the millions of per-segment opus "
+             "files (avoids the inode blow-up on shared filesystems). Pair with "
+             "--resampled_output_dir so the tarring stage can regenerate each clip's opus on "
+             "the fly (tar_shards.py --opus-from-resampled).",
+    )
 
     ex = ap.add_argument_group("Executor")
     ex.add_argument(
@@ -535,6 +545,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             output_dir=args.output_dir,
             target_sample_rate=args.target_sample_rate,
             writer_concurrency=args.writer_concurrency,
+            save_audio=args.save_audio,
         )
     )
     return stages
