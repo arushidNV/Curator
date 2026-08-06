@@ -16,8 +16,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+import torch
+from nemo.collections.asr.modules import AudioToMelSpectrogramPreprocessor
+
 from nemo_curator.stages.audio.inference.sortformer import (
     InferenceSortformerStage,
+    _extract_nemo_features_in_blocks,
     _parse_sortformer_segments,
     _write_rttm,
 )
@@ -50,6 +55,10 @@ class TestParseSortformerSegments:
         assert len(out) == 2
         assert out[0] == {"start": 0.0, "end": 2.0, "speaker": "speaker_0"}
 
+    def test_parses_dict_segments(self) -> None:
+        segment = {"start": 0.0, "end": 2.0, "speaker": "speaker_0"}
+        assert _parse_sortformer_segments([segment]) == [segment]
+
     def test_empty_list_returns_empty(self) -> None:
         assert _parse_sortformer_segments([]) == []
 
@@ -58,7 +67,46 @@ class TestParseSortformerSegments:
         assert out == []
 
 
+class TestNemoStreamingStft:
+    @staticmethod
+    def _make_preprocessor(normalize: str = "NA") -> AudioToMelSpectrogramPreprocessor:
+        return AudioToMelSpectrogramPreprocessor(
+            sample_rate=1600,
+            window_size=None,
+            window_stride=None,
+            n_window_size=16,
+            n_window_stride=8,
+            n_fft=16,
+            features=8,
+            normalize=normalize,
+            dither=0.0,
+            pad_to=0,
+        ).eval()
+
+    def test_bounded_nemo_stft_matches_full_preprocessor(self) -> None:
+        preprocessor = self._make_preprocessor()
+        waveform = torch.sin(torch.arange(103, dtype=torch.float32) * 0.2)
+        expected, expected_length = preprocessor(
+            input_signal=waveform.unsqueeze(0),
+            length=torch.tensor([waveform.numel()]),
+        )
+
+        with patch("nemo_curator.stages.audio.inference.sortformer._NEMO_STFT_BLOCK_SECONDS", 0.02):
+            actual = _extract_nemo_features_in_blocks(preprocessor, waveform, waveform.numel())
+
+        assert actual.shape[1] == expected_length.item()
+        torch.testing.assert_close(actual, expected[0, :, : expected_length.item()])
+
+
 class TestWriteRttm:
+    def test_rejects_unknown_precision(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported Sortformer precision"):
+            InferenceSortformerStage(precision="int8")  # type: ignore[arg-type]
+
+    def test_tensorrt_requires_all_artifacts(self) -> None:
+        with pytest.raises(ValueError, match="requires engine, config, and runtime module"):
+            InferenceSortformerStage(backend="tensorrt", tensorrt_engine_path="model.plan")
+
     def test_writes_rttm_file(self, tmp_path: Path) -> None:
         segments = [
             {"start": 0.0, "end": 2.5, "speaker": "speaker_0"},
@@ -101,12 +149,43 @@ class TestWriteRttm:
             stage.setup_on_node()
             mock_dl.assert_not_called()
 
-    def test_setup_skips_when_model_provided(self) -> None:
+    def test_setup_uses_tensorrt_runtime(self) -> None:
+        stage = InferenceSortformerStage(
+            backend="tensorrt",
+            tensorrt_engine_path="model.plan",
+            tensorrt_config_path="model.json",
+            tensorrt_runtime_module_path="sortformer_modules.py",
+            inference_batch_size=2,
+        )
+        runtime = MagicMock()
+        runtime.diarize.return_value = [[], []]
+        with patch(
+            "nemo_curator.stages.audio.inference.sortformer_tensorrt.TensorRTSortformer",
+            return_value=runtime,
+        ) as runtime_class:
+            stage.setup()
+
+        runtime_class.assert_called_once_with("model.plan", "model.json", "sortformer_modules.py", 2)
+        runtime.diarize.assert_not_called()
+        stage.teardown()
+        runtime.close.assert_called_once_with()
+
+    def test_setup_preserves_model_streaming_config(self) -> None:
         mock_model = MagicMock()
-        mock_model.sortformer_modules = MagicMock()
+        mock_model.sortformer_modules = SimpleNamespace(
+            chunk_len=264,
+            chunk_right_context=1,
+            fifo_len=0,
+            spkcache_update_period=188,
+            spkcache_len=264,
+        )
         stage = InferenceSortformerStage(diar_model=mock_model)
         stage.setup()
-        assert mock_model.sortformer_modules.chunk_len == 340
+        assert mock_model.sortformer_modules.chunk_len == 264
+        assert mock_model.sortformer_modules.chunk_right_context == 1
+        assert mock_model.sortformer_modules.fifo_len == 0
+        assert mock_model.sortformer_modules.spkcache_update_period == 188
+        assert mock_model.sortformer_modules.spkcache_len == 264
 
     def test_streaming_config_applied(self) -> None:
         mock_model = MagicMock()
@@ -126,6 +205,19 @@ class TestWriteRttm:
         assert sm.fifo_len == 124
         assert sm.spkcache_update_period == 124
         assert sm.spkcache_len == 200
+        sm._check_streaming_parameters.assert_called_once_with()
+
+    def test_setup_compiles_encoder(self) -> None:
+        mock_model = MagicMock()
+        mock_model.sortformer_modules = MagicMock()
+        mock_model.diarize.return_value = [[]]
+        stage = InferenceSortformerStage(diar_model=mock_model, compile_encoder=True)
+        encoder = mock_model.encoder
+
+        with patch("torch.compile", return_value=MagicMock()) as mock_compile:
+            stage.setup()
+
+        mock_compile.assert_called_once_with(encoder, dynamic=False)
 
     def _make_mock_model(self, fake_segments_per_file: list[list[str]]) -> MagicMock:
         mock_model = MagicMock()
@@ -174,6 +266,49 @@ class TestWriteRttm:
         rttm_file = tmp_path / shard_key / "rttm" / "my_audio.rttm"
         assert rttm_file.exists()
         assert task.data["rttm_filepath"] == f"{shard_key}/rttm/my_audio.rttm"
+
+    def test_bfloat16_inference_uses_autocast(self) -> None:
+        mock_model = self._make_mock_model([[]])
+        stage = InferenceSortformerStage(diar_model=mock_model, precision="bf16")
+
+        with patch("torch.autocast") as mock_autocast:
+            stage.process(AudioTask(data={"audio_filepath": "/test/audio1.wav"}))
+
+        mock_autocast.assert_called_once_with(device_type="cuda", dtype=torch.bfloat16)
+
+    def test_process_batch_uses_inference_batch_size(self) -> None:
+        fake_output = [[f"0.00 1.00 speaker_{index}"] for index in range(4)]
+        mock_model = self._make_mock_model(fake_output)
+        stage = InferenceSortformerStage(diar_model=mock_model, inference_batch_size=4)
+        tasks = [AudioTask(data={"audio_filepath": f"/test/audio{index}.wav"}) for index in range(4)]
+
+        stage.process_batch(tasks)
+
+        mock_model.diarize.assert_called_once_with(
+            audio=[f"/test/audio{index}.wav" for index in range(4)],
+            batch_size=4,
+        )
+
+    def test_process_batch_orders_by_duration_and_restores_results(self) -> None:
+        durations = [8.0, 2.0, 7.0, 1.0]
+        sorted_indices = [3, 1, 2, 0]
+        fake_output = [[f"0.00 1.00 speaker_{index}"] for index in sorted_indices]
+        mock_model = self._make_mock_model(fake_output)
+        stage = InferenceSortformerStage(diar_model=mock_model, inference_batch_size=2)
+        tasks = [
+            AudioTask(data={"audio_filepath": f"/test/audio{index}.wav", "duration": duration})
+            for index, duration in enumerate(durations)
+        ]
+
+        results = stage.process_batch(tasks)
+
+        mock_model.diarize.assert_called_once_with(
+            audio=[f"/test/audio{index}.wav" for index in sorted_indices],
+            batch_size=2,
+        )
+        assert results == tasks
+        for index, task in enumerate(results):
+            assert task.data["diar_segments"][0]["speaker"] == f"speaker_{index}"
 
     def test_process_writes_rttm(self, tmp_path: Path) -> None:
         fake_output = [["0.00 2.50 speaker_0"]]
