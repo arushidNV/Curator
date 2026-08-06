@@ -427,6 +427,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     resampled_output_dir: str | None = None
     resampled_subtype: str = "FLOAT"
     keep_waveform: bool = True
+    process_skipme: bool = False
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -876,6 +877,58 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
         return entry_data
 
+    @staticmethod
+    def _sanitize_skipme_manifest(manifest_path: str, shard_key: str) -> str | None:
+        """Rewrite ``manifest_path`` to a temp JSONL that clears truthy ``_skipme``.
+
+        NeMo's lhotse iterators drop any entry whose ``_skipme`` is truthy. When the
+        reader is configured with ``process_skipme=True`` we still want those entries
+        transcribed, so we emit a copy of the manifest where each flagged entry has its
+        ``_skipme`` reason moved to ``additional_notes["input_skipme"]`` (for provenance)
+        and the top-level ``_skipme`` removed. All other fields (``shard_id``, ``offset``,
+        ``duration``, existing ``additional_notes`` keys, …) are preserved so tar-member
+        pairing and segment slicing are unchanged.
+
+        Returns the temp file path, or ``None`` when nothing was flagged (caller then
+        reads the original manifest — no temp file created).
+        """
+        import json
+        import tempfile
+
+        from fsspec.core import url_to_fs
+
+        fs, resolved = url_to_fs(manifest_path)
+        flagged = 0
+        out_lines: list[str] = []
+        with fs.open(resolved, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                reason = entry.pop("_skipme", None)
+                if reason:
+                    # Preserve provenance next to the LID details in additional_notes.
+                    notes = entry.get("additional_notes")
+                    if not isinstance(notes, dict):
+                        notes = {} if notes is None else {"_note": notes}
+                        entry["additional_notes"] = notes
+                    notes["input_skipme"] = reason
+                    flagged += 1
+                out_lines.append(json.dumps(entry, ensure_ascii=False))
+
+        if flagged == 0:
+            return None
+
+        tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w", suffix=".json", prefix="skipme_", delete=False, encoding="utf-8"
+        )
+        try:
+            tmp.write("\n".join(out_lines) + "\n")
+        finally:
+            tmp.close()
+        logger.info(f"[{shard_key}] process_skipme: cleared _skipme on {flagged} entries -> {tmp.name}")
+        return tmp.name
+
     def _process_cutset(self, task: FileGroupTask) -> list[AudioTask]:
         """Load all cuts from a manifest/tar shard and return AudioTasks."""
         corpus = task.reader_config.get("corpus", "unknown")
@@ -885,33 +938,48 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
         manifest_path = task.data[0]
         tar_path = task.data[1] if len(task.data) >= 2 else None  # noqa: PLR2004
-        cutset = self._make_cutset(manifest_path, tar_path)
+
+        # Optionally read _skipme-flagged entries too (see ``process_skipme`` docstring).
+        tmp_manifest: str | None = None
+        cutset_manifest = manifest_path
+        if self.process_skipme:
+            try:
+                tmp_manifest = self._sanitize_skipme_manifest(manifest_path, shard_key)
+                if tmp_manifest is not None:
+                    cutset_manifest = tmp_manifest
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[{shard_key}] process_skipme sanitize failed ({exc}); using original manifest")
 
         mode = "tarred" if tar_path else "non-tarred"
         logger.info(f"Reading shard {shard_key} via NeMo {mode} adapter")
 
         results: list[AudioTask] = []
-        loaded = 0
-        for cut in cutset:
-            try:
-                entry_data = self._build_cut_entry(cut, corpus, language)
-            except Exception:  # noqa: BLE001
-                logger.warning(f"Skipping unreadable audio: {cut.id}")
-                continue
+        try:
+            cutset = self._make_cutset(cutset_manifest, tar_path)
+            loaded = 0
+            for cut in cutset:
+                try:
+                    entry_data = self._build_cut_entry(cut, corpus, language)
+                except Exception:  # noqa: BLE001
+                    logger.warning(f"Skipping unreadable audio: {cut.id}")
+                    continue
 
-            loaded += 1
-            if loaded % 100 == 0 or loaded == 1:
-                logger.info(f"  [{shard_key}] loaded {loaded}")
+                loaded += 1
+                if loaded % 100 == 0 or loaded == 1:
+                    logger.info(f"  [{shard_key}] loaded {loaded}")
 
-            results.append(
-                AudioTask(
-                    task_id=f"{shard_key}_{cut.id}",
-                    dataset_name=corpus,
-                    data=entry_data,
-                    _metadata={**metadata, "_shard_key": shard_key},
-                    _stage_perf=list(task._stage_perf),
+                results.append(
+                    AudioTask(
+                        task_id=f"{shard_key}_{cut.id}",
+                        dataset_name=corpus,
+                        data=entry_data,
+                        _metadata={**metadata, "_shard_key": shard_key},
+                        _stage_perf=list(task._stage_perf),
+                    )
                 )
-            )
+        finally:
+            if tmp_manifest is not None and os.path.exists(tmp_manifest):
+                os.remove(tmp_manifest)
 
         for r in results:
             r._metadata["_shard_total"] = len(results)
@@ -1013,6 +1081,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
     resampled_output_dir: str | None = None
     resampled_subtype: str = "FLOAT"
     keep_waveform: bool = True
+    process_skipme: bool = False
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -1034,6 +1103,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
                 resampled_output_dir=self.resampled_output_dir,
                 resampled_subtype=self.resampled_subtype,
                 keep_waveform=self.keep_waveform,
+                process_skipme=self.process_skipme,
             ),
         ]
 
