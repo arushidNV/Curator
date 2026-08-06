@@ -496,6 +496,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help="Decoding mode for the IndicConformer hybrid model (model card recommends rnnt).",
     )
     asr.add_argument(
+        "--indic_monolingual_backend",
+        type=str,
+        default="nemo",
+        choices=["nemo", "tensorrt"],
+        help="Inference backend for IndicConformer primary or recovery stages.",
+    )
+    asr.add_argument(
+        "--indic_monolingual_tensorrt_engine_dir",
+        type=str,
+        default=None,
+        metavar="ENGINE_DIR",
+        help="TensorRT encoder bundle required when --indic_monolingual_backend=tensorrt.",
+    )
+    asr.add_argument(
+        "--indic_monolingual_rnnt_precision",
+        type=str,
+        default="fp32",
+        choices=["fp32", "fp16", "bf16"],
+        help="RNNT decoder precision for IndicConformer.",
+    )
+    asr.add_argument(
+        "--indic_monolingual_inference_batch_size",
+        type=int,
+        default=None,
+        help="IndicConformer inference batch size. Defaults to --asr_batch_size when omitted.",
+    )
+    asr.add_argument(
         "--indic_canary_engine_dir",
         type=str,
         default=None,
@@ -578,6 +605,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "(with --primary_model indic_canary). "
             "Distinct model from --parakeet_v3_model_id."
         ),
+    )
+    asr.add_argument(
+        "--parakeet_riva_backend",
+        type=str,
+        default="nemo",
+        choices=["nemo", "tensorrt"],
+        help="Inference backend for Indic Riva Parakeet primary or recovery stages.",
+    )
+    asr.add_argument(
+        "--parakeet_riva_tensorrt_engine_dir",
+        type=str,
+        default=None,
+        metavar="ENGINE_DIR",
+        help="TensorRT encoder bundle required when --parakeet_riva_backend=tensorrt.",
     )
     asr.add_argument(
         "--parakeet_inference_batch_size",
@@ -847,6 +888,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 model_id=args.parakeet_riva_model_id,
                 supported_langs=PARAKEET_RIVA_PRIMARY_LANGS,
                 inference_batch_size=args.parakeet_inference_batch_size,
+                backend=args.parakeet_riva_backend,
+                tensorrt_engine_dir=args.parakeet_riva_tensorrt_engine_dir,
                 source_lang_key=args.source_lang_key,
                 pred_text_key="primary_model_prediction",
                 keep_waveform=has_recovery,
@@ -861,6 +904,10 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 name="IndicConformerHybrid_primary",
                 model_id=_resolve_indic_monolingual_model_id(),
                 decode_mode=args.indic_monolingual_decode,
+                backend=args.indic_monolingual_backend,
+                tensorrt_engine_dir=args.indic_monolingual_tensorrt_engine_dir,
+                rnnt_precision=args.indic_monolingual_rnnt_precision,
+                inference_batch_size=args.indic_monolingual_inference_batch_size,
                 source_lang_key=args.source_lang_key,
                 pred_text_key="primary_model_prediction",
                 keep_waveform=has_recovery,
@@ -916,6 +963,10 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 name="IndicConformerHybrid_recovery",
                 model_id=_resolve_indic_monolingual_model_id(),
                 decode_mode=args.indic_monolingual_decode,
+                backend=args.indic_monolingual_backend,
+                tensorrt_engine_dir=args.indic_monolingual_tensorrt_engine_dir,
+                rnnt_precision=args.indic_monolingual_rnnt_precision,
+                inference_batch_size=args.indic_monolingual_inference_batch_size,
                 source_lang_key=args.source_lang_key,
                 pred_text_key="fallback_model_prediction",
                 batch_size=args.asr_batch_size,
@@ -960,6 +1011,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 model_id=args.parakeet_riva_model_id,
                 supported_langs=PARAKEET_RIVA_PRIMARY_LANGS,
                 inference_batch_size=args.parakeet_inference_batch_size,
+                backend=args.parakeet_riva_backend,
+                tensorrt_engine_dir=args.parakeet_riva_tensorrt_engine_dir,
                 source_lang_key=args.source_lang_key,
                 pred_text_key="fallback_model_prediction",
                 batch_size=args.asr_batch_size,
