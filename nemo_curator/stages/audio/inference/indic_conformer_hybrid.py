@@ -39,41 +39,52 @@ config keys, so ``ASRModel.restore_from`` fails out of the box:
 Rather than installing the fork (which is pinned to NeMo 1.23 and would break the
 rest of the pipeline), :func:`_apply_multisoftmax_patches` **monkeypatches just those
 three module classes** on top of the installed NeMo so the checkpoint loads, and the
-model then runs a **compact greedy CTC / RNNT decode** that mirrors the fork's decode
-semantics (per-language blank index ``V/num_langs``, per-language joint head, local-id
-feedback to the prediction network). Decoding maps the per-language local token ids
-back to text through the model's own ``AggregateTokenizer`` (which already ships the
-per-language tokenizers and offset tables in 2.7.x).
+model then runs compact greedy CTC decoding and NeMo's optimized batched label-looping
+RNNT decoder while preserving the fork's multilingual semantics (per-language blank
+index ``V/num_langs``, per-language joint head, local-id feedback to the prediction
+network). Decoding maps the per-language local token ids back to text through the
+model's own ``AggregateTokenizer`` (which already ships the per-language tokenizers
+and offset tables in 2.7.x).
 
 The patches are idempotent and additive: when ``multisoftmax`` / ``multilingual`` are
 absent (a normal NeMo model), every patched path falls back to the original behaviour,
 so importing this module does not change ordinary NeMo usage.
 """
 
+# The compatibility shim mirrors dynamically patched NeMo signatures, so its
+# concrete types and parameter names cannot follow Curator's normal lint rules.
+# ruff: noqa: ANN401, N806, PLR0913, PLW0603
+
 from __future__ import annotations
 
 import gc
 import os
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
 
-import nemo.collections.asr as nemo_asr
 import numpy as np
-import torch
-import torchaudio.functional as audio_functional
-from huggingface_hub import HfApi, hf_hub_download
 from loguru import logger
-from nemo.collections.asr.modules import conv_asr, rnnt
-from nemo.collections.asr.parts.mixins.mixins import ASRBPEMixin
 
-from nemo_curator.backends.base import NodeInfo, WorkerMetadata
 from nemo_curator.models.base import ModelInterface
+from nemo_curator.stages.audio.inference.audio_chunking import (
+    engine_chunk_duration,
+    has_audio_longer_than,
+    merge_chunk_texts,
+    split_waveforms,
+)
 from nemo_curator.stages.audio.pipeline_utils import set_note
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import AudioTask
 
+if TYPE_CHECKING:
+    from nemo_curator.backends.base import NodeInfo, WorkerMetadata
+
 _TARGET_SR = 16000
+_MAX_CHUNK_DURATION_SEC = 40.0
+_TENSORRT_INFERENCE_BATCH_SIZE = 64
+_TENSORRT_ENCODER_BATCH_SIZE = 8
 
 # Set once ``_apply_multisoftmax_patches`` has run.
 _PATCHED = False
@@ -90,11 +101,59 @@ INDIC_CONFORMER_HYBRID_LANGS: frozenset[str] = frozenset({
 })
 
 
+class _LanguageRNNTDecoder:
+    """Route NeMo's per-language blank to the aggregate predictor's SOS token."""
+
+    def __init__(self, decoder: Any, blank_index: int):
+        self._decoder = decoder
+        self._blank_index = blank_index
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._decoder, name)
+
+    def predict(self, y: Any = None, state: Any = None, **kwargs: Any) -> Any:
+        if y is not None:
+            y = y.masked_fill(y == self._blank_index, self._decoder.blank_idx)
+        return self._decoder.predict(y, state=state, **kwargs)
+
+
+class _LanguageRNNTJoint:
+    """Bind the multilingual joint network to one language head."""
+
+    def __init__(self, joint: Any, language: str, num_classes_with_blank: int):
+        self._joint = joint
+        self._language = language
+        self._num_classes_with_blank = num_classes_with_blank
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._joint, name)
+
+    @property
+    def num_classes_with_blank(self) -> int:
+        return self._num_classes_with_blank
+
+    def project_encoder(self, encoder_output: Any) -> Any:
+        project = getattr(self._joint, "project_encoder", self._joint.enc)
+        return project(encoder_output)
+
+    def project_prednet(self, prednet_output: Any) -> Any:
+        project = getattr(self._joint, "project_prednet", self._joint.pred)
+        return project(prednet_output)
+
+    def joint_after_projection(self, f: Any, g: Any) -> Any:
+        language_ids = [self._language] * f.shape[0]
+        return self._joint.joint_after_projection(f, g, language_ids=language_ids)
+
+
 def _apply_multisoftmax_patches() -> None:  # noqa: C901, PLR0915
     """Idempotently patch ConvASRDecoder / RNNTJoint / RNNTDecoder for multi-softmax."""
     global _PATCHED
     if _PATCHED:
         return
+
+    import torch
+    from nemo.collections.asr.modules import conv_asr, rnnt
+    from nemo.collections.asr.parts.mixins.mixins import ASRBPEMixin
 
     # ------------------------------------------------------------------
     # Tokenizer routing: the fork tags the aggregate tokenizer ``type:
@@ -281,15 +340,35 @@ class IndicConformerHybridASR(ModelInterface):
         *,
         max_symbols_per_step: int = 10,
         inference_batch_size: int = 128,
+        tensorrt_engine_dir: str | None = None,
+        rnnt_precision: Literal["fp32", "fp16", "bf16"] = "fp32",
     ):
+        if decode_mode not in {"ctc", "rnnt"}:
+            msg = f"Unsupported IndicConformer decode mode: {decode_mode!r}"
+            raise ValueError(msg)
+        if rnnt_precision not in {"fp32", "fp16", "bf16"}:
+            msg = f"Unsupported IndicConformer RNNT precision: {rnnt_precision!r}"
+            raise ValueError(msg)
+        if max_symbols_per_step < 1:
+            msg = "max_symbols_per_step must be at least 1"
+            raise ValueError(msg)
+        if inference_batch_size < 1:
+            msg = "inference_batch_size must be at least 1"
+            raise ValueError(msg)
         self.model_id = model_id
         self.decode_mode = decode_mode
         self.max_symbols_per_step = max_symbols_per_step
-        self.inference_batch_size = max(1, int(inference_batch_size))
+        self.tensorrt_engine_dir = tensorrt_engine_dir
+        self.inference_batch_size = int(inference_batch_size)
+        self.rnnt_precision = rnnt_precision
         self._model: Any = None
         self._device: Any = None
         self._num_langs: int = 0
         self._per_lang_classes: int = 0  # V / num_langs (blank index within a head)
+        self._trt_encoder: Any = None
+        self._trt_metadata: dict[str, Any] | None = None
+        self._chunk_duration_sec: float | None = None
+        self._rnnt_decoders: dict[str, Any] = {}
 
     @property
     def model_id_names(self) -> list[str]:
@@ -314,6 +393,8 @@ class IndicConformerHybridASR(ModelInterface):
         if cls._offline():
             # Offline: rely on the pre-populated cache (no network listing/download).
             return cls._resolve_nemo_path(model_id)
+        from huggingface_hub import HfApi, hf_hub_download
+
         files = [f for f in HfApi().list_repo_files(model_id) if f.endswith(".nemo")]
         if not files:
             msg = f"No .nemo file found in HuggingFace repo '{model_id}'"
@@ -344,10 +425,12 @@ class IndicConformerHybridASR(ModelInterface):
             cached = [f for f in os.listdir(snap_dir) if f.endswith(".nemo")]
             if cached:
                 return os.path.join(snap_dir, cached[0])
-        except Exception:  # noqa: BLE001 — fall through to the online path below.
+        except Exception:  # noqa: BLE001, S110
             pass
 
         # 3. Online fallback (needs egress; gated repos need HF_TOKEN).
+        from huggingface_hub import HfApi, hf_hub_download
+
         files = [f for f in HfApi().list_repo_files(model_id) if f.endswith(".nemo")]
         if not files:
             msg = f"No .nemo file found in HuggingFace repo '{model_id}'"
@@ -355,14 +438,40 @@ class IndicConformerHybridASR(ModelInterface):
         return hf_hub_download(model_id, files[0])
 
     def setup(self) -> None:
+        import nemo.collections.asr as nemo_asr
+        import torch
+
         _apply_multisoftmax_patches()
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        nemo_path = self._resolve_nemo_path(self.model_id)
+        if self.tensorrt_engine_dir is None:
+            nemo_path = self._resolve_nemo_path(self.model_id)
+        else:
+            from nemo_curator.stages.audio.inference.indic_conformer_tensorrt import load_engine_metadata
+            from nemo_curator.stages.audio.inference.tensorrt_encoder import ENGINE_FILENAME, MODEL_FILENAME
+
+            if self._device.type != "cuda":
+                msg = "IndicConformer TensorRT inference requires CUDA"
+                raise RuntimeError(msg)
+            engine_dir = Path(self.tensorrt_engine_dir)
+            self._trt_metadata = load_engine_metadata(engine_dir)
+            nemo_path = str(engine_dir / MODEL_FILENAME)
+            engine_path = engine_dir / ENGINE_FILENAME
+            if not Path(nemo_path).is_file():
+                msg = f"Bundled NeMo model not found: {nemo_path}"
+                raise FileNotFoundError(msg)
+            if not engine_path.is_file():
+                msg = f"TensorRT encoder engine not found: {engine_path}"
+                raise FileNotFoundError(msg)
         logger.info(f"Loading IndicConformer hybrid model={nemo_path} device={self._device}")
 
         self._model = nemo_asr.models.ASRModel.restore_from(nemo_path, map_location=self._device)
         self._model.to(self._device)
         self._model.eval()
+        self._chunk_duration_sec = _MAX_CHUNK_DURATION_SEC
+        self._configure_rnnt_precision()
+
+        if self._trt_metadata is not None:
+            self._enable_tensorrt_encoder(engine_path)
 
         tok = self._model.tokenizer
         if not hasattr(tok, "langs_by_token_id"):
@@ -383,19 +492,101 @@ class IndicConformerHybridASR(ModelInterface):
             f"IndicConformer hybrid ready: {self._num_langs} langs, {self._per_lang_classes} tokens/lang"
         )
 
+    def _enable_tensorrt_encoder(self, engine_path: Path) -> None:
+        from nemo_curator.stages.audio.inference.tensorrt_encoder import TensorRTEncoder
+
+        metadata = self._trt_metadata
+        if metadata is None:
+            msg = "TensorRT metadata is not loaded"
+            raise RuntimeError(msg)
+        encoder = self._model.encoder
+        actual_feature_count = int(getattr(encoder, "_feat_in", self._model.cfg.encoder.feat_in))
+        actual_subsampling = int(encoder.subsampling_factor)
+        actual_sample_rate = int(self._model.cfg.preprocessor.sample_rate)
+        actual_encoder_dim = int(self._model.cfg.encoder.d_model)
+        expected = (
+            ("feature_count", actual_feature_count),
+            ("subsampling_factor", actual_subsampling),
+            ("sample_rate", actual_sample_rate),
+            ("encoder_dim", actual_encoder_dim),
+        )
+        for key, actual in expected:
+            if actual != int(metadata[key]):
+                msg = (
+                    "Bundled NeMo model does not match the TensorRT engine: "
+                    f"{key}={actual}, expected={metadata[key]}"
+                )
+                raise ValueError(msg)
+
+        self._model.encoder = None
+        del encoder
+        gc.collect()
+        import torch
+
+        torch.cuda.empty_cache()
+        self._trt_encoder = TensorRTEncoder(
+            engine_path,
+            subsampling_factor=int(metadata["subsampling_factor"]),
+            max_batch_size=_TENSORRT_ENCODER_BATCH_SIZE,
+        )
+        max_feature_frames = self._trt_encoder.max_input_shape("audio_signal")[2]
+        engine_duration = engine_chunk_duration(self._model, max_feature_frames)
+        if engine_duration < _MAX_CHUNK_DURATION_SEC:
+            msg = (
+                "IndicConformer TensorRT engine does not support 40-second audio: "
+                f"max_feature_frames={max_feature_frames}; rebuild with --max-frames 4001"
+            )
+            raise ValueError(msg)
+        self._chunk_duration_sec = _MAX_CHUNK_DURATION_SEC
+        self._model.encoder = self._trt_encoder
+        logger.info(f"IndicConformer TensorRT encoder loaded: {engine_path}")
+
     def teardown(self) -> None:
+        import torch
+
+        for decoder in self._rnnt_decoders.values():
+            if decoder.decoding_computer is not None:
+                decoder.decoding_computer.reset_cuda_graphs_state()
+        self._rnnt_decoders.clear()
+        if self._trt_encoder is not None:
+            self._trt_encoder.close()
+            self._trt_encoder = None
         del self._model
         self._model = None
         self._device = None
+        self._trt_metadata = None
+        self._chunk_duration_sec = None
         gc.collect()
-        try:
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        except Exception:  # noqa: BLE001, S110
-            pass
 
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
+    def _rnnt_dtype(self) -> Any:
+        import torch
+
+        return {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[self.rnnt_precision]
+
+    def _configure_rnnt_precision(self) -> None:
+        if self.rnnt_precision == "fp32":
+            return
+        import torch
+
+        if self._device.type != "cuda":
+            msg = f"IndicConformer {self.rnnt_precision.upper()} RNNT inference requires CUDA"
+            raise RuntimeError(msg)
+        if self.rnnt_precision == "bf16" and not torch.cuda.is_bf16_supported():
+            msg = "IndicConformer BF16 RNNT inference is not supported by this GPU"
+            raise RuntimeError(msg)
+        rnnt_dtype = self._rnnt_dtype()
+        self._model.decoder.to(dtype=rnnt_dtype)
+        self._model.joint.to(dtype=rnnt_dtype)
+
     def generate(
         self,
         waveforms: list[np.ndarray],
@@ -407,6 +598,46 @@ class IndicConformerHybridASR(ModelInterface):
             msg = "Model not initialized. Call setup() first."
             raise RuntimeError(msg)
         mode = (decode_mode or self.decode_mode).lower()
+        if self._chunk_duration_sec is None:
+            msg = "IndicConformer chunk duration was not initialized from the model"
+            raise RuntimeError(msg)
+        if len(lang_codes) != len(waveforms):
+            msg = "waveforms and lang_codes must have the same length"
+            raise ValueError(msg)
+        requires_merge = has_audio_longer_than(waveforms, sample_rates, self._chunk_duration_sec)
+
+        chunks, chunk_sample_rates, owners = split_waveforms(
+            waveforms,
+            sample_rates,
+            self._chunk_duration_sec,
+        )
+        if not chunks:
+            return [""] * len(waveforms), list(lang_codes)
+        chunk_langs = [lang_codes[owner] for owner in owners]
+        chunk_texts, _ = self._generate_chunks(
+            chunks,
+            chunk_sample_rates,
+            chunk_langs,
+            mode,
+        )
+        if not requires_merge:
+            texts = [""] * len(waveforms)
+            for text, owner in zip(chunk_texts, owners, strict=True):
+                texts[owner] = text
+            return texts, list(lang_codes)
+        return merge_chunk_texts(chunk_texts, owners, len(waveforms)), list(lang_codes)
+
+    def _generate_chunks(
+        self,
+        waveforms: list[np.ndarray],
+        sample_rates: list[int],
+        lang_codes: list[str],
+        mode: str,
+    ) -> tuple[list[str], list[str]]:
+        if self._trt_encoder is not None:
+            return self._generate_tensorrt(waveforms, sample_rates, lang_codes, mode)
+        import torch
+        import torchaudio.functional as audio_functional
 
         texts: list[str] = [""] * len(waveforms)
         langs_out: list[str] = [str(lang).strip().lower() for lang in lang_codes]
@@ -431,6 +662,12 @@ class IndicConformerHybridASR(ModelInterface):
                 prepared_langs.append(lang)
                 original_indices.append(idx)
 
+            duration_order = sorted(range(len(prepared)), key=lengths.__getitem__)
+            prepared = [prepared[idx] for idx in duration_order]
+            lengths = [lengths[idx] for idx in duration_order]
+            prepared_langs = [prepared_langs[idx] for idx in duration_order]
+            original_indices = [original_indices[idx] for idx in duration_order]
+
             for start in range(0, len(prepared), self.inference_batch_size):
                 end = start + self.inference_batch_size
                 chunk = prepared[start:end]
@@ -443,9 +680,64 @@ class IndicConformerHybridASR(ModelInterface):
                 if mode == "ctc":
                     batch_texts = self._decode_ctc_batch(encoded, encoded_len, chunk_langs)
                 else:
+                    encoded = encoded.to(dtype=self._rnnt_dtype())
                     batch_texts = self._decode_rnnt_batch(encoded, encoded_len, chunk_langs)
                 for original_idx, text in zip(chunk_indices, batch_texts, strict=True):
                     texts[original_idx] = text
+        return texts, langs_out
+
+    def _generate_tensorrt(
+        self,
+        waveforms: list[np.ndarray],
+        sample_rates: list[int],
+        lang_codes: list[str],
+        mode: str,
+    ) -> tuple[list[str], list[str]]:
+        import torch
+        import torchaudio.functional as audio_functional
+
+        texts = [""] * len(waveforms)
+        langs_out = list(lang_codes)
+        prepared: list[tuple[int, torch.Tensor, str]] = []
+        for index, (waveform, sample_rate, lang) in enumerate(
+            zip(waveforms, sample_rates, lang_codes, strict=True)
+        ):
+            if waveform is None or np.asarray(waveform).size == 0:
+                continue
+            wav = torch.from_numpy(np.ascontiguousarray(waveform, dtype=np.float32)).to(self._device)
+            if wav.ndim > 1:
+                wav = wav.mean(dim=-1)
+            if int(sample_rate) != _TARGET_SR:
+                wav = audio_functional.resample(wav, orig_freq=int(sample_rate), new_freq=_TARGET_SR)
+            prepared.append((index, wav, lang))
+
+        prepared.sort(key=lambda item: item[1].shape[0])
+
+        max_batch = min(self.inference_batch_size, _TENSORRT_INFERENCE_BATCH_SIZE)
+        with torch.inference_mode():
+            for start in range(0, len(prepared), max_batch):
+                group = prepared[start : start + max_batch]
+                lengths = torch.tensor([wav.shape[0] for _, wav, _ in group], device=self._device)
+                signals = torch.nn.utils.rnn.pad_sequence(
+                    [wav for _, wav, _ in group],
+                    batch_first=True,
+                )
+                features, feature_lengths = self._model.preprocessor(
+                    input_signal=signals,
+                    length=lengths,
+                )
+                encoded, encoded_lengths = self._model.encoder(
+                    audio_signal=features.to(dtype=torch.float16),
+                    length=feature_lengths,
+                )
+                group_langs = [lang for _, _, lang in group]
+                if mode == "ctc":
+                    batch_texts = self._decode_ctc_batch(encoded.float(), encoded_lengths, group_langs)
+                else:
+                    encoded = encoded.to(dtype=self._rnnt_dtype())
+                    batch_texts = self._decode_rnnt_batch(encoded, encoded_lengths, group_langs)
+                for (output_index, _, _), text in zip(group, batch_texts, strict=True):
+                    texts[output_index] = text
         return texts, langs_out
 
     def _ids_to_text(self, local_ids: list[int], lang: str) -> str:
@@ -474,139 +766,66 @@ class IndicConformerHybridASR(ModelInterface):
         out: list[int] = []
         prev = None
         for p in preds:
-            if p != blank and p != prev:
+            if p != blank and p != prev:  # noqa: PLR1714
                 out.append(p)
             prev = p
         return self._ids_to_text(out, lang)
 
-    def _decode_rnnt(self, encoded: Any, enc_len: int, lang: str) -> str:
-        # Compact greedy transducer decode mirroring the fork's single-sample path:
-        # per-language joint head, blank index = V/num_langs, local-id feedback.
-        joint = self._model.joint
-        decoder = self._model.decoder
-        blank = self._per_lang_classes
-        x = encoded.transpose(1, 2)  # [B, T, D_enc]
-        f_enc = joint.enc(x)  # project encoder once: [B, T, H]
+    def _rnnt_decoder(self, lang: str) -> Any:
+        decoder = self._rnnt_decoders.get(lang)
+        if decoder is not None:
+            return decoder
 
-        last_token: int | None = None
-        state: Any = None
-        hyp: list[int] = []
-        for t in range(enc_len):
-            f = f_enc[:, t : t + 1, :]  # [B, 1, H]
-            not_blank = True
-            symbols = 0
-            while not_blank and symbols < self.max_symbols_per_step:
-                if last_token is None and state is None:
-                    g, new_state = decoder.predict(None, state=None, add_sos=False, batch_size=1)
-                else:
-                    label = torch.full([1, 1], fill_value=last_token, dtype=torch.long, device=self._device)
-                    g, new_state = decoder.predict(label, state=state, add_sos=False, batch_size=1)
-                g = joint.pred(g)  # [1, 1, H]
-                logp = joint.joint_after_projection(f, g, language_ids=[lang])[0, 0, 0, :]
-                k = int(logp.argmax(dim=-1).item())
-                if k == blank:
-                    not_blank = False
-                else:
-                    hyp.append(k)
-                    last_token = k
-                    state = new_state
-                symbols += 1
-        return self._ids_to_text(hyp, lang)
+        from nemo.collections.asr.parts.submodules.rnnt_greedy_decoding import GreedyBatchedRNNTInfer
+
+        decoder = GreedyBatchedRNNTInfer(
+            decoder_model=_LanguageRNNTDecoder(self._model.decoder, self._per_lang_classes),
+            joint_model=_LanguageRNNTJoint(
+                self._model.joint,
+                lang,
+                self._per_lang_classes + 1,
+            ),
+            blank_index=self._per_lang_classes,
+            max_symbols_per_step=self.max_symbols_per_step,
+            preserve_alignments=False,
+            preserve_frame_confidence=False,
+            loop_labels=True,
+            use_cuda_graph_decoder=self._device.type == "cuda",
+        )
+        self._rnnt_decoders[lang] = decoder
+        return decoder
 
     def _decode_rnnt_batch(self, encoded: Any, encoded_len: Any, lang_codes: list[str]) -> list[str]:
-        batch_size = len(lang_codes)
-        if batch_size == 0:
-            return []
-        joint = self._model.joint
-        decoder = self._model.decoder
-        blank = self._per_lang_classes
-        x = encoded.transpose(1, 2)  # [B, T, D_enc]
-        f_enc = joint.enc(x)  # [B, T, H]
-        enc_lens = [int(length.item()) for length in encoded_len]
-        max_time = max(enc_lens, default=0)
+        import torch
 
-        hyps: list[list[int]] = [[] for _ in range(batch_size)]
-        last_tokens: list[int | None] = [None] * batch_size
-        states: list[Any | None] = [None] * batch_size
+        with torch.inference_mode():
+            batch_size = len(lang_codes)
+            if batch_size == 0:
+                return []
+            language_groups: dict[str, list[int]] = {}
+            for index, lang in enumerate(lang_codes):
+                language_groups.setdefault(lang, []).append(index)
 
-        for t in range(max_time):
-            emitting = [idx for idx, enc_len in enumerate(enc_lens) if t < enc_len]
-            symbols = 0
-            while emitting and symbols < self.max_symbols_per_step:
-                next_emitting: list[int] = []
-                no_state = [idx for idx in emitting if last_tokens[idx] is None and states[idx] is None]
-                with_state = [idx for idx in emitting if idx not in no_state]
+            texts = [""] * batch_size
+            for lang, indices in language_groups.items():
+                if len(indices) == batch_size:
+                    group_encoded = encoded
+                    group_lengths = encoded_len
+                else:
+                    index_tensor = torch.tensor(indices, dtype=torch.long, device=encoded.device)
+                    group_encoded = encoded.index_select(0, index_tensor)
+                    group_lengths = encoded_len.index_select(0, index_tensor)
 
-                if no_state:
-                    g, new_state = decoder.predict(None, state=None, add_sos=False, batch_size=len(no_state))
-                    g = joint.pred(g)
-                    logp = joint.joint_after_projection(
-                        f_enc[no_state, t : t + 1, :],
-                        g,
-                        language_ids=[lang_codes[idx] for idx in no_state],
-                    )[:, 0, 0, :]
-                    pred_ids = logp.argmax(dim=-1).tolist()
-                    split_state = self._split_decoder_state(new_state, len(no_state))
-                    for idx, pred_id, state_i in zip(no_state, pred_ids, split_state, strict=True):
-                        token = int(pred_id)
-                        if token != blank:
-                            hyps[idx].append(token)
-                            last_tokens[idx] = token
-                            states[idx] = state_i
-                            next_emitting.append(idx)
-
-                if with_state:
-                    labels = torch.tensor(
-                        [[int(last_tokens[idx])] for idx in with_state],
-                        dtype=torch.long,
-                        device=self._device,
-                    )
-                    packed_state = self._pack_decoder_states([states[idx] for idx in with_state])
-                    g, new_state = decoder.predict(
-                        labels,
-                        state=packed_state,
-                        add_sos=False,
-                        batch_size=len(with_state),
-                    )
-                    g = joint.pred(g)
-                    logp = joint.joint_after_projection(
-                        f_enc[with_state, t : t + 1, :],
-                        g,
-                        language_ids=[lang_codes[idx] for idx in with_state],
-                    )[:, 0, 0, :]
-                    pred_ids = logp.argmax(dim=-1).tolist()
-                    split_state = self._split_decoder_state(new_state, len(with_state))
-                    for idx, pred_id, state_i in zip(with_state, pred_ids, split_state, strict=True):
-                        token = int(pred_id)
-                        if token != blank:
-                            hyps[idx].append(token)
-                            last_tokens[idx] = token
-                            states[idx] = state_i
-                            next_emitting.append(idx)
-
-                emitting = next_emitting
-                symbols += 1
-
-        return [self._ids_to_text(hyp, lang) for hyp, lang in zip(hyps, lang_codes, strict=True)]
-
-    @staticmethod
-    def _pack_decoder_states(states: list[Any | None]) -> Any:
-        first_state = next((state for state in states if state is not None), None)
-        if first_state is None:
-            return None
-        return [
-            torch.cat([state[layer_idx] for state in states], dim=1).contiguous()
-            for layer_idx in range(len(first_state))
-        ]
-
-    @staticmethod
-    def _split_decoder_state(state: Any, batch_size: int) -> list[Any | None]:
-        if state is None:
-            return [None] * batch_size
-        return [
-            [state_part[:, idx : idx + 1, :].contiguous() for state_part in state]
-            for idx in range(batch_size)
-        ]
+                hypotheses = self._rnnt_decoder(lang)(
+                    encoder_output=group_encoded,
+                    encoded_lengths=group_lengths,
+                )[0]
+                for index, hypothesis in zip(indices, hypotheses, strict=True):
+                    token_ids = hypothesis.y_sequence
+                    if torch.is_tensor(token_ids):
+                        token_ids = token_ids.tolist()
+                    texts[index] = self._ids_to_text(token_ids, lang)
+            return texts
 
 
 @dataclass
@@ -621,6 +840,14 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         model_id: Local ``.nemo`` path or HuggingFace repo id (gated; set ``HF_TOKEN``),
             e.g. ``ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large``.
         decode_mode: ``"ctc"`` or ``"rnnt"`` (model card recommends rnnt).
+        backend: ``"nemo"`` for the existing implementation or ``"tensorrt"``
+            for batched inference through an optimized encoder bundle.
+        tensorrt_engine_dir: Directory containing ``encoder.plan``, ``model.nemo``,
+            and ``metadata.json``. Required when ``backend="tensorrt"``.
+        rnnt_precision: Precision for the RNNT prediction and joint networks.
+            Defaults to ``"fp32"``; ``"fp16"`` and ``"bf16"`` require CUDA.
+        inference_batch_size: Maximum NeMo inference batch size. When unset, uses
+            ``batch_size``. TensorRT remains capped by the engine profile.
         source_lang_key: Task key holding the per-sample ISO language code.
         keep_waveform: When True the waveform is left on the task for a later stage.
     """
@@ -628,6 +855,9 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
     name: str = "IndicConformerHybrid_inference"
     model_id: str = "ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large"
     decode_mode: Literal["ctc", "rnnt"] = "rnnt"
+    backend: Literal["nemo", "tensorrt"] = "nemo"
+    tensorrt_engine_dir: str | None = None
+    rnnt_precision: Literal["fp32", "fp16", "bf16"] = "fp32"
     source_lang_key: str = "source_lang"
     waveform_key: str = "waveform"
     sample_rate_key: str = "sampling_rate"
@@ -638,7 +868,22 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
     num_workers_override: int | None = None
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 128
+    inference_batch_size: int | None = None
     _model: IndicConformerHybridASR | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.decode_mode not in {"ctc", "rnnt"}:
+            msg = f"Unsupported IndicConformer decode mode: {self.decode_mode!r}"
+            raise ValueError(msg)
+        if self.backend not in {"nemo", "tensorrt"}:
+            msg = f"Unsupported IndicConformer inference backend: {self.backend!r}"
+            raise ValueError(msg)
+        if self.rnnt_precision not in {"fp32", "fp16", "bf16"}:
+            msg = f"Unsupported IndicConformer RNNT precision: {self.rnnt_precision!r}"
+            raise ValueError(msg)
+        if self.backend == "tensorrt" and not self.tensorrt_engine_dir:
+            msg = "tensorrt_engine_dir is required when backend='tensorrt'"
+            raise ValueError(msg)
 
     def num_workers(self) -> int | None:
         return self.num_workers_override
@@ -653,7 +898,11 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         return IndicConformerHybridASR(
             model_id=self.model_id,
             decode_mode=self.decode_mode,
-            inference_batch_size=self.batch_size,
+            tensorrt_engine_dir=self.tensorrt_engine_dir if self.backend == "tensorrt" else None,
+            rnnt_precision=self.rnnt_precision,
+            inference_batch_size=(
+                self.batch_size if self.inference_batch_size is None else self.inference_batch_size
+            ),
         )
 
     def setup_on_node(
@@ -661,10 +910,17 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         _node_info: NodeInfo | None = None,
         _worker_metadata: WorkerMetadata | None = None,
     ) -> None:
-        # Download the checkpoint into the shared HF cache exactly ONCE per node
-        # (online). Per-worker setup() then resolves it from cache without each
-        # re-downloading. No-op for a local path or when HF_HUB_OFFLINE=1.
-        IndicConformerHybridASR.download_to_cache(self.model_id)
+        if self.backend == "tensorrt":
+            from nemo_curator.stages.audio.inference.indic_conformer_tensorrt import load_engine_metadata
+
+            engine_dir = self.tensorrt_engine_dir
+            if engine_dir is None:
+                msg = "tensorrt_engine_dir is required when backend='tensorrt'"
+                raise ValueError(msg)
+            load_engine_metadata(engine_dir)
+        else:
+            # Download the checkpoint into the shared HF cache exactly once per node.
+            IndicConformerHybridASR.download_to_cache(self.model_id)
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         if self._model is None:
@@ -687,7 +943,7 @@ class InferenceIndicConformerHybridStage(ProcessingStage[AudioTask, AudioTask]):
         msg = "InferenceIndicConformerHybridStage only supports process_batch"
         raise NotImplementedError(msg)
 
-    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:  # noqa: C901
         if len(tasks) == 0:
             return []
         if self._model is None:

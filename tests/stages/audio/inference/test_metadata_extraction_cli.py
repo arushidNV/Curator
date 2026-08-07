@@ -21,7 +21,6 @@ from nemo_curator.stages.audio.inference.indic_canary_lid import IndicCanaryLang
 from nemo_curator.stages.audio.inference.sed import SEDInferenceStage
 from nemo_curator.stages.audio.inference.sortformer import InferenceSortformerStage
 from nemo_curator.stages.audio.inference.speechbrain_langid import SpeechBrainLangIDStage
-from nemo_curator.stages.audio.io.nemo_speech_reader import NeMoSpeechAudioReader
 from nemo_curator.stages.audio.segmentation.vad_segmentation import VADSegmentationStage
 
 _SCRIPT = Path(__file__).parents[4] / "examples/audio/metadata_extraction/run_metadata_extraction.py"
@@ -74,15 +73,6 @@ def test_explicit_sortformer_batch_window() -> None:
     assert sortformer.batch_size == 20
 
 
-def test_resampled_subtype_wiring() -> None:
-    stages = _MODULE._build_stages(
-        _parse("--resampled_output_dir", "resampled", "--resampled_subtype", "PCM_16"),
-        None,
-    )
-    reader = next(stage for stage in stages if isinstance(stage, NeMoSpeechAudioReader))
-    assert reader.resampled_subtype == "PCM_16"
-
-
 def test_indic_lid_pipeline_wiring() -> None:
     stages = _MODULE._build_stages(
         _parse(
@@ -91,14 +81,10 @@ def test_indic_lid_pipeline_wiring() -> None:
             "engine",
             "--langid_batch_size",
             "12",
-            "--langid_max_duration_sec",
-            "8",
             "--langid_max_workers",
             "2",
             "--indic_canary_batch_size",
             "6",
-            "--indic_canary_lid_max_duration_sec",
-            "12",
             "--indic_canary_num_workers",
             "1",
         ),
@@ -109,10 +95,8 @@ def test_indic_lid_pipeline_wiring() -> None:
     canary = next(stage for stage in stages if isinstance(stage, IndicCanaryLangIDStage))
 
     assert primary.batch_size == 12
-    assert primary.max_duration_sec == 8
     assert primary.num_workers() == 2
     assert canary.batch_size == 6
-    assert canary.max_duration_sec == 12
     assert canary.num_workers() == 1
 
 
@@ -121,10 +105,6 @@ def test_indic_lid_pipeline_wiring() -> None:
     [
         (("--sortformer_model", "model.nemo", "--sortformer_batch_window", "0"), "must be positive"),
         (("--indic", "--skip_langid"), "cannot be combined"),
-        (
-            ("--indic", "--indic_canary_engine_dir", "engine", "--indic_canary_lid_max_duration_sec", "0"),
-            "must be positive",
-        ),
     ],
 )
 def test_invalid_stage_controls(extra: tuple[str, ...], message: str) -> None:

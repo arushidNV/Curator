@@ -89,6 +89,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to prebuilt Indic Canary TRT-LLM engine directory. Required when --indic is set.",
     )
+    ap.add_argument("--indic_canary_batch_size", type=int, default=16, help="Indic Canary LID batch size.")
+    ap.add_argument(
+        "--indic_canary_num_workers",
+        type=int,
+        default=1,
+        help="Fixed Indic Canary worker count; use 0 to let the executor decide.",
+    )
     ap.add_argument(
         "--indic_canary_lid_max_duration_sec",
         type=float,
@@ -122,22 +129,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory to write resampled 16kHz mono WAV files. The output filename matches the input stem with a .wav extension.",
     )
-    ap.add_argument(
-        "--resampled_subtype",
-        type=str,
-        default="FLOAT",
-        help=(
-            "soundfile subtype for resampled WAV files. "
-            "Use FLOAT to avoid quantization changes in diarization output."
-        ),
-    )
-    ap.add_argument(
-        "--max_audio_duration_sec",
-        type=float,
-        default=12 * 60 * 60,
-        help="Maximum source-audio duration to process (default: 12 hours; 0 disables the limit).",
-    )
-
     vad = ap.add_argument_group("VAD (Silero)")
     vad.add_argument(
         "--vad_threshold",
@@ -524,7 +515,6 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 IndicCanaryLangIDStage(
                     engine_dir=args.indic_canary_engine_dir,
                     tag="secondary",
-                    max_duration_sec=args.indic_canary_lid_max_duration_sec,
                     batch_size=args.indic_canary_batch_size,
                     max_workers=args.indic_canary_num_workers if args.indic_canary_num_workers > 0 else None,
                     kv_cache_free_gpu_memory_fraction=args.indic_canary_kv_cache_free_gpu_memory_fraction,

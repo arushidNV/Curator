@@ -17,10 +17,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
-
 from loguru import logger
 
 from nemo_curator.stages.audio.inference.asr_nemo import NemoASRModel
@@ -50,6 +49,12 @@ class InferenceParakeetStage(ProcessingStage[AudioTask, AudioTask]):
     Args:
         model_id: NeMo / HuggingFace model identifier (e.g. ``"nvidia/parakeet-tdt-0.6b-v3"``).
         inference_batch_size: Batch size passed to Parakeet ``ASRModel.transcribe``.
+        backend: ``"nemo"`` for the existing implementation or ``"tensorrt"``
+            for the optimized Indic Parakeet RNN-T engine bundle.
+        tensorrt_engine_dir: Directory containing ``encoder.plan``, ``model.nemo``,
+            and ``metadata.json``. Required when ``backend="tensorrt"``.
+        chunking_mode: TensorRT input handling. ``"engine"`` splits only inputs
+            that exceed the engine profile; ``"none"`` sends each input unchanged.
         waveform_key: Task data key for the mono float32 numpy waveform.
         sample_rate_key: Task data key for the integer sample rate.
         pred_text_key: Output key for the predicted transcription.
@@ -69,6 +74,9 @@ class InferenceParakeetStage(ProcessingStage[AudioTask, AudioTask]):
     model_id: str = "nvidia/parakeet-tdt-0.6b-v3"
     supported_langs: frozenset[str] | None = None
     inference_batch_size: int = 16
+    backend: Literal["nemo", "tensorrt"] = "nemo"
+    tensorrt_engine_dir: str | None = None
+    chunking_mode: Literal["engine", "none"] = "engine"
     waveform_key: str = "waveform"
     sample_rate_key: str = "sampling_rate"
     pred_text_key: str = "asr_prediction"
@@ -81,6 +89,17 @@ class InferenceParakeetStage(ProcessingStage[AudioTask, AudioTask]):
     resources: Resources = field(default_factory=lambda: Resources(gpus=1.0))
     batch_size: int = 128
     _wrapper: NemoASRModel | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.backend not in {"nemo", "tensorrt"}:
+            msg = f"Unsupported Parakeet inference backend: {self.backend!r}"
+            raise ValueError(msg)
+        if self.backend == "tensorrt" and not self.tensorrt_engine_dir:
+            msg = "tensorrt_engine_dir is required when backend='tensorrt'"
+            raise ValueError(msg)
+        if self.chunking_mode not in {"engine", "none"}:
+            msg = f"Unsupported Parakeet chunking mode: {self.chunking_mode!r}"
+            raise ValueError(msg)
 
     # ------------------------------------------------------------------
     # Scaling hooks
@@ -100,6 +119,20 @@ class InferenceParakeetStage(ProcessingStage[AudioTask, AudioTask]):
     # ------------------------------------------------------------------
 
     def _create_wrapper(self) -> NemoASRModel:
+        if self.backend == "tensorrt":
+            from nemo_curator.stages.audio.inference.indic_parakeet_rnnt_tensorrt import (
+                TensorRTParakeetRNNTModel,
+            )
+
+            engine_dir = self.tensorrt_engine_dir
+            if engine_dir is None:
+                msg = "tensorrt_engine_dir is required when backend='tensorrt'"
+                raise ValueError(msg)
+            return TensorRTParakeetRNNTModel(
+                engine_dir=engine_dir,
+                inference_batch_size=self.inference_batch_size,
+                chunking_mode=self.chunking_mode,
+            )
         return NemoASRModel(
             model_name=self.model_id,
             inference_batch_size=self.inference_batch_size,
@@ -147,7 +180,7 @@ class InferenceParakeetStage(ProcessingStage[AudioTask, AudioTask]):
         msg = "InferenceParakeetStage only supports process_batch"
         raise NotImplementedError(msg)
 
-    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:
+    def process_batch(self, tasks: list[AudioTask]) -> list[AudioTask]:  # noqa: C901, PLR0912
         if len(tasks) == 0:
             return []
         if self._wrapper is None or self._wrapper.asr_model is None:
