@@ -126,7 +126,7 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
         lid_entries = task.data.pop(self.lid_key, [])
         if not lid_entries:
             task.data[self.output_key] = ""
-            task.data[self.notes_key][self.confidence_key] = 0.0
+            task.data.setdefault(self.notes_key, {})[self.confidence_key] = 0.0
             task.data[self.skip_me_key] = "skipped due to missing langID predictions."
             set_note(task.data, self.name, "skipped (missing predictions)", self.notes_key)
             return task
