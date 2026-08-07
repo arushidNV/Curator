@@ -96,13 +96,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Fixed Indic Canary worker count; use 0 to let the executor decide.",
     )
-    ap.add_argument("--indic_canary_batch_size", type=int, default=16, help="Indic Canary LID batch size.")
-    ap.add_argument(
-        "--indic_canary_num_workers",
-        type=int,
-        default=1,
-        help="Fixed Indic Canary worker count; use 0 to let the executor decide.",
-    )
     ap.add_argument(
         "--indic_canary_kv_cache_free_gpu_memory_fraction",
         type=float,
@@ -122,6 +115,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Directory to write resampled 16kHz mono WAV files. The output filename matches the input stem with a .wav extension.",
+    )
+    ap.add_argument(
+        "--max_audio_duration_sec",
+        type=float,
+        default=12 * 60 * 60,
+        help="Maximum source-audio duration to process (seconds); longer recordings are skipped. "
+        "Use 0 or a negative value to disable the cap.",
     )
     vad = ap.add_argument_group("VAD (Silero)")
     vad.add_argument(
