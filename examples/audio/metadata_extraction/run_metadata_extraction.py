@@ -96,12 +96,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Fixed Indic Canary worker count; use 0 to let the executor decide.",
     )
-    ap.add_argument(
-        "--indic_canary_lid_max_duration_sec",
-        type=float,
-        default=15.0,
-        help="Maximum audio duration passed to Indic Canary LID.",
-    )
     ap.add_argument("--indic_canary_batch_size", type=int, default=16, help="Indic Canary LID batch size.")
     ap.add_argument(
         "--indic_canary_num_workers",
@@ -236,12 +230,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     lid.add_argument("--langid_model", type=str, default=None, help="Model name/path (default depends on backend).")
     lid.add_argument("--langid_gpu_memory_gb", type=float, default=4.0, help="GPU memory for LangID stage.")
-    lid.add_argument(
-        "--langid_max_duration_sec",
-        type=float,
-        default=10.0,
-        help="Maximum audio duration passed to the primary LangID model; use 0 for no truncation.",
-    )
     lid.add_argument(
         "--langid_max_workers",
         type=int,
@@ -382,8 +370,6 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             max_io_threads=args.max_io_threads,
             read_concurrency=args.read_concurrency,
             resampled_output_dir=args.resampled_output_dir,
-            resampled_subtype=args.resampled_subtype,
-            max_audio_duration_sec=args.max_audio_duration_sec,
             keep_waveform=not args.resampled_output_dir,
         ),
     ]
@@ -484,7 +470,6 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                     source=langid_source,
                     tag="primary",
                     batch_size=args.langid_batch_size,
-                    max_duration_sec=args.langid_max_duration_sec,
                     max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
@@ -496,7 +481,6 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                     model_name=langid_model,
                     tag="primary",
                     batch_size=args.langid_batch_size,
-                    max_duration_sec=args.langid_max_duration_sec,
                     max_workers=langid_max_workers,
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
@@ -507,9 +491,6 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
 
             if not args.indic_canary_engine_dir:
                 msg = "--indic_canary_engine_dir is required when --indic is set"
-                raise ValueError(msg)
-            if args.indic_canary_lid_max_duration_sec <= 0:
-                msg = "--indic_canary_lid_max_duration_sec must be positive"
                 raise ValueError(msg)
             stages.append(
                 IndicCanaryLangIDStage(
