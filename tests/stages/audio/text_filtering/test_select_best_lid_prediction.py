@@ -33,7 +33,7 @@ def test_missing_lid_sets_skipme() -> None:
     out = stage.process(AudioTask(data={}))
 
     assert out.data["source_lang"] == ""
-    assert out.data["source_lid_confidence"] == 0.0
+    assert out.data["additional_notes"]["source_lid_confidence"] == 0.0
     assert out.data["_skipme"] == "skipped due to missing langID predictions."
     assert out.data["additional_notes"]["SelectBestLIDPrediction"] == "skipped (missing predictions)"
 
@@ -54,7 +54,7 @@ def test_whisper_english_accepted() -> None:
     out = stage.process(task)
 
     assert out.data["source_lang"] == "en"
-    assert out.data["source_lid_confidence"] == 0.95
+    assert out.data["additional_notes"]["source_lid_confidence"] == 0.95
     notes = out.data["additional_notes"]
     assert notes["tertiary_lid_model"] == "whisper"
     assert notes["tertiary_lid_prediction"] == "en"
@@ -77,7 +77,7 @@ def test_missing_whisper_sets_skipme() -> None:
     out = stage.process(task)
 
     assert out.data["source_lang"] == ""
-    assert out.data["source_lid_confidence"] == 0.0
+    assert out.data["additional_notes"]["source_lid_confidence"] == 0.0
     assert out.data["_skipme"] == "skipped due to missing or empty whisper langID prediction."
     notes = out.data["additional_notes"]
     assert notes["primary_lid_model"] == "speechbrain"
@@ -100,7 +100,7 @@ def test_empty_whisper_language_sets_skipme() -> None:
     out = stage.process(task)
 
     assert out.data["source_lang"] == ""
-    assert out.data["source_lid_confidence"] == 0.0
+    assert out.data["additional_notes"]["source_lid_confidence"] == 0.0
     assert out.data["_skipme"] == "skipped due to missing or empty whisper langID prediction."
     assert (
         out.data["additional_notes"]["SelectBestLIDPrediction"]
@@ -124,7 +124,7 @@ def test_all_three_agree_uses_canary() -> None:
     out = stage.process(task)
 
     assert out.data["source_lang"] == "hi"
-    assert out.data["source_lid_confidence"] == 0.97
+    assert out.data["additional_notes"]["source_lid_confidence"] == 0.97
     notes = out.data["additional_notes"]
     assert notes["primary_lid_prediction"] == "hi"
     assert notes["secondary_lid_prediction"] == "hi"
@@ -148,7 +148,7 @@ def test_non_indic_agreement_uses_whisper() -> None:
     out = stage.process(task)
 
     assert out.data["source_lang"] == "fr"
-    assert out.data["source_lid_confidence"] == 0.88
+    assert out.data["additional_notes"]["source_lid_confidence"] == 0.88
     notes = out.data["additional_notes"]
     assert notes["SelectBestLIDPrediction"] == (
         "used tertiary, agreement between primary and tertiary langID models."
@@ -173,7 +173,7 @@ def test_indic_without_full_agreement_sets_skipme() -> None:
     out = stage.process(task)
 
     assert out.data["source_lang"] == "skipped"
-    assert out.data["source_lid_confidence"] == 0.0
+    assert out.data["additional_notes"]["source_lid_confidence"] == 0.0
     assert out.data["_skipme"] == "skipped due to disagreement between langID models."
     assert (
         out.data["additional_notes"]["SelectBestLIDPrediction"]
@@ -196,7 +196,7 @@ def test_non_indic_disagreement_sets_skipme() -> None:
     out = stage.process(task)
 
     assert out.data["source_lang"] == "skipped"
-    assert out.data["source_lid_confidence"] == 0.0
+    assert out.data["additional_notes"]["source_lid_confidence"] == 0.0
     assert out.data["_skipme"] == "skipped due to disagreement between langID models."
 
 
@@ -216,7 +216,7 @@ def test_ambernet_is_treated_as_speechbrain() -> None:
     out = stage.process(task)
 
     assert out.data["source_lang"] == "ta"
-    assert out.data["source_lid_confidence"] == 0.92
+    assert out.data["additional_notes"]["source_lid_confidence"] == 0.92
     notes = out.data["additional_notes"]
     assert notes["primary_lid_model"] == "ambernet"
     assert notes["SelectBestLIDPrediction"] == "used secondary, agreement between all 3 langID models."

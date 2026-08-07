@@ -31,15 +31,15 @@ one input recording/group, so resume logic counts completed input recordings
 
 from __future__ import annotations
 
+import io
 import json
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import soundfile as sf
 from loguru import logger
-
-from nemo_curator.stages.audio.io import common as audio_common
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
@@ -252,7 +252,9 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         return waveform.astype(np.float32)
 
     def _encode_opus(self, waveform: np.ndarray, sr: int) -> bytes:
-        return audio_common.encode_opus_bytes(waveform, sr)
+        buf = io.BytesIO()
+        sf.write(buf, waveform, sr, format="OGG", subtype="OPUS")
+        return buf.getvalue()
 
     def _shard_manifest_path(self, shard_subdir: str) -> str:
         name = f"{shard_subdir}.jsonl" if shard_subdir else "manifest.jsonl"
