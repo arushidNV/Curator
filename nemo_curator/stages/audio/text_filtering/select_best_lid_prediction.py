@@ -14,15 +14,18 @@
 
 """Select the best language-ID prediction from SpeechBrain/AmberNet, Whisper, and Indic Canary.
 
-Reads ``LangIDResult`` entries from ``task.data[lid_key]`` (tagged ``primary`` /
-``secondary``). Routing:
+Reads ``LangIDResult`` entries from ``task.data[lid_key]``. Routing (in order):
 
-- SpeechBrain predicted a **non-Indic** language → cross-check with Whisper (if present).
-  If both agree, record an agreement note; if they disagree, set ``_skipme`` and a
-  disagreement note.
-- SpeechBrain predicted an **Indic** language → use Indic Canary as ``source_lang``.
-  If both models agree on the language code, record an agreement note; otherwise
-  record disagreement and set ``_skipme``.
+- No predictions at all → set ``_skipme``.
+- Whisper predicts **English** (``en``) → accept Whisper's language.
+- Whisper is missing or empty → set ``_skipme`` (Whisper is required for the checks below).
+- SpeechBrain/AmberNet, Indic Canary, and Whisper **all agree** → use Indic Canary as
+  ``source_lang`` (records an agreement note).
+- Whisper predicts a **non-Indic** language and SpeechBrain/AmberNet agrees → use Whisper.
+- Otherwise (disagreement, or an Indic language without full 3-way agreement) → set ``_skipme``.
+
+Every skip path also sets ``source_lang`` to ``""`` and confidence to ``0.0`` so the sentinel
+is consistent; ``_skipme`` remains the authoritative skip flag.
 """
 
 from __future__ import annotations
@@ -122,6 +125,8 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
     def process(self, task: AudioTask) -> AudioTask:  # noqa: C901
         lid_entries = task.data.pop(self.lid_key, [])
         if not lid_entries:
+            task.data[self.output_key] = ""
+            task.data[self.notes_key][self.confidence_key] = 0.0
             task.data[self.skip_me_key] = "skipped due to missing langID predictions."
             set_note(task.data, self.name, "skipped (missing predictions)", self.notes_key)
             return task
@@ -143,74 +148,56 @@ class SelectBestLIDPredictionStage(ProcessingStage[AudioTask, AudioTask]):
                     whisper_result = result
                 else:
                     raise ValueError(f"Invalid model name: {model_name}")
-
-        if sb_result is None or len(sb_result.language)==0:
-            task.data[self.output_key] = ""
-            task.data[self.notes_key][self.confidence_key] = 0.0
-            task.data[self.skip_me_key] = "skipped due to missing or empty primary langID prediction."
-            set_note(task.data, self.name, "skipped (missing or empty primary langID prediction)", self.notes_key)
+        
+        # Whisper predicts English -> accept it outright.
+        if whisper_result is not None and whisper_result.language == "en":
+            task.data[self.output_key] = whisper_result.language
+            task.data[self.notes_key][self.confidence_key] = float(whisper_result.confidence)
+            set_note(
+                task.data,
+                self.name,
+                f"used {whisper_result.tag}, English language.",
+            )
             return task
 
-        if sb_result.language in self.indic_languages:
-            if canary_result is None:
-                task.data[self.output_key] = sb_result.language
-                task.data[self.notes_key][self.confidence_key] = float(sb_result.confidence)
-                set_note(
-                    task.data,
-                    self.name,
-                    f"used {sb_result.tag}, Indic language.",
-                    self.notes_key,
-                )
-                return task
-            if canary_result.language == sb_result.language:
-                task.data[self.output_key] = canary_result.language
-                task.data[self.notes_key][self.confidence_key] = float(canary_result.confidence)
-                set_note(
-                    task.data,
-                    self.name,
-                    f"used {canary_result.tag}, agreement between SpeechBrain and Indic Canary langID model.",
-                    self.notes_key,
-                )
-                return task
+        # Whisper is required for the agreement checks below; skip if missing/empty.
+        if whisper_result is None or len(whisper_result.language) == 0:
+            task.data[self.output_key] = ""
+            task.data[self.notes_key][self.confidence_key] = 0.0
+            task.data[self.skip_me_key] = "skipped due to missing or empty whisper langID prediction."
+            set_note(task.data, self.name, "skipped (missing or empty whisper langID prediction)", self.notes_key)
+            return task
+
+        # If all 3 models agree on the language, use the Canary result.
+        if (
+            sb_result is not None
+            and canary_result is not None
+            and canary_result.language == sb_result.language
+            and whisper_result.language == sb_result.language
+        ):
             task.data[self.output_key] = canary_result.language
             task.data[self.notes_key][self.confidence_key] = float(canary_result.confidence)
             set_note(
                 task.data,
                 self.name,
-                f"used {canary_result.tag}, disagreement between {sb_result.tag} and {canary_result.tag}",
-                self.notes_key,
-            )
-            task.data[self.skip_me_key] = (
-                f"skipped due to disagreement between {sb_result.tag} and {canary_result.tag} langID models."
+                f"used {canary_result.tag}, agreement between all 3 langID models.",
             )
             return task
 
-        # Non-Indic: cross-check with Whisper when available.
-        if whisper_result is not None:
-            if whisper_result.language == sb_result.language:
-                task.data[self.output_key] = sb_result.language
-                task.data[self.notes_key][self.confidence_key] = float(sb_result.confidence)
+        # Non-Indic language: accept Whisper when SpeechBrain/AmberNet agrees.
+        if whisper_result.language not in self.indic_languages:
+            if sb_result is not None and sb_result.language == whisper_result.language:
+                task.data[self.output_key] = whisper_result.language
+                task.data[self.notes_key][self.confidence_key] = float(whisper_result.confidence)
                 set_note(
                     task.data,
                     self.name,
-                    f"used {sb_result.tag}, agreement between {sb_result.tag} and {whisper_result.tag} langID models.",
-                    self.notes_key,
+                    f"used {whisper_result.tag}, agreement between {sb_result.tag} and {whisper_result.tag} langID models.",
                 )
                 return task
-            task.data[self.output_key] = sb_result.language
-            task.data[self.notes_key][self.confidence_key] = float(sb_result.confidence)
-            set_note(
-                task.data,
-                self.name,
-                f"used {sb_result.tag}, disagreement between {sb_result.tag} and {whisper_result.tag}",
-                self.notes_key,
-            )
-            task.data[self.skip_me_key] = (
-                f"skipped due to disagreement between {sb_result.tag} and {whisper_result.tag} langID models."
-            )
-            return task
 
-        task.data[self.output_key] = sb_result.language
-        task.data[self.notes_key][self.confidence_key] = float(sb_result.confidence)
-        set_note(task.data, self.name, f"used {sb_result.tag}, non-Indic language.", self.notes_key)
+        task.data[self.output_key] = "skipped"
+        task.data[self.notes_key][self.confidence_key] = 0.0
+        task.data[self.skip_me_key] = "skipped due to disagreement between langID models."
+        set_note(task.data, self.name, "skipped due to disagreement between langID models.", self.notes_key)
         return task
