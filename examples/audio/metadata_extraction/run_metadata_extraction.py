@@ -371,6 +371,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             read_concurrency=args.read_concurrency,
             resampled_output_dir=args.resampled_output_dir,
             keep_waveform=not args.resampled_output_dir,
+            max_audio_duration_sec=args.max_audio_duration_sec,
         ),
     ]
 
@@ -512,6 +513,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 tag=whisper_tag,
                 model_size=args.whisper_model_size,
                 batch_size=args.langid_batch_size,
+                max_workers=langid_max_workers,
                 resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
             )
         )
