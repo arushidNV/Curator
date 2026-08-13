@@ -104,6 +104,7 @@ audio_common = [
     "librosa",
     "scipy",
     "pydub>=0.25.1",
+    "openai-whisper",
 ]
 audio_cpu = [
     "nemo_curator[audio_common]",

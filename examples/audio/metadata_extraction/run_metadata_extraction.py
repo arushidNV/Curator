@@ -246,7 +246,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--whisper_model_size",
         type=str,
         default="medium",
-        help="Whisper model size (e.g. 'medium', 'large-v3'). Passed to whisper.load_model.",
+        help="Whisper model size (e.g. 'medium', 'large-v3'). Ignored when --whisper_model_path is set.",
+    )
+    whisper_grp.add_argument(
+        "--whisper_model_path",
+        type=str,
+        default=None,
+        help="Path to a local Whisper checkpoint (.pt file). When set, skips download and ignores --whisper_model_size.",
+    )
+    whisper_grp.add_argument(
+        "--whisper_fp16",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use FP16 Mel inputs on CUDA (disable with --no-whisper_fp16).",
     )
 
     diar = ap.add_argument_group("Speaker Diarization (Sortformer)")
@@ -331,9 +343,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
         default=True,
         help="Write only the JSONL manifest — skip encoding the millions of per-segment opus "
-             "files (avoids the inode blow-up on shared filesystems). Pair with "
-             "--resampled_output_dir so the tarring stage can regenerate each clip's opus on "
-             "the fly (tar_shards.py --opus-from-resampled).",
+        "files (avoids the inode blow-up on shared filesystems). Pair with "
+        "--resampled_output_dir so the tarring stage can regenerate each clip's opus on "
+        "the fly (tar_shards.py --opus-from-resampled).",
     )
 
     ex = ap.add_argument_group("Executor")
@@ -512,6 +524,8 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             WhisperLangIDStage(
                 tag=whisper_tag,
                 model_size=args.whisper_model_size,
+                model_path=args.whisper_model_path,
+                fp16=args.whisper_fp16,
                 batch_size=args.langid_batch_size,
                 max_workers=langid_max_workers,
                 resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
