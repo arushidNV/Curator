@@ -29,6 +29,7 @@ Decomposes into:
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -419,7 +420,9 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
     name: str = "nemo_speech_reader"
     max_io_threads: int = 8
-    batch_size: int = 8
+    # One shard per batch. process_batch reads every shard in a batch to completion
+    # before emitting, so grouping shards idles the GPU for the whole read phase.
+    batch_size: int = 1
     # Max shards read in parallel. Caps in-flight waveforms so the object store
     # doesn't overflow (without it, Ray launches up to one reader task per CPU).
     read_concurrency: int = 2
@@ -464,13 +467,17 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     def ray_stage_spec(self) -> dict[str, Any]:
         # Fan out AudioTask outputs into 1-row blocks for parallel downstream GPU
         # stages; concurrency caps how many reader tasks run at once (see read_concurrency).
+        # Fanout repartitions to one row per block, which costs one Ray object per
+        # clip (~56k for a 300h run). Set NEMO_READER_FANOUT=0 to keep whole-shard
+        # blocks and let downstream map_batches slice its own batches instead.
+        fanout = os.environ.get("NEMO_READER_FANOUT", "1") != "0"
         if RayStageSpecKeys is not None:
             return {
-                RayStageSpecKeys.IS_FANOUT_STAGE: True,
+                RayStageSpecKeys.IS_FANOUT_STAGE: fanout,
                 RayStageSpecKeys.RAY_REMOTE_ARGS: {"concurrency": self.read_concurrency},
             }
         return {
-            "is_fanout_stage": True,
+            "is_fanout_stage": fanout,
             "ray_remote_args": {"concurrency": self.read_concurrency},
         }
 
@@ -918,6 +925,110 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
         logger.info(f"Shard {shard_key}: emitted {len(results)} AudioTasks")
         return results
+
+    @staticmethod
+    def _count_manifest_entries(manifest_path: str) -> int:
+        """Count JSON-lines entries in a manifest shard, or 0 if it can't be read."""
+        try:
+            with open(manifest_path) as fh:
+                return sum(1 for line in fh if line.strip())
+        except OSError:
+            return 0
+
+    def _cut_placeholder(
+        self,
+        cut_id: str,
+        corpus: str,
+        language: str,
+        shard_key: str,
+        shard_total: int,
+        metadata: dict[str, Any],
+    ) -> AudioTask:
+        """read_error placeholder for a cut that could not be decoded or was skipped."""
+        entry_data: dict[str, Any] = {
+            "read_error": True,
+            "corpus": corpus,
+            "audio_filepath": cut_id,
+            "original_file": cut_id,
+        }
+        if language:
+            entry_data["source_lang"] = language
+        return AudioTask(
+            task_id=f"{shard_key}_{cut_id}",
+            dataset_name=corpus,
+            data=entry_data,
+            _metadata={**metadata, "_shard_key": shard_key, "_shard_total": shard_total},
+        )
+
+    def _iter_cutset(self, task: FileGroupTask) -> Iterator[AudioTask]:
+        """Yield AudioTasks as cuts decode instead of buffering the whole shard.
+
+        ``_process_cutset`` must hold every clip to compute ``_shard_total`` from
+        ``len(results)``, so peak heap scales with shard duration (~23 GB for a 100h
+        shard) and the GPU idles until the last cut is decoded. Here the total comes
+        from the manifest entry count up front, which lets each clip be emitted
+        immediately. Undecodable cuts, and manifest entries lhotse skips because they
+        are absent from the tar, are emitted as read_error placeholders so the
+        writer's running count still reaches ``_shard_total`` and ``.jsonl.done`` is
+        written.
+        """
+        corpus = task.reader_config.get("corpus", "unknown")
+        shard_key = task.reader_config.get("shard_key", task.task_id)
+        language = task.reader_config.get("language", "")
+        metadata = dict(task._metadata)
+
+        manifest_path = task.data[0]
+        tar_path = task.data[1] if len(task.data) >= 2 else None  # noqa: PLR2004
+
+        shard_total = int(task.reader_config.get("shard_total") or 0)
+        if shard_total <= 0:
+            shard_total = self._count_manifest_entries(manifest_path)
+        if shard_total <= 0:
+            # Total unknown, so streaming would leave the writer unable to finalize
+            # the shard. Fall back to the buffered path.
+            yield from self._process_cutset(task)
+            return
+
+        mode = "tarred" if tar_path else "non-tarred"
+        logger.info(f"Streaming shard {shard_key} via NeMo {mode} adapter ({shard_total} manifest entries)")
+
+        cutset = self._make_cutset(manifest_path, tar_path)
+        emitted = 0
+        for cut in cutset:
+            try:
+                entry_data = self._build_cut_entry(cut, corpus, language)
+            except Exception:  # noqa: BLE001
+                logger.warning(f"Skipping unreadable audio: {cut.id}")
+                yield self._cut_placeholder(cut.id, corpus, language, shard_key, shard_total, metadata)
+                emitted += 1
+                continue
+
+            emitted += 1
+            if emitted % 100 == 0 or emitted == 1:
+                logger.info(f"  [{shard_key}] loaded {emitted}")
+
+            yield AudioTask(
+                task_id=f"{shard_key}_{cut.id}",
+                dataset_name=corpus,
+                data=entry_data,
+                _metadata={**metadata, "_shard_key": shard_key, "_shard_total": shard_total},
+                _stage_perf=list(task._stage_perf),
+            )
+
+        for missing in range(emitted, shard_total):
+            yield self._cut_placeholder(
+                f"missing_entry_{missing}", corpus, language, shard_key, shard_total, metadata
+            )
+
+        logger.info(f"Shard {shard_key}: streamed {emitted} AudioTasks of {shard_total} expected")
+
+    def process_batch_iter(self, tasks: list[FileGroupTask]) -> Iterator[AudioTask]:
+        """Streaming counterpart to ``process_batch``; see ``_iter_cutset``."""
+        for task in tasks:
+            if task.reader_config.get("entry") is not None:
+                yield from self._process_single_entry(task)
+            else:
+                yield from self._iter_cutset(task)
 
     def process(self, task: FileGroupTask) -> list[AudioTask]:
         if task.reader_config.get("entry") is not None:

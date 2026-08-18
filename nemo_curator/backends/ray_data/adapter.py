@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -162,10 +163,32 @@ def create_task_from_stage(stage: ProcessingStage) -> Callable[[dict[str, Any]],
     # Create the adapter instance
     adapter = RayDataStageAdapter(stage)
 
-    # Create a standalone function that wraps the adapter's processing logic
-    def stage_map_fn(batch: dict[str, Any]) -> dict[str, Any]:
-        """Dynamically named map function that processes a batch of Task objects."""
-        return adapter._process_batch_internal(batch)
+    # A stage that exposes process_batch_iter can emit rows as it produces them.
+    # Ray only receives a plain return value once the task ends, so a stage that
+    # buffers its whole output keeps downstream operators idle until then; a
+    # generator UDF hands Ray a block per chunk instead. Opt-in per run because
+    # this changes block granularity for every stage that offers the method.
+    stream_fn = getattr(stage, "process_batch_iter", None)
+    stream_enabled = stream_fn is not None and os.environ.get("NEMO_STAGE_STREAMING", "0") == "1"
+
+    if stream_enabled:
+        chunk_size = max(1, int(os.environ.get("NEMO_STAGE_STREAMING_CHUNK", "64")))
+
+        def stage_map_fn(batch: dict[str, Any]) -> Any:  # noqa: ANN401
+            """Dynamically named generator map function over a batch of Task objects."""
+            chunk: list[Any] = []
+            for result in stream_fn(list(batch["item"])):
+                chunk.append(result)
+                if len(chunk) >= chunk_size:
+                    yield {"item": chunk}
+                    chunk = []
+            if chunk:
+                yield {"item": chunk}
+    else:
+
+        def stage_map_fn(batch: dict[str, Any]) -> dict[str, Any]:
+            """Dynamically named map function that processes a batch of Task objects."""
+            return adapter._process_batch_internal(batch)
 
     # Set the function name to include the stage name with Task suffix
     stage_name = stage.__class__.__name__ + "Task"
