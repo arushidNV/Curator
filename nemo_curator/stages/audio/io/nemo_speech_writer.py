@@ -79,8 +79,13 @@ def _record_shard_input(output_dir: str, shard_subdir: str, input_id: str, shard
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
             f.seek(0)
-            raw = f.read().strip()
-            data = json.loads(raw) if raw else {"seen": []}
+            raw = f.read().strip("\x00 \t\r\n")
+            try:
+                data = json.loads(raw) if raw else {"seen": []}
+            except (json.JSONDecodeError, ValueError):
+                data = {"seen": []}
+            if not isinstance(data, dict):
+                data = {"seen": []}
             seen = data.setdefault("seen", [])
             if input_id not in seen:
                 seen.append(input_id)
@@ -314,11 +319,13 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         if task.data.get("read_error"):
             manifest_entry = {
                 "audio_filepath": "",
-                "duration": 0.0,
+                "duration": task.data.get("duration", 0.0),
                 "sample_rate": self.target_sample_rate,
                 "sampling_rate": self.target_sample_rate,
                 "read_error": True,
             }
+            if task.data.get("audio_too_long"):
+                manifest_entry["audio_too_long"] = True
             if original_file:
                 manifest_entry["original_audio_filepath"] = original_file
             for key in ("corpus", "shard_id", "source_lang"):
@@ -343,12 +350,29 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         else:
             filename = f"{base_name}_{offset_ms}ms.opus"
 
-        # Use shard_key as subdirectory to mirror input structure
-        segment_dir = os.path.join(self.output_dir, shard_subdir)
-        os.makedirs(segment_dir, exist_ok=True)
+        # Output location relative to output_dir, derived from the source stem + segment
+        # offset, mirroring the input shard structure.
+        rel_path = os.path.join(shard_subdir, filename) if shard_subdir else filename
 
-        out_path = os.path.join(segment_dir, filename)
-        if self.save_audio and has_waveform:
+        # If the input row already carries the opus key (``output_audio_filepath``), keep it
+        # verbatim instead of recomputing the name. This lets the opus backfill re-emit a
+        # manifest whose opus path is identical to the original run's, with no risk of the
+        # derived name drifting. The path is preserved whether or not the file exists: if the
+        # opus is already on disk it is reused as-is (encode skipped below); if it is missing
+        # it is created under this run's output_dir at that same relative path.
+        preset_rel = task.data.get("output_audio_filepath")
+        if preset_rel:
+            rel_path = preset_rel
+
+        out_path = os.path.join(self.output_dir, rel_path)
+        os.makedirs(os.path.dirname(out_path) or self.output_dir, exist_ok=True)
+
+        # Skip re-encoding a clip that is already on disk (resume / opus backfill): opus is
+        # written atomically (temp file + os.replace), so a file present at out_path is always
+        # complete, never a partial from a killed run. The manifest row is still written below,
+        # so a re-run rebuilds the manifest faithfully while only encoding the missing clips.
+        opus_exists = self.save_audio and os.path.isfile(out_path)
+        if self.save_audio and has_waveform and not opus_exists:
             # Only needed for opus encoding; skip the conversion in manifest-only mode.
             waveform = self._ensure_numpy(waveform)
             opus_bytes = self._encode_opus(waveform, sr)
@@ -358,7 +382,6 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
         duration = task.data.get("duration_sec") or (len(waveform) / sr if has_waveform and sr > 0 else 0)
         original_sr = task.data.get("original_sampling_rate")
         original_channels = task.data.get("original_channels")
-        rel_path = os.path.join(shard_subdir, filename) if shard_subdir else filename
         manifest_entry = {
             "audio_filepath": rel_path,
             "duration": round(duration, 4),
@@ -400,6 +423,7 @@ class NeMoSpeechWriterStage(ProcessingStage[AudioTask, FileGroupTask]):
             "num_channels",
             "original_file",
             "audio_filepath",
+            "output_audio_filepath",
             "start_ms",
             "end_ms",
             "source_lang",

@@ -35,8 +35,11 @@ class RegexSubstitutionStage(ProcessingStage[AudioTask, AudioTask]):
     and writes the result to ``output_text_key`` (default ``"cleaned_text"``).
     The original ``text_key`` field is preserved unchanged.
 
-    After all substitutions, if the result is empty and ``_skipme`` is
-    still empty, ``_skipme`` is set to ``"Empty after regex cleaning"``.
+    After all substitutions, ``_skipme`` is set to ``"Empty after regex cleaning"``
+    ONLY when the regex actually removed content: the prediction was non-empty before
+    cleaning, became empty after, and ``_skipme`` was still empty. A prediction that was
+    already empty before cleaning is left untouched (``_skipme`` is NOT set) — nothing was
+    cleaned away, so it is not a regex-cleaning skip.
     """
 
     regex_params_yaml: str = ""
@@ -73,12 +76,13 @@ class RegexSubstitutionStage(ProcessingStage[AudioTask, AudioTask]):
         text = task.data[self.text_key]
         if not isinstance(text, str):
             return task
+        had_text = bool(text.strip())
         text = " " + text + " "
         for rule in self._rules:
             text = re.sub(rule["pattern"], rule["repl"], text, count=rule.get("count", 0))
         text = re.sub(r"\s+", " ", text).strip()
         task.data[self.output_text_key] = text
-        if not text and not task.data.get(self.skip_me_key, ""):
+        if not text and had_text and not task.data.get(self.skip_me_key, ""):
             task.data[self.skip_me_key] = "Empty after regex cleaning"
         return task
 

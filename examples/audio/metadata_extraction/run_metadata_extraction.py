@@ -36,8 +36,10 @@ Pipeline:
         -> SqueezeWaveformStage (flatten VAD output shape)
         -> SEDInferenceStage (sound event detection on each segment) [optional]
         -> SEDPostprocessingStage (converts framewise probs to event labels) [optional]
-        -> LangID: AmberNet (NeMo, 20 langs) or SpeechBrain VoxLingua107 (107 langs);
-             with --indic, a second Indic Canary pass + dual-agreement selection
+        -> LangID: AmberNet (NeMo, 20 langs) or SpeechBrain VoxLingua107 (107 langs) [primary]
+             without --indic: Whisper [secondary] cross-checks non-Indic predictions
+             with --indic: Indic Canary [secondary] + Whisper [tertiary] for non-Indic cross-check
+        -> SelectBestLIDPredictionStage (picks final language from all LID results)
         -> NeMoSpeechWriterStage (encodes to opus at 16kHz)
 """
 
@@ -113,6 +115,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Directory to write resampled 16kHz mono WAV files. The output filename matches the input stem with a .wav extension.",
+    )
+    ap.add_argument(
+        "--max_audio_duration_sec",
+        type=float,
+        default=12 * 60 * 60,
+        help="Maximum source-audio duration to process (seconds); longer recordings are skipped. "
+        "Use 0 or a negative value to disable the cap.",
     )
     vad = ap.add_argument_group("VAD (Silero)")
     vad.add_argument(
@@ -232,6 +241,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     lid.add_argument("--langid_batch_size", type=int, default=16, help="LangID inference batch size.")
     lid.add_argument("--skip_langid", action="store_true", default=False, help="Skip language ID stage.")
 
+    whisper_grp = ap.add_argument_group("Whisper LID (always active when language ID is enabled)")
+    whisper_grp.add_argument(
+        "--whisper_model_size",
+        type=str,
+        default="medium",
+        help="Whisper model size (e.g. 'medium', 'large-v3'). Passed to whisper.load_model.",
+    )
+
     diar = ap.add_argument_group("Speaker Diarization (Sortformer)")
     diar.add_argument(
         "--sortformer_model",
@@ -308,6 +325,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     out = ap.add_argument_group("Output")
     out.add_argument("--target_sample_rate", type=int, default=16000, help="Output sample rate.")
+    out.add_argument(
+        "--no_save_audio",
+        dest="save_audio",
+        action="store_false",
+        default=True,
+        help="Write only the JSONL manifest — skip encoding the millions of per-segment opus "
+             "files (avoids the inode blow-up on shared filesystems). Pair with "
+             "--resampled_output_dir so the tarring stage can regenerate each clip's opus on "
+             "the fly (tar_shards.py --opus-from-resampled).",
+    )
 
     ex = ap.add_argument_group("Executor")
     ex.add_argument(
@@ -344,6 +371,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             read_concurrency=args.read_concurrency,
             resampled_output_dir=args.resampled_output_dir,
             keep_waveform=not args.resampled_output_dir,
+            max_audio_duration_sec=args.max_audio_duration_sec,
         ),
     ]
 
@@ -476,6 +504,20 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                     resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
                 )
             )
+
+        from nemo_curator.stages.audio.inference.whisper_langid import WhisperLangIDStage
+
+        whisper_tag = "tertiary" if args.indic else "secondary"
+        stages.append(
+            WhisperLangIDStage(
+                tag=whisper_tag,
+                model_size=args.whisper_model_size,
+                batch_size=args.langid_batch_size,
+                max_workers=langid_max_workers,
+                resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
+            )
+        )
+
         stages.append(SelectBestLIDPredictionStage())
 
     stages.append(
@@ -483,6 +525,7 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
             output_dir=args.output_dir,
             target_sample_rate=args.target_sample_rate,
             writer_concurrency=args.writer_concurrency,
+            save_audio=args.save_audio,
         )
     )
     return stages
@@ -551,14 +594,14 @@ def main() -> None:
         langid_desc = args.langid_model or (
             "speechbrain/lang-id-voxlingua107-ecapa" if args.langid_backend == "speechbrain" else "langid_ambernet"
         )
+        parts = [f"primary={args.langid_backend} ({langid_desc})"]
         if args.indic:
-            logger.info(
-                f"  LangID: two-pass Indic mode — primary={args.langid_backend} ({langid_desc})"
-                f" + Indic Canary ({args.indic_canary_engine_dir}, batch_size={args.indic_canary_batch_size}, "
-                f"workers={args.indic_canary_num_workers or 'auto'}) -> SelectBestLIDPrediction"
-            )
+            parts.append(f"secondary=IndicCanary ({args.indic_canary_engine_dir})")
+            parts.append(f"tertiary=Whisper/{args.whisper_model_size}")
         else:
-            logger.info(f"  LangID: {args.langid_backend} ({langid_desc})")
+            parts.append(f"secondary=Whisper/{args.whisper_model_size}")
+        parts.append("-> SelectBestLIDPrediction")
+        logger.info(f"  LangID: {' + '.join(parts)}")
     logger.info(f"  Target sample rate: {args.target_sample_rate}Hz, writer_concurrency={args.writer_concurrency}")
 
     t0 = time.time()

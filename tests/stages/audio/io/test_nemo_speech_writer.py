@@ -102,6 +102,7 @@ class TestNeMoSpeechWriterStage:
         manifest_path = output_dir / "shard_b.jsonl"
         entry = json.loads(manifest_path.read_text(encoding="utf-8").strip())
         assert entry["read_error"] is True
+        assert "audio_too_long" not in entry
         assert not (output_dir / "shard_b.jsonl.done").is_file()
 
         task2 = AudioTask(
@@ -117,6 +118,34 @@ class TestNeMoSpeechWriterStage:
         )
         stage.process(task2)
         assert (output_dir / "shard_b.jsonl.done").is_file()
+
+    def test_audio_too_long_writes_manifest_with_flag(self, tmp_path: Path) -> None:
+        output_dir = tmp_path / "out"
+        stage = NeMoSpeechWriterStage(output_dir=str(output_dir), writer_concurrency=1)
+        stage.setup()
+
+        task = AudioTask(
+            task_id="clip_long",
+            dataset_name="test",
+            data={
+                "read_error": True,
+                "audio_too_long": True,
+                "duration": 54000.0,  # 15-hour source file
+                "original_file": "s3://bucket/audio/too_long.m4a",
+                "audio_filepath": "s3://bucket/audio/too_long.m4a",
+            },
+            _metadata={"_shard_key": "shard_c", "_shard_total": 1},
+        )
+
+        stage.process(task)
+
+        entry = json.loads((output_dir / "shard_c.jsonl").read_text(encoding="utf-8").strip())
+        assert entry["read_error"] is True
+        assert entry["audio_too_long"] is True
+        assert entry["duration"] == 54000.0  # actual duration preserved for audit
+        assert entry["original_audio_filepath"] == "s3://bucket/audio/too_long.m4a"
+        # A single-entry shard completes even when the only row is audio_too_long.
+        assert (output_dir / "shard_c.jsonl.done").is_file()
 
     def test_distinct_dirs_same_basename_do_not_collide(self, tmp_path: Path) -> None:
         output_dir = tmp_path / "out"

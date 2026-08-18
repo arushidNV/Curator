@@ -237,6 +237,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.95)
     ap.add_argument("--prep_workers", type=int, default=16, help="Thread pool size for audio preprocessing.")
     ap.add_argument(
+        "--read_concurrency",
+        type=int,
+        default=4,
+        help="Max tar shards decoded in parallel by the reader stage (Ray concurrency). "
+        "Kept low to bound in-flight waveforms / object-store use; safe to raise for smaller shards.",
+    )
+    ap.add_argument(
         "--source_lang_key",
         type=str,
         default="source_lang",
@@ -643,7 +650,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         default=None,
         help="Fixed actor count for fallback/recovery ASR stage. Default: autoscaler decides.",
     )
+    scaling.add_argument(
+        "--primary_gpu_memory_gb",
+        type=float,
+        default=0.0,
+        help="If >0, size the PRIMARY ASR actor by GPU memory (Ray fractional GPU) instead of a "
+        "whole GPU, so it co-locates on one GPU with the recovery model (mirrors the metadata "
+        "pipeline's gpu_memory_gb packing). 0 = keep the stage default (whole GPU).",
+    )
+    scaling.add_argument(
+        "--recovery_gpu_memory_gb",
+        type=float,
+        default=0.0,
+        help="If >0, size the RECOVERY/fallback ASR actor by GPU memory (Ray fractional GPU) so it "
+        "streams concurrently with the primary model on the same GPU. 0 = whole GPU.",
+    )
     return ap
+
+
+def _asr_resources(mem_gb: float) -> Resources:
+    """GPU reservation for an ASR inference actor.
+
+    ``mem_gb > 0`` sizes the actor by GPU memory (Ray fractional GPU, e.g. 40 GB -> 0.5 of an
+    80 GB card) so the primary and recovery models co-locate and stream on ONE GPU, mirroring the
+    metadata pipeline's ``gpu_memory_gb`` packing. ``mem_gb <= 0`` keeps the whole-GPU default.
+    """
+    return Resources(gpu_memory_gb=mem_gb) if mem_gb and mem_gb > 0 else Resources(gpus=1.0)
 
 
 def _resolve_language_flags(args: argparse.Namespace) -> None:  # noqa: C901
@@ -782,6 +814,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             corpus_filter=args.corpus,
             language_filter=language_filter,
             output_dir=args.output_dir,
+            read_concurrency=args.read_concurrency,
         ),
         InitializeFieldsStage(
             pipeline_notes={
@@ -933,6 +966,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 keep_waveform=has_recovery,
                 batch_size=args.asr_batch_size,
                 num_workers_override=args.primary_num_workers,
+                resources=_asr_resources(args.primary_gpu_memory_gb),
             )
         )
 
@@ -971,6 +1005,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 pred_text_key="fallback_model_prediction",
                 batch_size=args.asr_batch_size,
                 num_workers_override=args.fallback_num_workers,
+                resources=_asr_resources(args.recovery_gpu_memory_gb),
             )
         elif args.recovery_model == "qwen_asr":
             recovery_stage = InferenceQwenASRStage(
@@ -1017,6 +1052,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 pred_text_key="fallback_model_prediction",
                 batch_size=args.asr_batch_size,
                 num_workers_override=args.fallback_num_workers,
+                resources=_asr_resources(args.recovery_gpu_memory_gb),
             )
         elif args.recovery_model == "qwen_omni":
             recovery_stage = InferenceQwenOmniStage(
@@ -1051,6 +1087,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 pred_text_key="fallback_model_prediction",
                 batch_size=args.asr_batch_size,
                 num_workers_override=args.fallback_num_workers,
+                resources=_asr_resources(args.recovery_gpu_memory_gb),
             )
 
         stages.append(recovery_stage)
