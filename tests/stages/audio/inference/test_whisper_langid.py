@@ -16,17 +16,14 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import numpy as np
+import pytest
 import torch
 from torch.nn import functional
 
-from nemo_curator.stages.audio.inference.whisper_langid import WhisperLangIDStage
+from nemo_curator.stages.audio.inference.whisper_langid import WhisperLangIDStage, WhisperTensorRTEncoder
 from nemo_curator.tasks import AudioTask
-
-if TYPE_CHECKING:
-    import pytest
 
 
 class _FakeWhisperAudio:
@@ -129,3 +126,68 @@ def test_setup_uses_fp16_mels_only_on_cuda(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(fp32_stage, "_load_model", lambda _device: _FakeWhisperModel())
     fp32_stage.setup()
     assert fp32_stage._mel_dtype == torch.float32
+
+
+def test_setup_requires_tensorrt_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    stage = WhisperLangIDStage(tag="secondary", device="cpu", backend="tensorrt")
+    monkeypatch.setattr(stage, "_load_model", lambda _device: _FakeWhisperModel())
+    with pytest.raises(ValueError, match="tensorrt_engine"):
+        stage.setup()
+
+
+class _FakeTRTSession:
+    def __init__(self, max_batch: int = 2) -> None:
+        self.input_names = ["mel"]
+        self.output_names = ["audio_features"]
+        self.max_batch = max_batch
+        self.n_mels = 80
+        self.n_frames = 10
+        self.infer_calls: list[tuple[int, ...]] = []
+        self.closed = False
+
+    def max_input_shape(self, name: str) -> tuple[int, ...]:
+        assert name == "mel"
+        return (self.max_batch, self.n_mels, self.n_frames)
+
+    def infer(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        mel = inputs["mel"]
+        self.infer_calls.append(tuple(mel.shape))
+        return {"audio_features": torch.ones(mel.shape[0], 4, 8, dtype=torch.float32)}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_tensorrt_encoder_splits_batches_wider_than_profile() -> None:
+    session = _FakeTRTSession(max_batch=2)
+    encoder = WhisperTensorRTEncoder("unused.plan", session=session)
+    features = encoder(torch.zeros(5, 80, 10))
+
+    assert features.shape == (5, 4, 8)
+    assert session.infer_calls == [(2, 80, 10), (2, 80, 10), (1, 80, 10)]
+    encoder.close()
+    assert session.closed
+
+
+def test_process_batch_uses_tensorrt_features_when_encoder_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_whisper = SimpleNamespace(audio=_FakeWhisperAudio, pad_or_trim=_pad_or_trim)
+    monkeypatch.setitem(sys.modules, "whisper", fake_whisper)
+
+    session = _FakeTRTSession(max_batch=8)
+    stage = WhisperLangIDStage(tag="secondary", min_duration_sec=0.0, batch_size=2)
+    stage._device = torch.device("cpu")
+    stage._mel_dtype = torch.float16
+    stage._model = _FakeWhisperModel()
+    stage._encoder = WhisperTensorRTEncoder("unused.plan", session=session)
+    tasks = [
+        _task(np.ones(1600, dtype=np.float32), "a"),
+        _task(np.ones(2400, dtype=np.float32) * 0.25, "b"),
+    ]
+
+    output = stage.process_batch(tasks)
+
+    assert stage._model.last_mel is not None
+    assert tuple(stage._model.last_mel.shape) == (2, 4, 8)
+    assert stage._model.last_mel.dtype == torch.float16
+    assert output[0].data["lid"][0]["WhisperLangID"].language == "en"
+    assert output[1].data["lid"][0]["WhisperLangID"].language == "de"

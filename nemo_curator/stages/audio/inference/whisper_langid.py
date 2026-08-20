@@ -27,6 +27,7 @@ from torch.nn.utils.rnn import pad_sequence
 from nemo_curator.stages.audio.inference.langid_base import BaseLangIDStage, LangIDResult
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from types import ModuleType
 
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
@@ -40,6 +41,56 @@ def _import_whisper() -> ModuleType:
         msg = "OpenAI Whisper is required for WhisperLangIDStage. Install: pip install openai-whisper"
         raise ImportError(msg) from exc
     return whisper
+
+
+class WhisperTensorRTEncoder:
+    """Whisper audio encoder backed by a persistent TensorRT engine.
+
+    Takes Mel batches shaped ``[batch, n_mels, n_frames]`` and returns features
+    shaped ``[batch, n_audio_ctx, n_audio_state]``, matching
+    ``whisper.model.AudioEncoder.forward``. ``Whisper.detect_language`` accepts
+    already-encoded features, so the decoder language-token step stays PyTorch
+    and only the encoder differs.
+    """
+
+    _INPUT = "mel"
+    _OUTPUT = "audio_features"
+
+    def __init__(self, engine_path: str | Path, session: Any = None) -> None:  # noqa: ANN401
+        if session is None:
+            from nemo_curator.stages.audio.inference.tensorrt_encoder import TensorRTEncoderSession
+
+            session = TensorRTEncoderSession(engine_path)
+        self.session = session
+        for name, names in ((self._INPUT, session.input_names), (self._OUTPUT, session.output_names)):
+            if name not in names:
+                msg = f"Whisper encoder engine is missing tensor {name!r}; found {sorted(names)}"
+                raise ValueError(msg)
+        self.max_batch, self.n_mels, self.n_frames = session.max_input_shape(self._INPUT)
+
+    def __call__(self, mel: torch.Tensor) -> torch.Tensor:
+        return self.forward(mel)
+
+    def forward(self, mel: torch.Tensor) -> torch.Tensor:
+        if mel.ndim != 3:  # noqa: PLR2004
+            msg = f"Whisper encoder expects mel shaped [batch, n_mels, n_frames], got {tuple(mel.shape)}"
+            raise ValueError(msg)
+        batch, n_mels, n_frames = mel.shape
+        if n_mels != self.n_mels or n_frames != self.n_frames:
+            msg = f"Whisper encoder engine expects mel [*, {self.n_mels}, {self.n_frames}], got {tuple(mel.shape)}"
+            raise ValueError(msg)
+        if batch <= self.max_batch:
+            return self.session.infer({self._INPUT: mel})[self._OUTPUT]
+
+        # The session reuses one output buffer per tensor, so copy each group out.
+        groups = []
+        for start in range(0, batch, self.max_batch):
+            group = self.session.infer({self._INPUT: mel[start : start + self.max_batch]})[self._OUTPUT]
+            groups.append(group.clone())
+        return torch.cat(groups, dim=0)
+
+    def close(self) -> None:
+        self.session.close()
 
 
 @dataclass
@@ -64,6 +115,10 @@ class WhisperLangIDStage(BaseLangIDStage):
         fp16: Use FP16 Mel inputs on CUDA. Whisper keeps its parameters in FP32
             but is designed to cast weights to the input dtype during inference.
         batch_size: Number of audio samples to process per forward pass.
+        backend: Encoder backend. ``"torch"`` (default) uses Whisper's PyTorch
+            encoder. ``"tensorrt"`` requires ``tensorrt_engine``.
+        tensorrt_engine: Path to a Whisper-encoder TensorRT plan. Required when
+            ``backend="tensorrt"``.
 
     See :class:`~nemo_curator.stages.audio.inference.langid_base.BaseLangIDStage`
     for the shared waveform/output arguments.
@@ -77,11 +132,14 @@ class WhisperLangIDStage(BaseLangIDStage):
     fp16: bool = True
     batch_size: int = 8
     max_duration_sec: float = 30.0  # Whisper's input window is 30 s; base defaults to 10 s
+    backend: str = "torch"
+    tensorrt_engine: str | None = None
 
     _model: Any = field(default=None, init=False, repr=False)
     _device: torch.device | None = field(default=None, init=False, repr=False)
     _mel_dtype: torch.dtype = field(default=torch.float32, init=False, repr=False)
     _hann_window: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _encoder: Any = field(default=None, init=False, repr=False)
 
     def _load_model(self, device: str | torch.device) -> object:
         whisper = _import_whisper()
@@ -111,6 +169,13 @@ class WhisperLangIDStage(BaseLangIDStage):
         if self._model is not None:
             return
 
+        if self.backend not in {"torch", "tensorrt"}:
+            msg = f"Unknown WhisperLangID backend: {self.backend!r} (expected 'torch' or 'tensorrt')"
+            raise ValueError(msg)
+        if self.backend == "tensorrt" and not self.tensorrt_engine:
+            msg = "WhisperLangID requires tensorrt_engine when backend='tensorrt'"
+            raise ValueError(msg)
+
         device_name = ("cuda" if torch.cuda.is_available() else "cpu") if self.device == "auto" else self.device
         self._device = torch.device(device_name)
 
@@ -119,9 +184,24 @@ class WhisperLangIDStage(BaseLangIDStage):
         self._model = self._load_model(self._device)
         self._model.eval()
         self._mel_dtype = torch.float16 if self.fp16 and self._device.type == "cuda" else torch.float32
+        if self.backend == "tensorrt":
+            self._encoder = WhisperTensorRTEncoder(self.tensorrt_engine)
+            logger.info(f"WhisperLangID: TensorRT encoder ready (max_batch={self._encoder.max_batch})")
         logger.info("WhisperLangID: model ready")
 
+    def _encode(self, mel_batch: torch.Tensor) -> torch.Tensor:
+        """Return Mel (torch) or encoder features (TensorRT) for ``detect_language``."""
+        if self._encoder is None:
+            # Torch path is unchanged: Whisper.detect_language runs the encoder.
+            return mel_batch
+        # Engine I/O is often FP32 around FP16 kernels. Cast back to the Mel
+        # dtype so the decoder step matches the torch FP16 path.
+        return self._encoder(mel_batch).to(mel_batch.dtype)
+
     def teardown(self) -> None:
+        if self._encoder is not None:
+            self._encoder.close()
+            self._encoder = None
         self._model = None
         self._device = None
         self._mel_dtype = torch.float32
@@ -200,7 +280,9 @@ class WhisperLangIDStage(BaseLangIDStage):
             audio_batch = whisper.pad_or_trim(audio_batch)
             mel_batch = self._log_mel_spectrogram(audio_batch, n_mels, whisper)
             with torch.inference_mode():
-                _language_tokens, probabilities = self._model.detect_language(mel_batch)
+                # TensorRT supplies [batch, n_audio_ctx, n_audio_state]; torch
+                # still passes Mel and lets Whisper encode internally.
+                _language_tokens, probabilities = self._model.detect_language(self._encode(mel_batch))
 
             # detect_language returns one probability dictionary per batch row.
             if isinstance(probabilities, dict):

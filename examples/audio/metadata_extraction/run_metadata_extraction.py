@@ -260,6 +260,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Use FP16 Mel inputs on CUDA (disable with --no-whisper_fp16).",
     )
+    whisper_grp.add_argument(
+        "--whisper_backend",
+        type=str,
+        default="torch",
+        choices=["torch", "tensorrt"],
+        help="Encoder backend for Whisper LID. 'tensorrt' requires --whisper_tensorrt_engine.",
+    )
+    whisper_grp.add_argument(
+        "--whisper_tensorrt_engine",
+        type=str,
+        default=None,
+        help="Whisper encoder TensorRT plan from scripts/build_whisper_encoder_tensorrt_engine.py.",
+    )
 
     diar = ap.add_argument_group("Speaker Diarization (Sortformer)")
     diar.add_argument(
@@ -517,6 +530,10 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 )
             )
 
+        if args.whisper_backend == "tensorrt" and not args.whisper_tensorrt_engine:
+            msg = "--whisper_tensorrt_engine is required when --whisper_backend=tensorrt"
+            raise ValueError(msg)
+
         from nemo_curator.stages.audio.inference.whisper_langid import WhisperLangIDStage
 
         whisper_tag = "tertiary" if args.indic else "secondary"
@@ -528,6 +545,8 @@ def _build_stages(args: argparse.Namespace, language_filter: list[str] | None) -
                 fp16=args.whisper_fp16,
                 batch_size=args.langid_batch_size,
                 max_workers=langid_max_workers,
+                backend=args.whisper_backend,
+                tensorrt_engine=args.whisper_tensorrt_engine,
                 resources=Resources(gpu_memory_gb=args.langid_gpu_memory_gb),
             )
         )
@@ -611,9 +630,9 @@ def main() -> None:
         parts = [f"primary={args.langid_backend} ({langid_desc})"]
         if args.indic:
             parts.append(f"secondary=IndicCanary ({args.indic_canary_engine_dir})")
-            parts.append(f"tertiary=Whisper/{args.whisper_model_size}")
+            parts.append(f"tertiary=Whisper/{args.whisper_model_size} [{args.whisper_backend}]")
         else:
-            parts.append(f"secondary=Whisper/{args.whisper_model_size}")
+            parts.append(f"secondary=Whisper/{args.whisper_model_size} [{args.whisper_backend}]")
         parts.append("-> SelectBestLIDPrediction")
         logger.info(f"  LangID: {' + '.join(parts)}")
     logger.info(f"  Target sample rate: {args.target_sample_rate}Hz, writer_concurrency={args.writer_concurrency}")
